@@ -45,7 +45,7 @@ This document exists so that an AI agent can "vibe code" the application from sc
 
 ### 1.2 Product Scope
 
-Job Search Pal's primary purpose is to use Claude Code to make a job search faster and less painful: tracking opportunities and applications, maintaining a rich personal history, and generating tailored application materials — with a Companion persona that keeps the process lighthearted in an ironic, retro-futurist way. The aesthetic target is the *Outer Worlds* franchise: ironic, corporate, funny, and slightly dystopian.
+Job Search Pal's primary purpose is to use Claude Code to make a job search faster and less painful: tracking opportunities and applications, maintaining a rich personal history, and generating tailored application materials — with a Companion persona that keeps the process lighthearted in an ironic, retro-futurist way. The aesthetic target is ironic corporate-dystopia: cheerful copy, slightly ominous subtext, and a company tone that is simultaneously upbeat and faintly threatening.
 
 The application consists of two top-level systems:
 
@@ -55,7 +55,7 @@ The application consists of two top-level systems:
 
 #### Pages
 
-The web interface is made up of the following pages. Tone across all pages should lean into the ironic corporate-dystopia aesthetic (think Spacer's Choice / Auntie Cleo's from *The Outer Worlds*): cheerful copy, slightly ominous subtext, retro-futurist visual cues.
+The web interface is made up of the following pages. Tone across all pages should lean into the ironic corporate-dystopia aesthetic: cheerful copy, slightly ominous subtext, retro-futurist visual cues.
 
 A global UI behavior applies to every rich-text editor in the app (Document Studio, Job Description, Notes fields, Cover Letter, Email drafts, etc.): the user can highlight any portion of text and a floating action pops up offering "Send to Companion." That opens a small prompt box where the user can add notes ("make it punchier", "reword for a senior role", "translate to casual email tone"), and the companion returns a rewrite that can be accepted, rejected, or iterated. Every such rewrite is recorded as a `DocumentEdit` so the history is auditable.
 
@@ -91,7 +91,7 @@ A global UI behavior applies to every rich-text editor in the app (Document Stud
    - **Job Preferences** — The user's job-search criteria across three tiers (*preferred*, *acceptable*, *unacceptable*) for scalar fields (salary, experience level, remote policy, commute, travel, hours, schedule, employment type, equity, benefits, start date) and list-valued categories (industry, role titles, technologies, company sizes, company types, mission areas, locations, languages, benefits, management styles, team sizes). Each list entry has a tier and an optional weight.
    - **Work Authorization** — Current country and location, citizenship(s), work-authorization status and visa type, visa expiry, sponsorship required now / in the future, countries the user will relocate to, security clearance level, and export-control considerations. Drives autofill of the universal "are you authorized to work in X / do you need sponsorship" application questions.
    - **Demographics (Voluntary Self-Identification)** — EEOC-style fields that applications commonly ask as optional self-identification: preferred / legal name, pronouns, gender identity (with self-describe), sex assigned at birth, transgender identification, sexual orientation, race / ethnicity (multi-select with self-describe), veteran status, disability status, date of birth or age bracket, first-generation college student. **Every field is optional**, "prefer not to say" is always a valid value, and each field has an independent **share policy** (`always_share` / `share_on_request` / `ask_each_time` / `never_share`) that governs whether `application-autofiller` may populate it without prompting. The page displays a clear notice explaining why this data is collected, how it is used, and that it is never transmitted to the LLM provider as free text.
-10. **Settings** — App configuration: API keys / credentials, theme (light / dark / "corporate-approved"), data export, account controls, LLM spend cap, and **AI Persona selection**. The persona panel lets the user pick from a set of built-in personas (e.g., *Spacer's Choice Cheerful Cog*, *Auntie Cleo Concerned Associate*, *Straight-Laced Career Coach*, *Dry and Professional*) or define a custom persona with a name, a tone description, a system-prompt snippet, and an optional avatar. The active persona is applied globally to all skill outputs and Companion responses.
+10. **Settings** — App configuration: API keys / credentials, theme (light / dark / "corporate-approved"), data export, account controls, LLM spend cap, and **AI Persona selection**. The persona panel lets the user pick from a set of built-in personas (e.g., *Cheerful Corporate Cog*, *Concerned Associate*, *Straight-Laced Career Coach*, *Dry and Professional*) or define a custom persona with a name, a tone description, a system-prompt snippet, and an optional avatar. The active persona is applied globally to all skill outputs and Companion responses.
 
 #### Schemas
 
@@ -175,7 +175,7 @@ Claude Code skills are the action surface the companion uses. Each skill is self
 ### 1.3 Definitions, Acronyms, and Abbreviations
 | Term |       Definition       |
 |------|------------------------|
-| QOL  | Quality Of Life        |                |
+| QOL  | Quality Of Life        |
 | JD   | Job Description        |
 | CV   | Curriculum Vitae       |
 | LLM  | Large Language Model   |
@@ -206,7 +206,7 @@ The following references inform this SRS. References are marked **[N]** normativ
 - **[N]** Claude Code Skills Documentation — Anthropic, current. https://docs.claude.com/en/docs/claude-code/skills
 - **[N]** WCAG 2.1 Level AA — W3C. https://www.w3.org/TR/WCAG21/
 - **[I]** OWASP Top 10 (current edition) — https://owasp.org/Top10/
-- **[I]** *The Outer Worlds* — Obsidian Entertainment, 2019. Tone and visual-vibe reference for copy and UI styling; not a functional requirement.
+- **[I]** Retro-futurist ironic corporate-dystopia aesthetic. Tone and visual-vibe reference for copy and UI styling; not a functional requirement.
 - **[I]** This repository's Git history — the authoritative log of design decisions over time.
 
 ### 1.5 Document Overview
@@ -246,10 +246,8 @@ At a high level, Job Search Pal enables the user to:
 - The system **shall** use Anthropic's Claude Code CLI as the skill execution runtime.
 - The system **shall** operate as a single-user application; multi-tenant / multi-user operation is out of scope.
 - The system **shall** treat the user's history data as sensitive PII; it **must not** be transmitted to any third party other than the user-configured LLM provider.
-- The Companion tone **shall** be configurable through a persona system; the built-in default persona **should** reflect the *Outer Worlds*-style ironic corporate-dystopia aesthetic.
+- The Companion tone **shall** be configurable through a persona system; the built-in default persona **should** reflect an ironic corporate-dystopia aesthetic.
 - The system **shall not** fabricate work experience, credentials, courses, publications, or achievements; every generation skill **must** only draw from the user's canonical history.
-
-📝 Note: Requirements (Section 3) defines verifiable system obligations—specific behaviors or qualities the system shall exhibit in order to satisfy limits described in this section.
 
 ### 2.4 User Characteristics
 

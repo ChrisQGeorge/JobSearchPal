@@ -1,0 +1,61 @@
+"""FastAPI application entrypoint."""
+from __future__ import annotations
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.api.v1 import auth as auth_router
+from app.api.v1 import history as history_router
+from app.core.config import settings
+
+app = FastAPI(
+    title="Job Search Pal API",
+    version="0.1.0",
+    docs_url="/docs",
+    redoc_url=None,
+)
+
+# Accept any origin on the loopback or RFC1918 private networks, or *.local mDNS
+# names. Covers localhost, 10.x, 172.16-31.x, 192.168.x, and e.g. "mymachine.local".
+# Public origins are intentionally excluded; front the deployment with a reverse
+# proxy if you need to serve beyond the LAN.
+LAN_ORIGIN_REGEX = (
+    r"^https?://("
+    r"localhost(:\d+)?|"
+    r"127\.0\.0\.1(:\d+)?|"
+    r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?|"
+    r"172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}(:\d+)?|"
+    r"192\.168\.\d{1,3}\.\d{1,3}(:\d+)?|"
+    r"[a-zA-Z0-9-]+\.local(:\d+)?"
+    r")$"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=LAN_ORIGIN_REGEX,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/health", tags=["health"])
+async def health() -> dict[str, str]:
+    return {"status": "ok", "env": settings.APP_ENV}
+
+
+@app.get("/health/claude", tags=["health"])
+async def claude_health() -> dict[str, object]:
+    """Reports whether the Claude Code CLI is reachable inside the container."""
+    from app.skills.runner import claude_is_available
+
+    available = await claude_is_available()
+    return {
+        "claude_cli_available": available,
+        "cli_bin": settings.CLAUDE_CODE_BIN,
+        "has_anthropic_api_key": bool(settings.ANTHROPIC_API_KEY),
+    }
+
+
+app.include_router(auth_router.router, prefix="/api/v1")
+app.include_router(history_router.router, prefix="/api/v1")

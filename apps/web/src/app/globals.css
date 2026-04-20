@@ -1,0 +1,35 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html, body {
+  background-color: #0f1117;
+  color: #e6e6e6;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: inherit; text-decoration: none; }
+
+.jsp-card {
+  @apply bg-corp-surface border border-corp-border rounded-lg;
+}
+.jsp-btn {
+  @apply inline-flex items-center justify-center rounded-md px-3 py-1.5 text-sm font-medium transition-colors;
+}
+.jsp-btn-primary {
+  @apply jsp-btn bg-corp-accent text-corp-bg hover:opacity-90;
+}
+.jsp-btn-ghost {
+  @apply jsp-btn border border-corp-border text-corp-text hover:bg-corp-surface2;
+}
+.jsp-input {
+  @apply w-full rounded-md border border-corp-border bg-corp-surface px-3 py-2 text-sm text-corp-text focus:outline-none focus:border-corp-accent;
+}
+.jsp-label {
+  @apply block text-xs uppercase tracking-wide text-corp-muted mb-1;
+}

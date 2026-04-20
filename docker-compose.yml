@@ -1,0 +1,74 @@
+services:
+  db:
+    image: mysql:8.0
+    container_name: jsp-db
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    container_name: jsp-api
+    restart: unless-stopped
+    environment:
+      APP_ENV: ${APP_ENV}
+      MYSQL_HOST: ${MYSQL_HOST}
+      MYSQL_PORT: ${MYSQL_PORT}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      SESSION_SECRET: ${SESSION_SECRET}
+      MASTER_SECRET: ${MASTER_SECRET}
+      # ANTHROPIC_API_KEY is optional — if you've done `claude login` on the host,
+      # the bind-mount below uses that session instead. Only set this if you prefer
+      # pay-per-token API access.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_DEFAULT_MODEL: ${ANTHROPIC_DEFAULT_MODEL:-claude-sonnet-4-6}
+      CLAUDE_CODE_BIN: ${CLAUDE_CODE_BIN:-claude}
+      SKILLS_DIR: ${SKILLS_DIR:-/app/skills}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${API_PORT}:8000"
+    volumes:
+      - ./skills:/app/skills:ro
+      # Bind-mount the host's Claude Code config so subprocess calls reuse your
+      # existing OAuth session. Run `claude login` on the host once to populate
+      # this directory. If you'd rather use an API key, unset CLAUDE_HOME.
+      - ${CLAUDE_HOME:-./.claude-placeholder}:/root/.claude
+      - uploads:/app/uploads
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+        NEXT_PUBLIC_API_PORT: ${NEXT_PUBLIC_API_PORT}
+    container_name: jsp-web
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+      NEXT_PUBLIC_API_PORT: ${NEXT_PUBLIC_API_PORT}
+    depends_on:
+      - api
+    ports:
+      - "${WEB_PORT}:3000"
+
+volumes:
+  db_data:
+  uploads:
