@@ -169,21 +169,28 @@ NEXT_PUBLIC_API_URL=http://localhost:8000 npm run dev
 
 ## Claude Code authentication
 
-The API container has the Claude Code CLI installed (`@anthropic-ai/claude-code`). It calls Claude with `claude -p --output-format json` via `apps/api/app/skills/runner.py`. Auth works in one of two ways:
+The API container has the Claude Code CLI installed (`@anthropic-ai/claude-code`) and stores its config in an isolated named Docker volume (`claude_config`). **It does not touch your personal `~/.claude` on the host** — no skills or sessions leak in either direction. You authenticate the container's own Claude Code session once.
 
-1. **Claude Code OAuth (recommended).** Run `claude login` once on your host. `setup.sh` then points `CLAUDE_HOME` at the resulting config directory, and `docker-compose.yml` bind-mounts it to `/root/.claude` inside the container. The container reuses your subscription session — no per-token charges.
-2. **Anthropic API key.** Set `ANTHROPIC_API_KEY` in `.env`. The runner propagates it as an env var to the CLI subprocess. This uses pay-per-token billing regardless of whether you also have a subscription.
+Two options (pick one):
 
-Verify the CLI is reachable:
+1. **Claude Code OAuth (recommended — uses your Claude subscription).** After the stack is up, run:
+
+   ```bash
+   docker compose exec -it api claude login
+   ```
+
+   The CLI prints the standard OAuth URL; open it in a browser, complete the flow, and the credentials persist in the container's config volume across restarts. Use `claude logout` inside the container to revoke.
+
+2. **Anthropic API key (pay-per-token).** Set `ANTHROPIC_API_KEY` in `.env` and recreate the `api` container (`docker compose up -d api`). The runner propagates the key to the CLI subprocess. No login step needed.
+
+Verify:
 
 ```bash
 curl http://localhost:8000/health/claude
-# {"claude_cli_available":true,"cli_bin":"claude","has_anthropic_api_key":false}
+# {"claude_cli_available":true,"authenticated":true,"has_oauth_session":true,...}
 ```
 
-Caveats:
-- The container runs as root, so anything Claude Code writes to `/root/.claude` will be owned by root on the host too. If that bothers you, make the mount read-only in `docker-compose.yml` (but then token refreshes won't persist).
-- Auth token refresh is automatic when the bind-mount is read-write. Revoke via `claude logout` on the host.
+The Companion page shows an inline banner if the container isn't authenticated yet, with the exact login command.
 
 ## Security notes
 

@@ -20,6 +20,11 @@ function resolveBaseUrl(): string {
   return `http://localhost:${API_PORT}`;
 }
 
+/** Absolute URL builder — used for APIs consumed via EventSource or iframe. */
+export function apiUrl(path: string): string {
+  return path.startsWith("http") ? path : `${resolveBaseUrl()}${path}`;
+}
+
 export class ApiError extends Error {
   status: number;
   detail?: unknown;

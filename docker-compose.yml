@@ -46,10 +46,12 @@ services:
       - "${API_PORT}:8000"
     volumes:
       - ./skills:/app/skills:ro
-      # Bind-mount the host's Claude Code config so subprocess calls reuse your
-      # existing OAuth session. Run `claude login` on the host once to populate
-      # this directory. If you'd rather use an API key, unset CLAUDE_HOME.
-      - ${CLAUDE_HOME:-./.claude-placeholder}:/root/.claude
+      # Isolated named volume for the container's own Claude Code config.
+      # NOT bound to the host — nothing leaks in (your personal skills /
+      # sessions) or out. Run `docker compose exec -it api claude login` once
+      # after the stack is up to complete the standard OAuth flow and persist
+      # credentials into this volume.
+      - claude_config:/root/.claude
       - uploads:/app/uploads
 
   web:
@@ -72,3 +74,4 @@ services:
 volumes:
   db_data:
   uploads:
+  claude_config:

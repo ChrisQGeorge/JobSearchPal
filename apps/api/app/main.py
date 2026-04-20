@@ -5,7 +5,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1 import auth as auth_router
+from app.api.v1 import auth_claude as auth_claude_router
+from app.api.v1 import companion as companion_router
 from app.api.v1 import history as history_router
+from app.api.v1 import organizations as organizations_router
 from app.core.config import settings
 
 app = FastAPI(
@@ -46,16 +49,26 @@ async def health() -> dict[str, str]:
 
 @app.get("/health/claude", tags=["health"])
 async def claude_health() -> dict[str, object]:
-    """Reports whether the Claude Code CLI is reachable inside the container."""
+    """Reports whether the Claude Code CLI is reachable and authenticated inside the container."""
     from app.skills.runner import claude_is_available
+    from app.skills.token_store import has_token
 
     available = await claude_is_available()
+    has_stored_token = has_token()
+    has_api_key = bool(settings.ANTHROPIC_API_KEY)
+
     return {
         "claude_cli_available": available,
         "cli_bin": settings.CLAUDE_CODE_BIN,
-        "has_anthropic_api_key": bool(settings.ANTHROPIC_API_KEY),
+        "has_anthropic_api_key": has_api_key,
+        "has_oauth_session": has_stored_token,
+        "authenticated": has_stored_token or has_api_key,
+        "login_hint": "Use the Companion page's Launch OAuth login button.",
     }
 
 
 app.include_router(auth_router.router, prefix="/api/v1")
+app.include_router(auth_claude_router.router, prefix="/api/v1")
 app.include_router(history_router.router, prefix="/api/v1")
+app.include_router(organizations_router.router, prefix="/api/v1")
+app.include_router(companion_router.router, prefix="/api/v1")

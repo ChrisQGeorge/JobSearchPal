@@ -86,25 +86,14 @@ else
   chmod 600 "$ENV_FILE"
   echo "Wrote $ENV_FILE (mode 0600)."
 
-  # --- Claude Code auth discovery ---------------------------------------------
-  # Prefer the host's existing Claude Code OAuth session. Fall back to an
-  # ANTHROPIC_API_KEY if set in the environment.
-  HOST_CLAUDE_DIR="${CLAUDE_HOME:-${HOME}/.claude}"
-  if [[ -d "$HOST_CLAUDE_DIR" ]]; then
-    # docker compose on Windows accepts POSIX-style paths via Git Bash.
-    sed_i "s|^CLAUDE_HOME=.*|CLAUDE_HOME=${HOST_CLAUDE_DIR}|" "$ENV_FILE"
-    echo "Using Claude Code host config at: $HOST_CLAUDE_DIR"
-    echo "  (the API container will bind-mount it as /root/.claude)"
-  else
-    echo ""
-    echo "NOTE: no Claude Code config found at $HOST_CLAUDE_DIR."
-    echo "      Either run 'claude login' on this host to create it, or set"
-    echo "      ANTHROPIC_API_KEY in $ENV_FILE to use pay-per-token API access."
-  fi
-
   if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
     sed_i "s|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}|" "$ENV_FILE"
     echo "Wrote ANTHROPIC_API_KEY from environment."
+  else
+    echo ""
+    echo "NOTE: after the stack is up, complete the Claude Code OAuth login with:"
+    echo "        docker compose exec -it api claude login"
+    echo "      (or set ANTHROPIC_API_KEY in $ENV_FILE for pay-per-token API access)"
   fi
 fi
 

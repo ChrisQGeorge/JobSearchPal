@@ -7,42 +7,44 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class WorkExperienceIn(BaseModel):
-    company_id: int | None = None
+    organization_id: Optional[int] = None
     title: str = Field(min_length=1, max_length=255)
-    start_date: date | None = None
-    end_date: date | None = None
-    location: str | None = None
-    employment_type: str | None = None
-    summary: str | None = None
-    highlights: list[str] | None = None
-    technologies_used: list[str] | None = None
-    team_size: int | None = None
-    manager_name: str | None = None
-    reason_for_leaving: str | None = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    location: Optional[str] = None
+    employment_type: Optional[str] = None
+    summary: Optional[str] = None
+    highlights: Optional[list[str]] = None
+    technologies_used: Optional[list[str]] = None
+    team_size: Optional[int] = None
+    manager_name: Optional[str] = None
+    reason_for_leaving: Optional[str] = None
 
 
 class WorkExperienceOut(WorkExperienceIn):
     model_config = ConfigDict(from_attributes=True)
     id: int
+    organization_name: Optional[str] = None
 
 
 class EducationIn(BaseModel):
-    institution: str = Field(min_length=1, max_length=255)
-    degree: str | None = None
-    field_of_study: str | None = None
-    minor: str | None = None
-    start_date: date | None = None
-    end_date: date | None = None
-    gpa: float | None = None
-    honors: list[str] | None = None
-    thesis_title: str | None = None
-    thesis_summary: str | None = None
-    notes: str | None = None
+    organization_id: Optional[int] = None
+    degree: Optional[str] = None
+    field_of_study: Optional[str] = None
+    minor: Optional[str] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    gpa: Optional[float] = None
+    honors: Optional[list[str]] = None
+    thesis_title: Optional[str] = None
+    thesis_summary: Optional[str] = None
+    notes: Optional[str] = None
 
 
 class EducationOut(EducationIn):
     model_config = ConfigDict(from_attributes=True)
     id: int
+    organization_name: Optional[str] = None
 
 
 class SkillIn(BaseModel):

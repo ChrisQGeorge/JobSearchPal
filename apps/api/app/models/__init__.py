@@ -27,9 +27,9 @@ from app.models.preferences import (
 )
 from app.models.jobs import (
     ApplicationEvent,
-    Company,
     InterviewArtifact,
     InterviewRound,
+    Organization,
     TrackedJob,
 )
 from app.models.documents import DocumentEdit, GeneratedDocument, WritingSample
@@ -60,7 +60,7 @@ __all__ = [
     "WorkAuthorization",
     "Demographics",
     "DemographicSharePolicy",
-    "Company",
+    "Organization",
     "TrackedJob",
     "ApplicationEvent",
     "InterviewRound",

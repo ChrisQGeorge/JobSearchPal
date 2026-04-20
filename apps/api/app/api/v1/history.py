@@ -13,6 +13,7 @@ from app.models.history import (
     Skill,
     WorkExperience,
 )
+from app.models.jobs import Organization
 from app.models.user import User
 from app.schemas.history import (
     AchievementIn,
@@ -46,6 +47,29 @@ async def _get_owned(db: AsyncSession, model, entity_id: int, user_id: int):
     return obj
 
 
+async def _attach_org_names(db: AsyncSession, items) -> None:
+    """Set `organization_name` on each item for which `organization_id` is set.
+
+    Includes soft-deleted organizations so stale references still resolve to a
+    readable name until the user reassigns them. Writes the name to a transient
+    attribute so the Pydantic response model picks it up via `from_attributes`.
+    """
+    org_ids = {getattr(i, "organization_id", None) for i in items}
+    org_ids.discard(None)
+    if not org_ids:
+        for i in items:
+            i.organization_name = None
+        return
+    rows = (
+        await db.execute(
+            select(Organization.id, Organization.name).where(Organization.id.in_(org_ids))
+        )
+    ).all()
+    name_by_id = {row[0]: row[1] for row in rows}
+    for i in items:
+        i.organization_name = name_by_id.get(getattr(i, "organization_id", None))
+
+
 # ----- WorkExperience ---------------------------------------------------------
 
 @router.get("/work", response_model=list[WorkExperienceOut])
@@ -53,7 +77,9 @@ async def list_work(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> list[WorkExperience]:
-    return await _list_for_user(db, WorkExperience, user.id)
+    items = await _list_for_user(db, WorkExperience, user.id)
+    await _attach_org_names(db, items)
+    return items
 
 
 @router.post("/work", response_model=WorkExperienceOut, status_code=status.HTTP_201_CREATED)
@@ -66,6 +92,7 @@ async def create_work(
     db.add(obj)
     await db.commit()
     await db.refresh(obj)
+    await _attach_org_names(db, [obj])
     return obj
 
 
@@ -81,6 +108,7 @@ async def update_work(
         setattr(obj, k, v)
     await db.commit()
     await db.refresh(obj)
+    await _attach_org_names(db, [obj])
     return obj
 
 
@@ -103,7 +131,9 @@ async def list_education(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> list[Education]:
-    return await _list_for_user(db, Education, user.id)
+    items = await _list_for_user(db, Education, user.id)
+    await _attach_org_names(db, items)
+    return items
 
 
 @router.post("/education", response_model=EducationOut, status_code=status.HTTP_201_CREATED)
@@ -116,6 +146,7 @@ async def create_education(
     db.add(obj)
     await db.commit()
     await db.refresh(obj)
+    await _attach_org_names(db, [obj])
     return obj
 
 
@@ -131,6 +162,7 @@ async def update_education(
         setattr(obj, k, v)
     await db.commit()
     await db.refresh(obj)
+    await _attach_org_names(db, [obj])
     return obj
 
 
@@ -257,26 +289,47 @@ async def timeline(
 ) -> list[TimelineEvent]:
     """Unified feed of every dated history event for the Career Timeline page."""
     events: list[TimelineEvent] = []
+    works = await _list_for_user(db, WorkExperience, user.id)
+    educations = await _list_for_user(db, Education, user.id)
 
-    for w in await _list_for_user(db, WorkExperience, user.id):
+    # Pre-load referenced organization names so the timeline can show them as
+    # subtitles without issuing N+1 queries.
+    org_ids = {w.organization_id for w in works if w.organization_id} | {
+        e.organization_id for e in educations if e.organization_id
+    }
+    org_names: dict[int, str] = {}
+    if org_ids:
+        rows = (
+            await db.execute(
+                select(Organization.id, Organization.name).where(Organization.id.in_(org_ids))
+            )
+        ).all()
+        org_names = {row[0]: row[1] for row in rows}
+
+    for w in works:
         events.append(
             TimelineEvent(
                 kind="work",
                 id=w.id,
                 title=w.title,
-                subtitle=None,
+                subtitle=org_names.get(w.organization_id) if w.organization_id else None,
                 start_date=w.start_date,
                 end_date=w.end_date,
                 metadata={"location": w.location, "employment_type": w.employment_type},
             )
         )
-    for e in await _list_for_user(db, Education, user.id):
+    for e in educations:
+        org_name = org_names.get(e.organization_id) if e.organization_id else None
         events.append(
             TimelineEvent(
                 kind="education",
                 id=e.id,
-                title=f"{e.degree or ''} {e.field_of_study or ''}".strip() or e.institution,
-                subtitle=e.institution,
+                title=(
+                    f"{e.degree or ''} {e.field_of_study or ''}".strip()
+                    or org_name
+                    or "Education"
+                ),
+                subtitle=org_name,
                 start_date=e.start_date,
                 end_date=e.end_date,
                 metadata={"gpa": float(e.gpa) if e.gpa is not None else None},

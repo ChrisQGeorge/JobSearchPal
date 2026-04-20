@@ -20,10 +20,21 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.models.base import Base, IdMixin, SoftDeleteMixin, TimestampMixin
 
 
-class Company(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
-    __tablename__ = "companies"
+class Organization(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
+    """A generic organization — employer, school, cert issuer, conference, etc.
+
+    Referenced by WorkExperience, Education, TrackedJob, Contact, and anywhere
+    else the user needs to link a dated history entry to a real-world entity.
+    """
+
+    __tablename__ = "organizations"
 
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    # Narrow type hint — drives icons / filters in the UI. Free-form to allow
+    # future additions without a migration.
+    type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="company", index=True,
+    )  # company / university / nonprofit / government / conference / publisher / agency / other
     website: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     industry: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     size: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
@@ -42,8 +53,8 @@ class TrackedJob(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     user_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    company_id: Mapped[Optional[int]] = mapped_column(
-        BigInteger, ForeignKey("companies.id", ondelete="SET NULL"), nullable=True, index=True
+    organization_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True, index=True
     )
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     job_description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import settings
+from app.skills.token_store import load_token
 
 log = logging.getLogger(__name__)
 
@@ -56,13 +57,20 @@ async def run_claude_prompt(
     allowed_tools: list[str] | None = None,
     timeout_seconds: int = 120,
     cwd: str | None = None,
+    session_id: str | None = None,
 ) -> ClaudeResult:
     """Run the Claude Code CLI non-interactively and return parsed output.
+
+    If `session_id` is provided, passes `--resume <id>` so the CLI continues an
+    existing multi-turn conversation instead of starting a fresh one.
 
     Raises ClaudeCodeError on non-zero exit, timeout, or JSON parse failure.
     """
 
     cmd: list[str] = [settings.CLAUDE_CODE_BIN, "-p", prompt, "--output-format", output_format]
+
+    if session_id:
+        cmd += ["--resume", session_id]
 
     # When running inside the container, skills are bind-mounted to SKILLS_DIR.
     # Set the CWD to that dir (or a caller override) so auto-discovery finds them.
@@ -78,9 +86,12 @@ async def run_claude_prompt(
         cmd += ["--allowedTools", ",".join(allowed_tools)]
 
     env = os.environ.copy()
-    # Propagate the API key only if it is set. Otherwise Claude Code uses the
-    # OAuth session in /root/.claude (bind-mounted from the host).
-    if settings.ANTHROPIC_API_KEY:
+    # Auth precedence: a stored long-lived OAuth token (from the in-UI login
+    # flow) wins, otherwise fall back to an ANTHROPIC_API_KEY if configured.
+    oauth_token = load_token()
+    if oauth_token:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
+    elif settings.ANTHROPIC_API_KEY:
         env["ANTHROPIC_API_KEY"] = settings.ANTHROPIC_API_KEY
     env.setdefault("CLAUDE_CONFIG_DIR", "/root/.claude")
 

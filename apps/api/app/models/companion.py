@@ -25,6 +25,9 @@ class CompanionConversation(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     persona_id: Mapped[Optional[int]] = mapped_column(
         BigInteger, ForeignKey("personas.id", ondelete="SET NULL"), nullable=True
     )
+    # Claude Code CLI session ID. We pass `--resume <id>` on subsequent turns
+    # so the CLI retains multi-turn context. Populated after the first turn.
+    claude_session_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
 
 
 class ConversationMessage(Base, IdMixin, TimestampMixin):

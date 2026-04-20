@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { OrganizationCombobox } from "@/components/OrganizationCombobox";
 import { PageShell } from "@/components/PageShell";
 import { api, ApiError } from "@/lib/api";
 import type {
@@ -118,6 +119,7 @@ function WorkPanel() {
                   <div>
                     <div className="font-medium">{w.title}</div>
                     <div className="text-sm text-corp-muted">
+                      {w.organization_name ? `${w.organization_name} · ` : ""}
                       {w.start_date ?? "?"} → {w.end_date ?? "current"}
                       {w.location ? ` · ${w.location}` : null}
                     </div>
@@ -160,6 +162,9 @@ function WorkForm({
   onSubmit: (p: Partial<WorkExperience>) => Promise<void> | void;
   onCancel: () => void;
 }) {
+  const [organizationId, setOrganizationId] = useState<number | null>(
+    initial?.organization_id ?? null,
+  );
   const [title, setTitle] = useState(initial?.title ?? "");
   const [startDate, setStartDate] = useState(initial?.start_date ?? "");
   const [endDate, setEndDate] = useState(initial?.end_date ?? "");
@@ -170,6 +175,7 @@ function WorkForm({
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     await onSubmit({
+      organization_id: organizationId,
       title,
       start_date: startDate || null,
       end_date: endDate || null,
@@ -181,9 +187,19 @@ function WorkForm({
 
   return (
     <form onSubmit={submit} className="space-y-3">
-      <div>
-        <label className="jsp-label">Title</label>
-        <input className="jsp-input" value={title} onChange={(e) => setTitle(e.target.value)} required />
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className="jsp-label">Organization</label>
+          <OrganizationCombobox
+            value={organizationId}
+            onChange={setOrganizationId}
+            defaultTypeOnCreate="company"
+          />
+        </div>
+        <div>
+          <label className="jsp-label">Title</label>
+          <input className="jsp-input" value={title} onChange={(e) => setTitle(e.target.value)} required />
+        </div>
       </div>
       <div className="grid grid-cols-2 gap-3">
         <div>
@@ -290,7 +306,9 @@ function EducationPanel() {
                   {e.degree ? `${e.degree} ` : ""}
                   {e.field_of_study ?? ""}
                 </div>
-                <div className="text-sm text-corp-muted">{e.institution}</div>
+                {e.organization_name ? (
+                  <div className="text-sm text-corp-muted">{e.organization_name}</div>
+                ) : null}
                 <div className="text-sm text-corp-muted">
                   {e.start_date ?? "?"} → {e.end_date ?? "current"}
                 </div>
@@ -319,7 +337,7 @@ function EducationForm({
   onCancel: () => void;
   onSubmit: (p: Partial<Education>) => Promise<void>;
 }) {
-  const [form, setForm] = useState<Partial<Education>>({ institution: "" });
+  const [form, setForm] = useState<Partial<Education>>({ organization_id: null });
   return (
     <form
       onSubmit={async (e) => {
@@ -331,11 +349,11 @@ function EducationForm({
       <div className="grid grid-cols-2 gap-3">
         <div>
           <label className="jsp-label">Institution</label>
-          <input
-            className="jsp-input"
+          <OrganizationCombobox
+            value={form.organization_id ?? null}
+            onChange={(id) => setForm({ ...form, organization_id: id })}
+            defaultTypeOnCreate="university"
             required
-            value={form.institution ?? ""}
-            onChange={(e) => setForm({ ...form, institution: e.target.value })}
           />
         </div>
         <div>

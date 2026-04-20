@@ -27,8 +27,8 @@ class WorkExperience(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     user_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    company_id: Mapped[Optional[int]] = mapped_column(
-        BigInteger, ForeignKey("companies.id", ondelete="SET NULL"), nullable=True, index=True
+    organization_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True, index=True
     )
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     start_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
@@ -64,7 +64,11 @@ class Education(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     user_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    institution: Mapped[str] = mapped_column(String(255), nullable=False)
+    # The school / university, stored as an Organization row. Nullable so we can
+    # soft-delete the institution row without orphaning the education record.
+    organization_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     degree: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     field_of_study: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     minor: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
@@ -227,8 +231,8 @@ class Contact(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     user_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    company_id: Mapped[Optional[int]] = mapped_column(
-        BigInteger, ForeignKey("companies.id", ondelete="SET NULL"), nullable=True, index=True
+    organization_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True, index=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
