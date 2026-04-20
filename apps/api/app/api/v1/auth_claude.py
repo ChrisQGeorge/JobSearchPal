@@ -220,14 +220,26 @@ async def start_login(_: User = Depends(get_current_user)) -> dict[str, str]:
 
     env = os.environ.copy()
     env.setdefault("CLAUDE_CONFIG_DIR", "/root/.claude")
-    # `script` emits ANSI timing info unless quiet. We also use /dev/null for
-    # the typescript file since we don't need a transcript on disk.
+    # Ink (the CLI's terminal UI) needs a reasonable terminal size and TERM,
+    # otherwise it degrades rendering and corrupts the token display — e.g.
+    # with TERM=dumb and 0x0 size, the token gets broken into visual chunks
+    # and two characters are replaced by cursor-right moves, making
+    # auto-extraction impossible.
+    env["TERM"] = "xterm-256color"
+    env["COLUMNS"] = "200"
+    env["LINES"] = "50"
+    # `script` wraps the command in a PTY. We also set stty inside so the
+    # kernel knows the PTY's window size (TIOCSWINSZ), not just env vars.
+    inner_cmd = (
+        "stty rows 50 cols 200 2>/dev/null; "
+        f"{settings.CLAUDE_CODE_BIN} setup-token"
+    )
     try:
         proc = await asyncio.create_subprocess_exec(
             "script",
             "-q",
             "-c",
-            f"{settings.CLAUDE_CODE_BIN} setup-token",
+            inner_cmd,
             "/dev/null",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
