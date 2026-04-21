@@ -286,6 +286,7 @@ function OverviewTab({
         job={job}
         onAnalyzed={onSaved}
       />
+      <AutofillPanel jobId={job.id} />
       {(job.required_skills && job.required_skills.length > 0) ||
       (job.nice_to_have_skills && job.nice_to_have_skills.length > 0) ? (
         <SkillsAnalysis
@@ -2719,6 +2720,177 @@ function CompanyResearchPanel({
             ))}
           </ul>
         </details>
+      ) : null}
+    </div>
+  );
+}
+
+type AutofillAnswer = {
+  question: string;
+  answer: string | null;
+  placeholder_keys_used: string[];
+  skipped_reason?: string | null;
+};
+
+function AutofillPanel({ jobId }: { jobId: number }) {
+  const [open, setOpen] = useState(false);
+  const [questionsText, setQuestionsText] = useState("");
+  const [extra, setExtra] = useState("");
+  const [running, setRunning] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [out, setOut] = useState<{
+    answers: AutofillAnswer[];
+    fields_shared: string[];
+    warning?: string | null;
+  } | null>(null);
+
+  async function run() {
+    const questions = questionsText
+      .split("\n")
+      .map((q) => q.trim())
+      .filter(Boolean);
+    if (!questions.length) {
+      setErr("Enter at least one question.");
+      return;
+    }
+    setRunning(true);
+    setErr(null);
+    setOut(null);
+    try {
+      const res = await api.post<{
+        answers: AutofillAnswer[];
+        fields_shared: string[];
+        warning?: string | null;
+      }>("/api/v1/autofill", {
+        tracked_job_id: jobId,
+        questions,
+        extra_notes: extra.trim() || null,
+      });
+      setOut(res);
+    } catch (e) {
+      setErr(
+        e instanceof ApiError
+          ? `Autofill failed (HTTP ${e.status}).`
+          : "Autofill failed.",
+      );
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  async function copy(text: string) {
+    await navigator.clipboard.writeText(text);
+  }
+
+  return (
+    <div className="jsp-card p-5">
+      <div className="flex items-start justify-between gap-3 flex-wrap">
+        <div>
+          <h3 className="text-sm uppercase tracking-wider text-corp-muted">
+            Application autofill
+          </h3>
+          <p className="text-[11px] text-corp-muted mt-1">
+            Paste in questions from the application form (one per line). Answers
+            come from your Job Preferences + Work Authorization + history.
+            Demographic questions resolve via templated substitution — the LLM
+            never sees that data as free text.
+          </p>
+        </div>
+        <button
+          className="jsp-btn-ghost text-xs"
+          onClick={() => setOpen((v) => !v)}
+          type="button"
+        >
+          {open ? "Hide" : "Open"}
+        </button>
+      </div>
+      {open ? (
+        <div className="mt-3 space-y-3">
+          <div>
+            <label className="jsp-label">Questions (one per line)</label>
+            <textarea
+              className="jsp-input min-h-[120px]"
+              value={questionsText}
+              onChange={(e) => setQuestionsText(e.target.value)}
+              placeholder={
+                "Why are you interested in this role?\nWhat is your target salary?\nDo you need visa sponsorship?"
+              }
+              disabled={running}
+            />
+          </div>
+          <div>
+            <label className="jsp-label">Extra notes (optional)</label>
+            <input
+              className="jsp-input"
+              value={extra}
+              onChange={(e) => setExtra(e.target.value)}
+              placeholder="Keep answers under 150 words."
+              disabled={running}
+            />
+          </div>
+          {err ? <div className="text-xs text-corp-danger">{err}</div> : null}
+          <div className="flex justify-end">
+            <button
+              className="jsp-btn-primary"
+              onClick={run}
+              disabled={running}
+              type="button"
+            >
+              {running ? "Filling..." : "Generate answers"}
+            </button>
+          </div>
+
+          {out ? (
+            <div className="space-y-2">
+              {out.warning ? (
+                <div className="text-xs text-corp-accent2 bg-corp-accent2/10 border border-corp-accent2/40 p-2 rounded">
+                  ⚠ {out.warning}
+                </div>
+              ) : null}
+              {out.fields_shared.length ? (
+                <div className="text-[11px] text-corp-muted">
+                  Templated fields used: {out.fields_shared.join(", ")} (logged
+                  to AutofillLog).
+                </div>
+              ) : null}
+              <ul className="space-y-2">
+                {out.answers.map((a, i) => (
+                  <li
+                    key={i}
+                    className="jsp-card p-3 bg-corp-surface2"
+                  >
+                    <div className="text-[11px] uppercase tracking-wider text-corp-muted mb-1">
+                      Q{i + 1}: {a.question}
+                    </div>
+                    {a.answer ? (
+                      <>
+                        <p className="text-sm whitespace-pre-wrap">{a.answer}</p>
+                        <div className="flex justify-between items-center mt-1">
+                          <span className="text-[10px] text-corp-muted">
+                            {a.placeholder_keys_used.length
+                              ? "uses: " + a.placeholder_keys_used.join(", ")
+                              : ""}
+                          </span>
+                          <button
+                            type="button"
+                            className="jsp-btn-ghost text-xs"
+                            onClick={() => copy(a.answer!)}
+                          >
+                            Copy
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <p className="text-xs text-corp-accent2 italic">
+                        Skipped{a.skipped_reason ? ` — ${a.skipped_reason}` : ""}
+                      </p>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+        </div>
       ) : null}
     </div>
   );

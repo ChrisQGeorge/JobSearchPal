@@ -161,6 +161,8 @@ export default function DashboardPage() {
         </section>
       )}
 
+      <StrategyPanel />
+
       <section className="jsp-card p-5 mt-4">
         <h2 className="text-sm uppercase tracking-wider text-corp-muted mb-3">
           Quick actions
@@ -437,6 +439,138 @@ function ActivitySparkline({
         <span>{total} updates</span>
         <span>{series[series.length - 1]?.date}</span>
       </div>
+    </div>
+  );
+}
+
+type StrategyResult = {
+  headline: string;
+  working_well: string[];
+  struggling: string[];
+  next_actions: string[];
+  risks: string[];
+  warning?: string | null;
+};
+
+function StrategyPanel() {
+  const [result, setResult] = useState<StrategyResult | null>(null);
+  const [running, setRunning] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function run() {
+    setRunning(true);
+    setErr(null);
+    try {
+      setResult(await api.post<StrategyResult>("/api/v1/metrics/strategy"));
+    } catch (e) {
+      setErr(
+        e instanceof ApiError
+          ? `Strategy failed (HTTP ${e.status}).`
+          : "Strategy failed.",
+      );
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  async function snapshot() {
+    setErr(null);
+    try {
+      await api.post("/api/v1/metrics/snapshot");
+    } catch (e) {
+      setErr(e instanceof ApiError ? `HTTP ${e.status}` : "Snapshot failed.");
+    }
+  }
+
+  return (
+    <section className="jsp-card p-5 mt-4">
+      <div className="flex items-start justify-between gap-3 flex-wrap">
+        <div>
+          <h2 className="text-sm uppercase tracking-wider text-corp-muted">
+            Strategy advisor
+          </h2>
+          <p className="text-xs text-corp-muted mt-1">
+            Reads your pipeline snapshot + recent snapshot history and tells you
+            where to push, where to stop bleeding time, and what to watch.
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            className="jsp-btn-ghost text-xs"
+            onClick={snapshot}
+          >
+            Save snapshot
+          </button>
+          <button
+            type="button"
+            className="jsp-btn-primary"
+            onClick={run}
+            disabled={running}
+          >
+            {running ? "Thinking..." : "Advise me"}
+          </button>
+        </div>
+      </div>
+      {err ? <div className="text-xs text-corp-danger mt-2">{err}</div> : null}
+      {result ? (
+        <div className="mt-3 space-y-3">
+          {result.warning ? (
+            <div className="text-xs text-corp-accent2 bg-corp-accent2/10 border border-corp-accent2/40 p-2 rounded">
+              ⚠ {result.warning}
+            </div>
+          ) : null}
+          <p className="text-sm font-medium">{result.headline}</p>
+          <div className="grid grid-cols-2 gap-4 text-sm">
+            {result.working_well.length ? (
+              <StratBullets label="Working well" items={result.working_well} tone="good" />
+            ) : null}
+            {result.struggling.length ? (
+              <StratBullets label="Struggling" items={result.struggling} tone="warn" />
+            ) : null}
+            {result.next_actions.length ? (
+              <StratBullets
+                label="Next actions"
+                items={result.next_actions}
+              />
+            ) : null}
+            {result.risks.length ? (
+              <StratBullets label="Risks" items={result.risks} tone="danger" />
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function StratBullets({
+  label,
+  items,
+  tone,
+}: {
+  label: string;
+  items: string[];
+  tone?: "good" | "warn" | "danger";
+}) {
+  const toneClass =
+    tone === "good"
+      ? "text-emerald-300"
+      : tone === "warn"
+        ? "text-corp-accent2"
+        : tone === "danger"
+          ? "text-corp-danger"
+          : "text-corp-muted";
+  return (
+    <div>
+      <div className={`text-[10px] uppercase tracking-wider mb-1 ${toneClass}`}>
+        {label}
+      </div>
+      <ul className="list-disc list-inside space-y-0.5">
+        {items.map((it, i) => (
+          <li key={i}>{it}</li>
+        ))}
+      </ul>
     </div>
   );
 }
