@@ -15,7 +15,14 @@ async def get_current_user(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> User:
+    # Auth precedence: session cookie (browser) wins, then Authorization bearer
+    # header (used by the Companion subprocess to call the API on behalf of
+    # the user via curl).
     token = request.cookies.get(settings.COOKIE_NAME)
+    if not token:
+        auth = request.headers.get("authorization") or request.headers.get("Authorization")
+        if auth and auth.lower().startswith("bearer "):
+            token = auth.split(" ", 1)[1].strip()
     if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

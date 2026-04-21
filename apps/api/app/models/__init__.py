@@ -7,6 +7,7 @@ from app.models.history import (
     Certification,
     Contact,
     Course,
+    CourseSkill,
     CustomEvent,
     Education,
     Language,
@@ -29,11 +30,13 @@ from app.models.jobs import (
     ApplicationEvent,
     InterviewArtifact,
     InterviewRound,
+    JobFetchQueue,
     Organization,
     TrackedJob,
 )
 from app.models.documents import DocumentEdit, GeneratedDocument, WritingSample
 from app.models.companion import CompanionConversation, ConversationMessage, Task
+from app.models.links import EntityLink
 from app.models.operational import AuditLog, AutofillLog, MetricSnapshot
 
 __all__ = [
@@ -43,6 +46,7 @@ __all__ = [
     "ApiCredential",
     "WorkExperience",
     "WorkExperienceSkill",
+    "CourseSkill",
     "Education",
     "Course",
     "Certification",
@@ -65,12 +69,14 @@ __all__ = [
     "ApplicationEvent",
     "InterviewRound",
     "InterviewArtifact",
+    "JobFetchQueue",
     "GeneratedDocument",
     "DocumentEdit",
     "WritingSample",
     "CompanionConversation",
     "ConversationMessage",
     "Task",
+    "EntityLink",
     "AuditLog",
     "AutofillLog",
     "MetricSnapshot",

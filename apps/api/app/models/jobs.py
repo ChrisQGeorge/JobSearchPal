@@ -6,6 +6,7 @@ from typing import Optional
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     Date,
     DateTime,
     ForeignKey,
@@ -71,6 +72,20 @@ class TrackedJob(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     jd_analysis: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     fit_summary: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
+    # Explicit JD-extracted fields (populated by fetch-from-url or manually).
+    experience_years_min: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    experience_years_max: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    experience_level: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    employment_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    education_required: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    visa_sponsorship_offered: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    relocation_offered: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    # Skills the JD calls out as required vs nice-to-have. Stored as JSON
+    # arrays of strings; the UI matches them against the user's Skill catalog
+    # at render time and offers +Add buttons for misses.
+    required_skills: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    nice_to_have_skills: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     date_posted: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     date_discovered: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     date_applied: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
@@ -109,6 +124,43 @@ class InterviewRound(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     self_rating: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     notes_md: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     prep_notes_md: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class JobFetchQueue(Base, IdMixin, TimestampMixin):
+    """Queue of URLs to fetch + auto-create as TrackedJob records.
+
+    A background worker polls rows with state='queued', runs the URL-fetch
+    flow, and on success creates a TrackedJob seeded with the fetched fields
+    plus any user-supplied overrides (status, date_applied, date_closed).
+    """
+
+    __tablename__ = "job_fetch_queue"
+
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    url: Mapped[str] = mapped_column(String(2048), nullable=False)
+
+    # Preset overrides applied to the created TrackedJob.
+    desired_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    desired_priority: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    desired_date_applied: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    desired_date_closed: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    desired_date_posted: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    desired_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Processing state machine: queued → processing → done | error
+    state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="queued", index=True
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_tracked_job_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("tracked_jobs.id", ondelete="SET NULL"), nullable=True
+    )
 
 
 class InterviewArtifact(Base, IdMixin, TimestampMixin, SoftDeleteMixin):

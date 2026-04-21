@@ -1,21 +1,48 @@
 """FastAPI application entrypoint."""
 from __future__ import annotations
 
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1 import auth as auth_router
 from app.api.v1 import auth_claude as auth_claude_router
 from app.api.v1 import companion as companion_router
+from app.api.v1 import documents as documents_router
 from app.api.v1 import history as history_router
+from app.api.v1 import jobs as jobs_router
 from app.api.v1 import organizations as organizations_router
 from app.core.config import settings
+from app.skills.queue_worker import run_forever as run_queue_worker
+
+log = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Launch the background JobFetchQueue worker. Single task, single
+    # container — if we ever scale out we'll need real coordination.
+    task = asyncio.create_task(run_queue_worker(), name="job-fetch-queue")
+    log.info("Started job-fetch-queue background worker")
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
 
 app = FastAPI(
     title="Job Search Pal API",
     version="0.1.0",
     docs_url="/docs",
     redoc_url=None,
+    lifespan=lifespan,
 )
 
 # Accept any origin on the loopback or RFC1918 private networks, or *.local mDNS
@@ -71,4 +98,6 @@ app.include_router(auth_router.router, prefix="/api/v1")
 app.include_router(auth_claude_router.router, prefix="/api/v1")
 app.include_router(history_router.router, prefix="/api/v1")
 app.include_router(organizations_router.router, prefix="/api/v1")
+app.include_router(jobs_router.router, prefix="/api/v1")
+app.include_router(documents_router.router, prefix="/api/v1")
 app.include_router(companion_router.router, prefix="/api/v1")

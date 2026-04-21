@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { PageShell } from "@/components/PageShell";
-import { api } from "@/lib/api";
+import { api, ApiError } from "@/lib/api";
 import {
   ORG_TYPES,
   type Organization,
@@ -135,7 +135,7 @@ export default function OrganizationsPage() {
           create them for you as you add experiences.
         </div>
       ) : (
-        <ul className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <ul className="jsp-card divide-y divide-corp-border overflow-hidden">
           {items.map((o) => (
             <OrganizationCard key={o.id} summary={o} onEdit={openEdit} onDelete={remove} />
           ))}
@@ -164,34 +164,36 @@ function OrganizationCard({
     ? usage.work_experiences + usage.educations + usage.tracked_jobs + usage.contacts
     : 0;
 
+  const usageLabel = usage
+    ? total > 0
+      ? [
+          usage.work_experiences > 0 ? `${usage.work_experiences} work` : null,
+          usage.educations > 0 ? `${usage.educations} education` : null,
+          usage.tracked_jobs > 0 ? `${usage.tracked_jobs} jobs` : null,
+          usage.contacts > 0 ? `${usage.contacts} contacts` : null,
+        ]
+          .filter(Boolean)
+          .join(" · ")
+      : "Unused"
+    : null;
+
   return (
-    <li className="jsp-card p-4 flex justify-between gap-3">
-      <div>
-        <div className="flex items-baseline gap-2">
-          <div className="font-medium">{summary.name}</div>
-          <span className="text-[10px] uppercase tracking-wider text-corp-muted">
-            {summary.type}
-          </span>
-        </div>
-        {usage ? (
-          total > 0 ? (
-            <div className="text-xs text-corp-muted mt-1">
-              {usage.work_experiences > 0 ? `${usage.work_experiences} work · ` : ""}
-              {usage.educations > 0 ? `${usage.educations} education · ` : ""}
-              {usage.tracked_jobs > 0 ? `${usage.tracked_jobs} jobs · ` : ""}
-              {usage.contacts > 0 ? `${usage.contacts} contacts` : ""}
-            </div>
-          ) : (
-            <div className="text-xs text-corp-muted mt-1">Unused</div>
-          )
+    <li className="flex items-center gap-3 py-1.5 px-3 hover:bg-corp-surface2">
+      <span className="inline-block px-2 py-0.5 rounded text-[10px] uppercase tracking-wider bg-corp-surface2 text-corp-muted border border-corp-border shrink-0">
+        {summary.type}
+      </span>
+      <div className="min-w-0 flex-1 flex items-baseline gap-2">
+        <span className="text-sm truncate">{summary.name}</span>
+        {usageLabel ? (
+          <span className="text-xs text-corp-muted truncate">· {usageLabel}</span>
         ) : null}
       </div>
-      <div className="flex gap-2 shrink-0">
-        <button className="jsp-btn-ghost" onClick={() => onEdit(summary)}>
+      <div className="flex gap-1 shrink-0">
+        <button className="jsp-btn-ghost text-xs" onClick={() => onEdit(summary)}>
           Edit
         </button>
         <button
-          className="jsp-btn-ghost text-corp-danger border-corp-danger/40"
+          className="jsp-btn-ghost text-xs text-corp-danger border-corp-danger/40"
           onClick={() => onDelete(summary.id)}
         >
           Delete
@@ -221,7 +223,62 @@ function OrganizationForm({
     headquarters_location: initial?.headquarters_location ?? null,
     founded_year: initial?.founded_year ?? null,
     description: initial?.description ?? null,
+    research_notes: initial?.research_notes ?? null,
   });
+  const [snapshot, setSnapshot] = useState<Organization | null>(initial ?? null);
+  const [researching, setResearching] = useState(false);
+  const [researchHint, setResearchHint] = useState("");
+  const [researchErr, setResearchErr] = useState<string | null>(null);
+
+  async function runResearch() {
+    if (!initial?.id) return;
+    if (!form.name || !form.name.trim()) {
+      setResearchErr("Name is required to research this organization.");
+      return;
+    }
+    setResearching(true);
+    setResearchErr(null);
+    try {
+      const updated = await api.post<Organization>(
+        `/api/v1/organizations/${initial.id}/research`,
+        { hint: researchHint.trim() || null },
+      );
+      setSnapshot(updated);
+      setForm((prev) => ({
+        ...prev,
+        website: prev.website || updated.website,
+        industry: prev.industry || updated.industry,
+        size: prev.size || updated.size,
+        headquarters_location:
+          prev.headquarters_location || updated.headquarters_location,
+        founded_year: prev.founded_year || updated.founded_year,
+        description: prev.description || updated.description,
+        research_notes: updated.research_notes ?? prev.research_notes ?? null,
+      }));
+      setResearchHint("");
+    } catch (e) {
+      setResearchErr(
+        e instanceof ApiError
+          ? `Research failed (HTTP ${e.status}).`
+          : "Research failed.",
+      );
+    } finally {
+      setResearching(false);
+    }
+  }
+
+  const techHints = snapshot?.tech_stack_hints ?? [];
+  const sourceLinks = snapshot?.source_links ?? [];
+  const reputation = (snapshot?.reputation_signals ?? null) as
+    | {
+        engineering_culture?: string | null;
+        work_life_balance?: string | null;
+        layoff_history?: string | null;
+        recent_news?: string | null;
+        red_flags?: string[] | null;
+        green_flags?: string[] | null;
+      }
+    | null;
 
   return (
     <form
@@ -316,7 +373,157 @@ function OrganizationForm({
             }
           />
         </div>
+        <div className="col-span-2">
+          <label className="jsp-label">Research notes (markdown)</label>
+          <textarea
+            className="jsp-input min-h-[120px]"
+            placeholder="What you've learned that a candidate would actually want before interviewing — history, culture, recent news."
+            value={form.research_notes ?? ""}
+            onChange={(e) =>
+              setForm({ ...form, research_notes: e.target.value || null })
+            }
+          />
+        </div>
       </div>
+
+      {initial?.id ? (
+        <div className="jsp-card p-3 bg-corp-surface2 space-y-2">
+          <div className="flex items-start justify-between gap-3 flex-wrap">
+            <div className="min-w-0 flex-1">
+              <div className="text-xs uppercase tracking-wider text-corp-muted">
+                Companion research
+              </div>
+              <p className="text-[11px] text-corp-muted mt-0.5">
+                WebSearch + WebFetch. Fills empty fields, refreshes research
+                notes and reputation signals, merges tech-stack hints and
+                source links.
+              </p>
+            </div>
+            <button
+              type="button"
+              className="jsp-btn-primary"
+              onClick={runResearch}
+              disabled={researching}
+            >
+              {researching ? "Researching..." : "Research company"}
+            </button>
+          </div>
+          <div>
+            <input
+              className="jsp-input"
+              placeholder="Optional focus: 'recent layoffs', 'engineering culture', 'infra stack'..."
+              value={researchHint}
+              onChange={(e) => setResearchHint(e.target.value)}
+              disabled={researching}
+            />
+          </div>
+          {researchErr ? (
+            <div className="text-xs text-corp-danger">{researchErr}</div>
+          ) : null}
+
+          {techHints.length > 0 ? (
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-corp-muted mb-1">
+                Tech stack hints
+              </div>
+              <div className="flex flex-wrap gap-1">
+                {techHints.map((t) => (
+                  <span
+                    key={t}
+                    className="text-[11px] px-2 py-0.5 rounded bg-corp-surface border border-corp-border text-corp-muted"
+                  >
+                    {t}
+                  </span>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
+          {reputation ? (
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              {reputation.engineering_culture ? (
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-corp-muted">
+                    Engineering culture
+                  </div>
+                  <div>{reputation.engineering_culture}</div>
+                </div>
+              ) : null}
+              {reputation.work_life_balance ? (
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-corp-muted">
+                    Work/life balance
+                  </div>
+                  <div>{reputation.work_life_balance}</div>
+                </div>
+              ) : null}
+              {reputation.layoff_history ? (
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-corp-muted">
+                    Layoff history
+                  </div>
+                  <div>{reputation.layoff_history}</div>
+                </div>
+              ) : null}
+              {reputation.recent_news ? (
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-corp-muted">
+                    Recent news
+                  </div>
+                  <div>{reputation.recent_news}</div>
+                </div>
+              ) : null}
+              {reputation.green_flags && reputation.green_flags.length > 0 ? (
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-emerald-300">
+                    Green flags
+                  </div>
+                  <ul className="list-disc list-inside space-y-0.5">
+                    {reputation.green_flags.map((f, i) => (
+                      <li key={i}>{f}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+              {reputation.red_flags && reputation.red_flags.length > 0 ? (
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-corp-danger">
+                    Red flags
+                  </div>
+                  <ul className="list-disc list-inside space-y-0.5">
+                    {reputation.red_flags.map((f, i) => (
+                      <li key={i}>{f}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
+          {sourceLinks.length > 0 ? (
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-corp-muted mb-1">
+                Sources consulted
+              </div>
+              <ul className="text-[11px] space-y-0.5">
+                {sourceLinks.map((l, i) => (
+                  <li key={i} className="truncate">
+                    <a
+                      href={l}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-corp-accent hover:underline"
+                    >
+                      {l}
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
       <div className="flex gap-2 justify-end">
         <button type="button" className="jsp-btn-ghost" onClick={onCancel}>
           Cancel

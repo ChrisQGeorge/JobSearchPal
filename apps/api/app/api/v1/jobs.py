@@ -1,0 +1,1271 @@
+"""Job Tracker: tracked jobs, application events, interview rounds.
+
+Status transitions are free-form (any → any) per SRS REQ-FUNC-JOBS-001 but
+always emit an ApplicationEvent so the audit/history is preserved.
+"""
+
+import json
+import logging
+import re
+from datetime import date, datetime, timezone
+from typing import Optional
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    UploadFile,
+    status as http_status,
+)
+from fastapi.responses import Response
+from pydantic import BaseModel
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+log = logging.getLogger(__name__)
+
+from app.core.database import get_db
+from app.core.deps import get_current_user
+from app.models.jobs import (
+    ApplicationEvent,
+    InterviewArtifact,
+    InterviewRound,
+    JobFetchQueue,
+    Organization,
+    TrackedJob,
+)
+from app.models.user import User
+from app.schemas.jobs import (
+    ApplicationEventIn,
+    ApplicationEventOut,
+    ARTIFACT_KINDS,
+    FetchFromUrlIn,
+    FetchedJobInfo,
+    InterviewArtifactIn,
+    InterviewArtifactOut,
+    InterviewRoundIn,
+    InterviewRoundOut,
+    JOB_STATUSES,
+    JobFetchQueueIn,
+    JobFetchQueueOut,
+    PRIORITIES,
+    REMOTE_POLICIES,
+    TrackedJobIn,
+    TrackedJobOut,
+    TrackedJobSummary,
+    TrackedJobUpdate,
+)
+from app.skills.runner import ClaudeCodeError, run_claude_prompt
+
+router = APIRouter(prefix="/jobs", tags=["jobs"])
+
+
+def _validate_status(v: Optional[str]) -> Optional[str]:
+    if v is None:
+        return v
+    if v not in JOB_STATUSES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown status '{v}'. Allowed: {sorted(JOB_STATUSES)}",
+        )
+    return v
+
+
+def _validate_simple(v: Optional[str], allowed: set[str], label: str) -> Optional[str]:
+    if v is None or v == "":
+        return None
+    if v not in allowed:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown {label} '{v}'. Allowed: {sorted(allowed)}",
+        )
+    return v
+
+
+async def _get_owned_job(
+    db: AsyncSession, job_id: int, user_id: int
+) -> TrackedJob:
+    stmt = select(TrackedJob).where(
+        TrackedJob.id == job_id,
+        TrackedJob.user_id == user_id,
+        TrackedJob.deleted_at.is_(None),
+    )
+    job = (await db.execute(stmt)).scalar_one_or_none()
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+async def _org_names_for(
+    db: AsyncSession, ids: set[int]
+) -> dict[int, str]:
+    if not ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(Organization.id, Organization.name).where(
+                Organization.id.in_(ids)
+            )
+        )
+    ).all()
+    return {row[0]: row[1] for row in rows}
+
+
+# --- TrackedJob list / create / detail / update / delete --------------------
+
+@router.get("", response_model=list[TrackedJobSummary])
+async def list_jobs(
+    status: Optional[str] = Query(default=None, description="Filter to one status"),
+    q: Optional[str] = Query(default=None, description="Prefix search on title"),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[TrackedJobSummary]:
+    stmt = select(TrackedJob).where(
+        TrackedJob.user_id == user.id, TrackedJob.deleted_at.is_(None)
+    )
+    if status:
+        _validate_status(status)
+        stmt = stmt.where(TrackedJob.status == status)
+    if q:
+        stmt = stmt.where(TrackedJob.title.ilike(f"%{q}%"))
+    stmt = stmt.order_by(TrackedJob.updated_at.desc())
+    jobs = list((await db.execute(stmt)).scalars().all())
+
+    # Hydrate organization names and interview-round counts in bulk.
+    org_names = await _org_names_for(
+        db, {j.organization_id for j in jobs if j.organization_id}
+    )
+
+    # Rounds aggregate: count + latest outcome per job.
+    if jobs:
+        job_ids = [j.id for j in jobs]
+        rounds_count_rows = (
+            await db.execute(
+                select(
+                    InterviewRound.tracked_job_id,
+                    func.count(InterviewRound.id),
+                )
+                .where(
+                    InterviewRound.tracked_job_id.in_(job_ids),
+                    InterviewRound.deleted_at.is_(None),
+                )
+                .group_by(InterviewRound.tracked_job_id)
+            )
+        ).all()
+        counts_by_job = {row[0]: row[1] for row in rounds_count_rows}
+
+        # Latest round outcome per job (by round_number desc, then created_at).
+        latest_rounds = (
+            await db.execute(
+                select(InterviewRound)
+                .where(
+                    InterviewRound.tracked_job_id.in_(job_ids),
+                    InterviewRound.deleted_at.is_(None),
+                )
+                .order_by(
+                    InterviewRound.tracked_job_id,
+                    InterviewRound.round_number.desc(),
+                    InterviewRound.id.desc(),
+                )
+            )
+        ).scalars().all()
+        latest_by_job: dict[int, str] = {}
+        for r in latest_rounds:
+            latest_by_job.setdefault(r.tracked_job_id, r.outcome)
+    else:
+        counts_by_job = {}
+        latest_by_job = {}
+
+    out: list[TrackedJobSummary] = []
+    for j in jobs:
+        fit_score: Optional[int] = None
+        fs = j.fit_summary
+        if isinstance(fs, dict):
+            raw = fs.get("score")
+            if isinstance(raw, (int, float)):
+                fit_score = int(raw)
+        out.append(
+            TrackedJobSummary(
+                id=j.id,
+                title=j.title,
+                status=j.status,
+                priority=j.priority,
+                remote_policy=j.remote_policy,
+                location=j.location,
+                organization_id=j.organization_id,
+                organization_name=org_names.get(j.organization_id)
+                if j.organization_id
+                else None,
+                date_applied=j.date_applied,
+                date_discovered=j.date_discovered,
+                updated_at=j.updated_at,
+                rounds_count=counts_by_job.get(j.id, 0),
+                latest_round_outcome=latest_by_job.get(j.id),
+                salary_min=j.salary_min,
+                salary_max=j.salary_max,
+                salary_currency=j.salary_currency,
+                experience_level=j.experience_level,
+                experience_years_min=j.experience_years_min,
+                experience_years_max=j.experience_years_max,
+                employment_type=j.employment_type,
+                fit_score=fit_score,
+            )
+        )
+    return out
+
+
+@router.post(
+    "",
+    response_model=TrackedJobOut,
+    status_code=http_status.HTTP_201_CREATED,
+)
+async def create_job(
+    payload: TrackedJobIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> TrackedJob:
+    data = payload.model_dump(exclude_unset=True)
+    data["status"] = _validate_status(data.get("status")) or "watching"
+    data["priority"] = _validate_simple(
+        data.get("priority"), PRIORITIES, "priority"
+    )
+    data["remote_policy"] = _validate_simple(
+        data.get("remote_policy"), REMOTE_POLICIES, "remote_policy"
+    )
+    if "date_discovered" not in data:
+        data["date_discovered"] = date.today()
+
+    job = TrackedJob(user_id=user.id, **data)
+    db.add(job)
+    await db.flush()
+
+    # Every new job starts with a status event — useful for the activity feed.
+    db.add(
+        ApplicationEvent(
+            tracked_job_id=job.id,
+            event_type="note",
+            event_date=datetime.now(tz=timezone.utc),
+            details_md=f"Created with status `{job.status}`.",
+        )
+    )
+    await db.commit()
+    await db.refresh(job)
+
+    org_names = await _org_names_for(
+        db, {job.organization_id} if job.organization_id else set()
+    )
+    job.organization_name = org_names.get(job.organization_id)  # type: ignore[attr-defined]
+    return job
+
+
+@router.get("/{job_id:int}", response_model=TrackedJobOut)
+async def get_job(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> TrackedJob:
+    job = await _get_owned_job(db, job_id, user.id)
+    org_names = await _org_names_for(
+        db, {job.organization_id} if job.organization_id else set()
+    )
+    job.organization_name = org_names.get(job.organization_id)  # type: ignore[attr-defined]
+    return job
+
+
+@router.put("/{job_id:int}", response_model=TrackedJobOut)
+async def update_job(
+    job_id: int,
+    payload: TrackedJobUpdate,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> TrackedJob:
+    job = await _get_owned_job(db, job_id, user.id)
+    data = payload.model_dump(exclude_unset=True)
+
+    _validate_status(data.get("status"))
+    if data.get("priority") is not None:
+        _validate_simple(data["priority"], PRIORITIES, "priority")
+    if data.get("remote_policy") is not None:
+        _validate_simple(data["remote_policy"], REMOTE_POLICIES, "remote_policy")
+
+    prior_status = job.status
+    for k, v in data.items():
+        setattr(job, k, v)
+
+    # Auto-emit an ApplicationEvent on status transitions so the activity feed
+    # has an audit trail without the user having to log anything by hand.
+    if "status" in data and data["status"] != prior_status:
+        db.add(
+            ApplicationEvent(
+                tracked_job_id=job.id,
+                event_type=_status_to_event_type(data["status"]),
+                event_date=datetime.now(tz=timezone.utc),
+                details_md=f"Status changed: `{prior_status}` → `{data['status']}`.",
+            )
+        )
+        # Convenience: the first move into `applied` stamps date_applied if
+        # the user hasn't already set it.
+        if data["status"] == "applied" and job.date_applied is None:
+            job.date_applied = date.today()
+        if data["status"] in {"won", "lost", "withdrawn", "ghosted", "archived"} and job.date_closed is None:
+            job.date_closed = date.today()
+
+    await db.commit()
+    await db.refresh(job)
+
+    org_names = await _org_names_for(
+        db, {job.organization_id} if job.organization_id else set()
+    )
+    job.organization_name = org_names.get(job.organization_id)  # type: ignore[attr-defined]
+    return job
+
+
+def _status_to_event_type(status: str) -> str:
+    """Best-fit mapping from status → event_type for the activity feed."""
+    return {
+        "applied": "applied",
+        "responded": "responded",
+        "screening": "phone_screen",
+        "interviewing": "interview_scheduled",
+        "assessment": "assessment_assigned",
+        "offer": "offer_received",
+        "won": "offer_accepted",
+        "lost": "rejection",
+        "withdrawn": "withdrawal",
+        "ghosted": "note",
+        "archived": "note",
+        "watching": "note",
+        "interested": "note",
+    }.get(status, "note")
+
+
+@router.delete("/{job_id:int}", status_code=http_status.HTTP_204_NO_CONTENT)
+async def delete_job(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> None:
+    job = await _get_owned_job(db, job_id, user.id)
+    job.deleted_at = datetime.now(tz=timezone.utc)
+    await db.commit()
+
+
+# --- ApplicationEvents (activity feed) --------------------------------------
+
+@router.get("/{job_id:int}/events", response_model=list[ApplicationEventOut])
+async def list_events(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[ApplicationEvent]:
+    await _get_owned_job(db, job_id, user.id)
+    stmt = (
+        select(ApplicationEvent)
+        .where(ApplicationEvent.tracked_job_id == job_id)
+        .order_by(ApplicationEvent.event_date.desc(), ApplicationEvent.id.desc())
+    )
+    return list((await db.execute(stmt)).scalars().all())
+
+
+@router.post(
+    "/{job_id:int}/events",
+    response_model=ApplicationEventOut,
+    status_code=http_status.HTTP_201_CREATED,
+)
+async def create_event(
+    job_id: int,
+    payload: ApplicationEventIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ApplicationEvent:
+    await _get_owned_job(db, job_id, user.id)
+    ev = ApplicationEvent(
+        tracked_job_id=job_id,
+        event_type=payload.event_type,
+        event_date=payload.event_date or datetime.now(tz=timezone.utc),
+        details_md=payload.details_md,
+        related_round_id=payload.related_round_id,
+    )
+    db.add(ev)
+    await db.commit()
+    await db.refresh(ev)
+    return ev
+
+
+# --- InterviewRounds --------------------------------------------------------
+
+@router.get("/{job_id:int}/rounds", response_model=list[InterviewRoundOut])
+async def list_rounds(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[InterviewRound]:
+    await _get_owned_job(db, job_id, user.id)
+    stmt = (
+        select(InterviewRound)
+        .where(
+            InterviewRound.tracked_job_id == job_id,
+            InterviewRound.deleted_at.is_(None),
+        )
+        .order_by(InterviewRound.round_number.asc(), InterviewRound.id.asc())
+    )
+    return list((await db.execute(stmt)).scalars().all())
+
+
+@router.post(
+    "/{job_id:int}/rounds",
+    response_model=InterviewRoundOut,
+    status_code=http_status.HTTP_201_CREATED,
+)
+async def create_round(
+    job_id: int,
+    payload: InterviewRoundIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> InterviewRound:
+    await _get_owned_job(db, job_id, user.id)
+    data = payload.model_dump(exclude_unset=True)
+    data.setdefault("outcome", "pending")
+    rnd = InterviewRound(tracked_job_id=job_id, **data)
+    db.add(rnd)
+    await db.commit()
+    await db.refresh(rnd)
+    return rnd
+
+
+async def _get_owned_round(
+    db: AsyncSession, round_id: int, job_id: int, user_id: int
+) -> InterviewRound:
+    # Validate the round belongs to the user's job.
+    await _get_owned_job(db, job_id, user_id)
+    stmt = select(InterviewRound).where(
+        InterviewRound.id == round_id,
+        InterviewRound.tracked_job_id == job_id,
+        InterviewRound.deleted_at.is_(None),
+    )
+    rnd = (await db.execute(stmt)).scalar_one_or_none()
+    if rnd is None:
+        raise HTTPException(status_code=404, detail="Interview round not found")
+    return rnd
+
+
+@router.put("/{job_id:int}/rounds/{round_id:int}", response_model=InterviewRoundOut)
+async def update_round(
+    job_id: int,
+    round_id: int,
+    payload: InterviewRoundIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> InterviewRound:
+    rnd = await _get_owned_round(db, round_id, job_id, user.id)
+    for k, v in payload.model_dump(exclude_unset=True).items():
+        setattr(rnd, k, v)
+    await db.commit()
+    await db.refresh(rnd)
+    return rnd
+
+
+@router.delete(
+    "/{job_id:int}/rounds/{round_id:int}", status_code=http_status.HTTP_204_NO_CONTENT
+)
+async def delete_round(
+    job_id: int,
+    round_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> None:
+    rnd = await _get_owned_round(db, round_id, job_id, user.id)
+    rnd.deleted_at = datetime.now(tz=timezone.utc)
+    await db.commit()
+
+
+# --- InterviewArtifacts -----------------------------------------------------
+
+def _validate_artifact_kind(v: str) -> str:
+    if v not in ARTIFACT_KINDS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown artifact kind '{v}'. Allowed: {sorted(ARTIFACT_KINDS)}",
+        )
+    return v
+
+
+async def _get_owned_artifact(
+    db: AsyncSession, artifact_id: int, job_id: int, user_id: int
+) -> InterviewArtifact:
+    await _get_owned_job(db, job_id, user_id)
+    stmt = select(InterviewArtifact).where(
+        InterviewArtifact.id == artifact_id,
+        InterviewArtifact.tracked_job_id == job_id,
+        InterviewArtifact.deleted_at.is_(None),
+    )
+    art = (await db.execute(stmt)).scalar_one_or_none()
+    if art is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    return art
+
+
+@router.get("/{job_id:int}/artifacts", response_model=list[InterviewArtifactOut])
+async def list_artifacts(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[InterviewArtifact]:
+    await _get_owned_job(db, job_id, user.id)
+    stmt = (
+        select(InterviewArtifact)
+        .where(
+            InterviewArtifact.tracked_job_id == job_id,
+            InterviewArtifact.deleted_at.is_(None),
+        )
+        .order_by(InterviewArtifact.created_at.desc(), InterviewArtifact.id.desc())
+    )
+    return list((await db.execute(stmt)).scalars().all())
+
+
+@router.post(
+    "/{job_id:int}/artifacts",
+    response_model=InterviewArtifactOut,
+    status_code=http_status.HTTP_201_CREATED,
+)
+async def create_artifact(
+    job_id: int,
+    payload: InterviewArtifactIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> InterviewArtifact:
+    await _get_owned_job(db, job_id, user.id)
+    _validate_artifact_kind(payload.kind)
+    if payload.interview_round_id is not None:
+        await _get_owned_round(db, payload.interview_round_id, job_id, user.id)
+    data = payload.model_dump(exclude_unset=True)
+    art = InterviewArtifact(tracked_job_id=job_id, **data)
+    db.add(art)
+    await db.commit()
+    await db.refresh(art)
+    return art
+
+
+@router.put(
+    "/{job_id:int}/artifacts/{artifact_id:int}",
+    response_model=InterviewArtifactOut,
+)
+async def update_artifact(
+    job_id: int,
+    artifact_id: int,
+    payload: InterviewArtifactIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> InterviewArtifact:
+    art = await _get_owned_artifact(db, artifact_id, job_id, user.id)
+    _validate_artifact_kind(payload.kind)
+    if payload.interview_round_id is not None:
+        await _get_owned_round(db, payload.interview_round_id, job_id, user.id)
+    for k, v in payload.model_dump(exclude_unset=True).items():
+        setattr(art, k, v)
+    await db.commit()
+    await db.refresh(art)
+    return art
+
+
+@router.delete(
+    "/{job_id:int}/artifacts/{artifact_id:int}",
+    status_code=http_status.HTTP_204_NO_CONTENT,
+)
+async def delete_artifact(
+    job_id: int,
+    artifact_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> None:
+    art = await _get_owned_artifact(db, artifact_id, job_id, user.id)
+    art.deleted_at = datetime.now(tz=timezone.utc)
+    await db.commit()
+
+
+# --- JD analyzer -----------------------------------------------------------
+
+_JD_ANALYZE_PROMPT = """You are analyzing a job description for a candidate to decide
+whether to apply, and what to emphasize if they do. The user already has this
+posting saved — your job is to produce a structured analysis object.
+
+Before analyzing, you may curl the user's profile data to tailor the fit
+assessment. The base URL and bearer token for the user's own data are in
+environment variables JSP_API_BASE_URL and JSP_API_TOKEN. Useful endpoints:
+
+  GET  $JSP_API_BASE_URL/api/v1/history/skills
+  GET  $JSP_API_BASE_URL/api/v1/history/work-experiences
+  GET  $JSP_API_BASE_URL/api/v1/history/educations
+
+Fetch them with:
+
+  curl -sS -H "Authorization: Bearer $JSP_API_TOKEN" \\
+       "$JSP_API_BASE_URL/api/v1/history/skills"
+
+Keep the lookups light — one or two calls is enough.
+
+Here is the job description (verbatim from the posting):
+
+---
+{job_description}
+---
+
+And here is the structured metadata already extracted from the posting:
+
+  title: {title}
+  organization: {organization}
+  location: {location}
+  remote_policy: {remote_policy}
+  salary_min: {salary_min}
+  salary_max: {salary_max}
+  experience_years_min: {experience_years_min}
+  experience_years_max: {experience_years_max}
+  experience_level: {experience_level}
+  employment_type: {employment_type}
+  required_skills: {required_skills}
+  nice_to_have_skills: {nice_to_have_skills}
+
+Return ONE single JSON object, no prose and no markdown fences, with this schema:
+
+{{
+  "fit_score": number,              // 0-100, rough match against user's skills/experience
+  "fit_summary": string,            // 1-2 sentence plain summary of fit
+  "strengths": string[],            // concrete things the user should emphasize
+  "gaps": string[],                 // honest skill/experience gaps vs the JD
+  "red_flags": string[],            // JD-side concerns: vague scope, toxic signals, comp mismatch, etc.
+  "green_flags": string[],          // JD-side positives: clear rubric, strong comp, remote, etc.
+  "interview_focus_areas": string[],// topics to prep for, based on the JD
+  "suggested_questions": string[],  // questions the user should ask THEM
+  "resume_emphasis": string[],      // bullets / projects from history to foreground on a tailored resume
+  "cover_letter_hook": string       // one-paragraph opening hook for a cover letter
+}}
+
+All array fields should have at most 6 items. Prefer concrete examples over
+generalities ("Python async with FastAPI" > "backend skills"). If any field
+genuinely does not apply, return an empty array or a short "n/a" string.
+"""
+
+
+class JdAnalysis(BaseModel):
+    fit_score: Optional[int] = None
+    fit_summary: Optional[str] = None
+    strengths: Optional[list[str]] = None
+    gaps: Optional[list[str]] = None
+    red_flags: Optional[list[str]] = None
+    green_flags: Optional[list[str]] = None
+    interview_focus_areas: Optional[list[str]] = None
+    suggested_questions: Optional[list[str]] = None
+    resume_emphasis: Optional[list[str]] = None
+    cover_letter_hook: Optional[str] = None
+
+
+@router.post("/{job_id:int}/analyze-jd", response_model=TrackedJobOut)
+async def analyze_jd(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> TrackedJob:
+    """Run Claude against the saved job_description and populate
+    tracked_jobs.jd_analysis with a structured fit/red-flags breakdown.
+
+    Idempotent: re-running overwrites the previous analysis. The user can
+    always delete the object from the UI if they want to reset.
+    """
+    from app.core.security import create_access_token
+
+    job = await _get_owned_job(db, job_id, user.id)
+    if not (job.job_description and job.job_description.strip()):
+        raise HTTPException(
+            status_code=422,
+            detail="No job description stored. Paste one in before analyzing.",
+        )
+
+    # Resolve organization name for the prompt context.
+    org_name = None
+    if job.organization_id:
+        org_row = (
+            await db.execute(
+                select(Organization.name).where(Organization.id == job.organization_id)
+            )
+        ).first()
+        org_name = org_row[0] if org_row else None
+
+    prompt = _JD_ANALYZE_PROMPT.format(
+        job_description=job.job_description,
+        title=job.title or "(untitled)",
+        organization=org_name or "(unknown)",
+        location=job.location or "(unspecified)",
+        remote_policy=job.remote_policy or "(unspecified)",
+        salary_min=job.salary_min if job.salary_min is not None else "null",
+        salary_max=job.salary_max if job.salary_max is not None else "null",
+        experience_years_min=job.experience_years_min
+        if job.experience_years_min is not None
+        else "null",
+        experience_years_max=job.experience_years_max
+        if job.experience_years_max is not None
+        else "null",
+        experience_level=job.experience_level or "null",
+        employment_type=job.employment_type or "null",
+        required_skills=", ".join(job.required_skills or []) or "(none)",
+        nice_to_have_skills=", ".join(job.nice_to_have_skills or []) or "(none)",
+    )
+
+    api_token = create_access_token(
+        subject=str(user.id), extra={"purpose": "jd_analyzer"}
+    )
+
+    try:
+        result = await run_claude_prompt(
+            prompt=prompt,
+            output_format="json",
+            allowed_tools=["Bash"],
+            timeout_seconds=180,
+            extra_env={
+                "JSP_API_BASE_URL": "http://localhost:8000",
+                "JSP_API_TOKEN": api_token,
+            },
+        )
+    except ClaudeCodeError as exc:
+        log.warning("JD analyze failed for job %s: %s", job_id, exc)
+        raise HTTPException(status_code=502, detail=f"Claude Code error: {exc}")
+
+    data = _extract_json_object(result.result) or {}
+    # Normalize through our schema to drop unknown / malformed fields.
+    analysis = JdAnalysis(**{k: v for k, v in data.items() if k in JdAnalysis.model_fields})
+    job.jd_analysis = analysis.model_dump()
+    if analysis.fit_summary:
+        # Keep the short human-readable summary separately for list views.
+        job.fit_summary = {"summary": analysis.fit_summary, "score": analysis.fit_score}
+    await db.commit()
+    await db.refresh(job)
+    return job
+
+
+# --- Fetch-from-URL autofill ------------------------------------------------
+
+_FETCH_PROMPT_TEMPLATE = """Research this job posting and the hiring company. Start with the URL:
+
+  {url}
+
+Step 1: Use WebFetch to read the posting. Extract title, organization,
+location, remote policy, salary range, the platform this was posted on, and
+(if visible) the date the post was listed. For relative timestamps like
+"Posted 3 days ago", compute the absolute date based on today. If no date
+is visible, use null.
+
+Step 2: Capture the FULL job description VERBATIM. This is the most important
+field. Do NOT summarize, condense, paraphrase, or "clean up" — copy the
+description exactly as it appears on the page, preserving bullet points,
+section headers (About the role, Responsibilities, Requirements, Benefits,
+etc.), and all bullet and paragraph text. Markdown formatting (##, -, **) is
+fine; use it to preserve structure. Omit only page chrome (nav, cookie
+banner, sidebar, related-jobs rail, apply-button text). The user will be
+reviewing this description in full so completeness matters more than
+brevity.
+
+Step 3: Extract structured requirement fields from the description. Be
+literal — if the JD says "5+ years" set experience_years_min=5, max=null. If
+it says "3-7 years" set min=3, max=7. If it never mentions years, both null.
+Experience level is a bucket the JD implies or states (junior / mid /
+senior / staff / principal / manager / director / vp / cxo). Employment type
+should be the JD's exact intent (full_time / part_time / contract / c2h /
+internship / freelance). Education required is a bucket (none /
+associates / bachelors / masters / phd) reflecting the MINIMUM required,
+not "preferred". Visa sponsorship and relocation_offered are tri-state
+booleans — true if explicitly offered, false if explicitly denied, null if
+the JD is silent.
+
+Step 4: Extract two skill lists from the description — required_skills
+(things the JD says you must have) and nice_to_have_skills (things the JD
+says are a plus, preferred, nice to have, or bonus). Use short canonical
+names ("Python", "React", "Kubernetes", "GraphQL"), not full sentences.
+Keep each list to at most ~15 items.
+
+Step 5: If the company isn't a household name, use WebSearch (or WebFetch on
+the company's own site) to gather a few more facts about them: website,
+industry, approximate size, headquarters, a one-sentence description, and
+any visible tech-stack hints. Keep that lookup light — one or two searches
+is enough.
+
+Step 6: Return ONE single JSON object with the schema below. No prose, no
+markdown code fences around the JSON, no explanation before or after.
+Unknown fields must be null.
+
+Schema:
+{{
+  "title": string | null,
+  "organization_name": string | null,
+  "location": string | null,
+  "remote_policy": "remote" | "hybrid" | "onsite" | null,
+  "job_description": string | null,
+  "salary_min": number | null,
+  "salary_max": number | null,
+  "salary_currency": string | null,
+  "source_platform": "linkedin" | "indeed" | "company_site" | "other" | null,
+  "date_posted": "YYYY-MM-DD" | null,
+  "experience_years_min": number | null,
+  "experience_years_max": number | null,
+  "experience_level": "junior" | "mid" | "senior" | "staff" | "principal" | "manager" | "director" | "vp" | "cxo" | null,
+  "employment_type": "full_time" | "part_time" | "contract" | "c2h" | "internship" | "freelance" | null,
+  "education_required": "none" | "associates" | "bachelors" | "masters" | "phd" | null,
+  "visa_sponsorship_offered": true | false | null,
+  "relocation_offered": true | false | null,
+  "required_skills": string[] | null,
+  "nice_to_have_skills": string[] | null,
+  "organization_website": string | null,
+  "organization_industry": string | null,
+  "organization_size": string | null,
+  "organization_headquarters": string | null,
+  "organization_description": string | null,
+  "tech_stack_hints": string[] | null,
+  "research_notes": string | null
+}}
+
+`organization_size` should be a bucket like "1-10", "11-50", "51-200",
+"201-500", "501-1000", "1001-5000", "5001-10000", or "10000+".
+`research_notes` is a one-line summary of what you looked up ("Checked
+LinkedIn and the company's /about page"), NOT a summary of the job itself.
+Prefer null over guesses.
+"""
+
+# Matches any JSON object inside a blob of text. Claude sometimes wraps the
+# object in backticks or surrounding prose even when told not to; we yank
+# the first {...} balanced-ish string out.
+_JSON_OBJECT_RE = re.compile(r"\{[\s\S]*\}", re.MULTILINE)
+
+
+def _extract_json_object(text: str) -> Optional[dict]:
+    """Try hard to pull a JSON object out of Claude's textual output."""
+    text = text.strip()
+    # First: straight json.loads.
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Strip common markdown code fences.
+    if text.startswith("```"):
+        inner = "\n".join(text.splitlines()[1:])
+        if inner.rstrip().endswith("```"):
+            inner = inner.rsplit("```", 1)[0]
+        try:
+            return json.loads(inner)
+        except json.JSONDecodeError:
+            pass
+    # Finally: regex the first {...} blob.
+    m = _JSON_OBJECT_RE.search(text)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+async def perform_fetch(db: AsyncSession, url: str) -> FetchedJobInfo:
+    """Core URL-fetch + org-enrichment pipeline, reusable from both the
+    interactive endpoint and the background queue worker. Raises
+    ClaudeCodeError on CLI failure; otherwise returns a FetchedJobInfo with
+    organization_id set when an org was resolved or created.
+    """
+    url = url.strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise ValueError("URL must start with http(s)://")
+
+    prompt = _FETCH_PROMPT_TEMPLATE.format(url=url)
+
+    result = await run_claude_prompt(
+        prompt=prompt,
+        output_format="json",
+        allowed_tools=["WebFetch", "WebSearch"],
+        timeout_seconds=180,
+    )
+
+    data = _extract_json_object(result.result) or {}
+    if data.get("remote_policy") not in (None, "remote", "hybrid", "onsite"):
+        data["remote_policy"] = None
+    if data.get("source_platform") not in (
+        None,
+        "linkedin",
+        "indeed",
+        "company_site",
+        "other",
+    ):
+        data["source_platform"] = None
+
+    out = FetchedJobInfo(
+        **{k: v for k, v in data.items() if k in FetchedJobInfo.model_fields},
+        source_url=url,
+    )
+
+    if out.organization_name:
+        org = (
+            await db.execute(
+                select(Organization).where(
+                    func.lower(Organization.name) == out.organization_name.strip().lower(),
+                    Organization.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+
+        if org is None:
+            org = Organization(name=out.organization_name.strip(), type="company")
+            db.add(org)
+            await db.flush()
+
+        enrichment_map = {
+            "website": out.organization_website,
+            "industry": out.organization_industry,
+            "size": out.organization_size,
+            "headquarters_location": out.organization_headquarters,
+            "description": out.organization_description,
+        }
+        for attr, value in enrichment_map.items():
+            if value and not getattr(org, attr, None):
+                setattr(org, attr, value)
+        if out.research_notes and not org.research_notes:
+            org.research_notes = out.research_notes
+        if out.tech_stack_hints:
+            existing = list(org.tech_stack_hints or [])
+            org.tech_stack_hints = existing + [
+                h for h in out.tech_stack_hints if h not in existing
+            ]
+
+        await db.commit()
+        out.organization_id = org.id
+
+    if not any(
+        [out.title, out.organization_name, out.job_description, out.location]
+    ):
+        out.warning = (
+            "Couldn't extract recognizable job info from that URL. "
+            "The page may require sign-in, be JavaScript-only, or not be a job posting."
+        )
+
+    return out
+
+
+def build_tracked_job_payload(
+    fetched: FetchedJobInfo, overrides: Optional[dict] = None
+) -> dict:
+    """Build a TrackedJob field dict from a FetchedJobInfo plus optional
+    user-supplied overrides (status, priority, date_applied, etc.)."""
+    payload = {
+        "title": fetched.title or "(untitled)",
+        "organization_id": fetched.organization_id,
+        "job_description": fetched.job_description,
+        "source_url": fetched.source_url,
+        "source_platform": fetched.source_platform,
+        "location": fetched.location,
+        "remote_policy": fetched.remote_policy,
+        "salary_min": fetched.salary_min,
+        "salary_max": fetched.salary_max,
+        "salary_currency": fetched.salary_currency,
+        "date_posted": fetched.date_posted,
+        "experience_years_min": fetched.experience_years_min,
+        "experience_years_max": fetched.experience_years_max,
+        "experience_level": fetched.experience_level,
+        "employment_type": fetched.employment_type,
+        "education_required": fetched.education_required,
+        "visa_sponsorship_offered": fetched.visa_sponsorship_offered,
+        "relocation_offered": fetched.relocation_offered,
+        "required_skills": fetched.required_skills,
+        "nice_to_have_skills": fetched.nice_to_have_skills,
+    }
+    if overrides:
+        for k, v in overrides.items():
+            if v is not None:
+                payload[k] = v
+    return payload
+
+
+@router.post("/fetch-from-url", response_model=FetchedJobInfo)
+async def fetch_from_url(
+    body: FetchFromUrlIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> FetchedJobInfo:
+    """Invoke Claude Code's WebFetch to pull structured job info from a URL.
+
+    Does NOT create a TrackedJob — the frontend uses this to prefill the
+    New Job form. The user can review and edit before saving.
+    """
+    try:
+        return await perform_fetch(db, body.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except ClaudeCodeError as exc:
+        log.warning("URL fetch failed for %s: %s", body.url, exc)
+        raise HTTPException(status_code=502, detail=f"Claude Code error: {exc}")
+
+
+# --- JobFetchQueue ----------------------------------------------------------
+
+
+@router.get("/queue", response_model=list[JobFetchQueueOut])
+async def list_queue(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[JobFetchQueue]:
+    stmt = (
+        select(JobFetchQueue)
+        .where(JobFetchQueue.user_id == user.id)
+        .order_by(JobFetchQueue.id.desc())
+    )
+    return list((await db.execute(stmt)).scalars().all())
+
+
+@router.post(
+    "/queue",
+    response_model=JobFetchQueueOut,
+    status_code=http_status.HTTP_201_CREATED,
+)
+async def enqueue_url(
+    payload: JobFetchQueueIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> JobFetchQueue:
+    url = payload.url.strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise HTTPException(status_code=422, detail="URL must start with http(s)://")
+    if payload.desired_status is not None:
+        _validate_status(payload.desired_status)
+    if payload.desired_priority:
+        _validate_simple(payload.desired_priority, PRIORITIES, "priority")
+
+    item = JobFetchQueue(
+        user_id=user.id,
+        url=url,
+        desired_status=payload.desired_status,
+        desired_priority=payload.desired_priority,
+        desired_date_applied=payload.desired_date_applied,
+        desired_date_closed=payload.desired_date_closed,
+        desired_notes=payload.desired_notes,
+        state="queued",
+    )
+    db.add(item)
+    await db.commit()
+    await db.refresh(item)
+    return item
+
+
+@router.delete("/queue/{item_id:int}", status_code=http_status.HTTP_204_NO_CONTENT)
+async def delete_queue_item(
+    item_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> None:
+    stmt = select(JobFetchQueue).where(
+        JobFetchQueue.id == item_id, JobFetchQueue.user_id == user.id
+    )
+    item = (await db.execute(stmt)).scalar_one_or_none()
+    if item is None:
+        raise HTTPException(status_code=404, detail="Queue item not found")
+    await db.delete(item)
+    await db.commit()
+
+
+# --- Excel bulk import ------------------------------------------------------
+
+
+@router.get("/import-template.xlsx")
+async def download_import_template(_: User = Depends(get_current_user)) -> Response:
+    """Serve a pre-formatted .xlsx template for bulk-importing TrackedJobs."""
+    from app.skills.excel_io import build_template_workbook
+
+    data = build_template_workbook()
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": 'attachment; filename="job-search-pal-template.xlsx"',
+            "Content-Length": str(len(data)),
+        },
+    )
+
+
+@router.post("/import")
+async def import_jobs_from_xlsx(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, object]:
+    """Accept an .xlsx matching the import template and create TrackedJobs
+    for each non-empty row. Returns created/skipped counts and any per-row
+    errors so the user can fix and re-upload.
+    """
+    from app.skills.excel_io import parse_workbook
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=422, detail="Uploaded file is empty")
+    try:
+        rows = parse_workbook(content)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    created: list[int] = []
+    errors: list[dict] = []
+
+    for row_num, row in enumerate(rows, start=2):
+        title = row.get("title")
+        if not title:
+            errors.append({"row": row_num, "error": "Title is required"})
+            continue
+
+        status_val = row.get("status")
+        if status_val and status_val not in JOB_STATUSES:
+            errors.append(
+                {"row": row_num, "error": f"Unknown status '{status_val}'"}
+            )
+            continue
+
+        # Resolve / create Organization by name (case-insensitive).
+        org_id: Optional[int] = None
+        org_name = row.pop("organization_name", None)
+        if org_name:
+            org = (
+                await db.execute(
+                    select(Organization).where(
+                        func.lower(Organization.name) == org_name.strip().lower(),
+                        Organization.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+            if org is None:
+                org = Organization(name=org_name.strip(), type="company")
+                db.add(org)
+                await db.flush()
+            org_id = org.id
+
+        payload: dict = {"user_id": user.id, "organization_id": org_id}
+        for k, v in row.items():
+            if v is not None:
+                payload[k] = v
+        payload.setdefault("status", "watching")
+        payload.setdefault("date_discovered", date.today())
+
+        try:
+            job = TrackedJob(**payload)
+            db.add(job)
+            await db.flush()
+            db.add(
+                ApplicationEvent(
+                    tracked_job_id=job.id,
+                    event_type="note",
+                    event_date=datetime.now(tz=timezone.utc),
+                    details_md=f"Imported from Excel with status `{job.status}`.",
+                )
+            )
+            created.append(job.id)
+        except Exception as exc:
+            errors.append({"row": row_num, "error": str(exc)})
+
+    await db.commit()
+    return {
+        "created": created,
+        "created_count": len(created),
+        "skipped_count": len(errors),
+        "errors": errors,
+    }
+
+
+@router.get("/queue-import-template.xlsx")
+async def download_queue_import_template(
+    _: User = Depends(get_current_user),
+) -> Response:
+    """Serve a minimal .xlsx template for queue bulk-import: URL + optional
+    applied/posted dates. Rows get pushed to the fetch queue, not created
+    directly as TrackedJobs."""
+    from app.skills.excel_io import build_queue_template_workbook
+
+    data = build_queue_template_workbook()
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": 'attachment; filename="job-search-pal-queue-template.xlsx"',
+            "Content-Length": str(len(data)),
+        },
+    )
+
+
+@router.post("/queue-import")
+async def import_queue_from_xlsx(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, object]:
+    """Accept an .xlsx matching the queue-import template and enqueue each
+    row in the fetch queue. Returns enqueued/skipped counts plus per-row
+    errors for malformed URLs."""
+    from app.skills.excel_io import parse_queue_workbook
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=422, detail="Uploaded file is empty")
+    try:
+        rows = parse_queue_workbook(content)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    enqueued: list[int] = []
+    errors: list[dict] = []
+
+    for row_num, row in enumerate(rows, start=2):
+        url = row.get("url")
+        if not url or not isinstance(url, str):
+            errors.append({"row": row_num, "error": "Job URL is required"})
+            continue
+        url = url.strip()
+        if not (url.startswith("http://") or url.startswith("https://")):
+            errors.append(
+                {"row": row_num, "error": f"Unrecognized URL: {url[:120]}"}
+            )
+            continue
+
+        item = JobFetchQueue(
+            user_id=user.id,
+            url=url,
+            desired_date_applied=row.get("desired_date_applied"),
+            desired_date_posted=row.get("desired_date_posted"),
+            state="queued",
+            attempts=0,
+        )
+        db.add(item)
+        try:
+            await db.flush()
+            enqueued.append(item.id)
+        except Exception as exc:
+            errors.append({"row": row_num, "error": str(exc)})
+
+    await db.commit()
+    return {
+        "enqueued": enqueued,
+        "enqueued_count": len(enqueued),
+        "skipped_count": len(errors),
+        "errors": errors,
+    }
+
+
+@router.post("/queue/{item_id:int}/retry", response_model=JobFetchQueueOut)
+async def retry_queue_item(
+    item_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> JobFetchQueue:
+    stmt = select(JobFetchQueue).where(
+        JobFetchQueue.id == item_id, JobFetchQueue.user_id == user.id
+    )
+    item = (await db.execute(stmt)).scalar_one_or_none()
+    if item is None:
+        raise HTTPException(status_code=404, detail="Queue item not found")
+    if item.state == "processing":
+        raise HTTPException(status_code=409, detail="Already processing")
+    item.state = "queued"
+    item.error_message = None
+    item.attempts = 0
+    await db.commit()
+    await db.refresh(item)
+    return item

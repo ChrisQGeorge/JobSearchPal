@@ -171,6 +171,11 @@ export default function TimelinePage() {
   const [enabledKinds, setEnabledKinds] = useState<Set<Kind>>(
     () => new Set(KIND_DISPLAY_ORDER),
   );
+  // Visible date range controls. `null` on either side means "unbounded on
+  // that side" — we fall back to the data's own extent. The "Fit to content"
+  // button resets both to null.
+  const [fromYear, setFromYear] = useState<number | null>(null);
+  const [toYear, setToYear] = useState<number | null>(null);
 
   useEffect(() => {
     api
@@ -190,35 +195,68 @@ export default function TimelinePage() {
 
   const nowMs = useMemo(() => Date.now(), []);
 
+  // Natural extent from the data — used for axis boundaries when no explicit
+  // range is set, and to drive the from/to year selectors.
+  const { dataMin, dataMax, dataMinYear, dataMaxYear } = useMemo(() => {
+    let min = Infinity;
+    let max = -Infinity;
+    for (const ev of events) {
+      const pos = positionEvent(ev, nowMs);
+      if (!pos) continue;
+      min = Math.min(min, pos.startMs);
+      max = Math.max(max, pos.endMs);
+    }
+    if (!isFinite(min)) {
+      min = nowMs - 365 * 24 * 3600 * 1000;
+      max = nowMs;
+    }
+    const minY = new Date(min).getFullYear();
+    const maxY = new Date(max).getFullYear();
+    return { dataMin: min, dataMax: max, dataMinYear: minY, dataMaxYear: maxY };
+  }, [events, nowMs]);
+
   const { byKind, undated, minMs, maxMs } = useMemo(() => {
     const byKind: Partial<Record<Kind, PositionedEvent[]>> = {};
     const undated: TimelineEvent[] = [];
-    let min = Infinity;
-    let max = -Infinity;
+    // Effective visible window: user-set years win; else the data extent.
+    const visibleFromMs =
+      fromYear != null ? new Date(fromYear, 0, 1).getTime() : dataMin;
+    const visibleToMs =
+      toYear != null
+        ? new Date(toYear + 1, 0, 1).getTime() - 1
+        : dataMax;
+
     for (const ev of events) {
       const pos = positionEvent(ev, nowMs);
       if (!pos) {
         undated.push(ev);
         continue;
       }
-      min = Math.min(min, pos.startMs);
-      max = Math.max(max, pos.endMs);
+      // Keep events that overlap the visible window at all (so a multi-year
+      // role that started before `from` still shows its relevant portion).
+      if (pos.endMs < visibleFromMs || pos.startMs > visibleToMs) continue;
       (byKind[pos.kind] ??= []).push(pos);
     }
-    if (!isFinite(min)) {
-      min = nowMs - 365 * 24 * 3600 * 1000;
-      max = nowMs;
-    }
-    // Pad each side by a bit so events don't hug the edges.
+
+    // Pad each side by 3% so events don't hug the axis edges.
+    let min = visibleFromMs;
+    let max = visibleToMs;
     const span = max - min || 365 * 24 * 3600 * 1000;
     min -= span * 0.03;
     max += span * 0.03;
     return { byKind, undated, minMs: min, maxMs: max };
-  }, [events, nowMs]);
+  }, [events, nowMs, fromYear, toYear, dataMin, dataMax]);
 
   const kindsPresent = KIND_DISPLAY_ORDER.filter(
     (k) => (byKind[k]?.length ?? 0) > 0,
   );
+
+  const fitToContent = () => {
+    setFromYear(null);
+    setToYear(null);
+  };
+
+  const isZoomed = fromYear != null || toYear != null;
 
   function toggleKind(k: Kind) {
     setEnabledKinds((prev) => {
@@ -243,11 +281,23 @@ export default function TimelinePage() {
         </div>
       ) : (
         <>
-          <Legend
-            kinds={kindsPresent}
-            enabled={enabledKinds}
-            onToggle={toggleKind}
-          />
+          <div className="flex flex-wrap gap-3 items-end justify-between">
+            <Legend
+              kinds={kindsPresent}
+              enabled={enabledKinds}
+              onToggle={toggleKind}
+            />
+            <RangeControls
+              fromYear={fromYear}
+              toYear={toYear}
+              dataMinYear={dataMinYear}
+              dataMaxYear={dataMaxYear}
+              onFrom={setFromYear}
+              onTo={setToYear}
+              onFit={fitToContent}
+              isZoomed={isZoomed}
+            />
+          </div>
 
           <div className="jsp-card p-4 mt-4 overflow-x-auto">
             <div className="min-w-[48rem]">
@@ -293,6 +343,87 @@ export default function TimelinePage() {
     </PageShell>
   );
 }
+
+function RangeControls({
+  fromYear,
+  toYear,
+  dataMinYear,
+  dataMaxYear,
+  onFrom,
+  onTo,
+  onFit,
+  isZoomed,
+}: {
+  fromYear: number | null;
+  toYear: number | null;
+  dataMinYear: number;
+  dataMaxYear: number;
+  onFrom: (y: number | null) => void;
+  onTo: (y: number | null) => void;
+  onFit: () => void;
+  isZoomed: boolean;
+}) {
+  // Offer a year picker that spans a bit beyond the actual data range so
+  // users can project into recent history or future plans.
+  const pad = 2;
+  const lo = dataMinYear - pad;
+  const hi = Math.max(dataMaxYear, new Date().getFullYear()) + pad;
+  const years: number[] = [];
+  for (let y = lo; y <= hi; y++) years.push(y);
+
+  return (
+    <div className="flex gap-2 items-end">
+      <div>
+        <div className="text-[10px] uppercase tracking-wider text-corp-muted mb-1">
+          From
+        </div>
+        <select
+          className="jsp-input text-sm py-1"
+          value={fromYear ?? ""}
+          onChange={(e) =>
+            onFrom(e.target.value === "" ? null : Number(e.target.value))
+          }
+        >
+          <option value="">all</option>
+          {years.map((y) => (
+            <option key={y} value={y}>
+              {y}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div>
+        <div className="text-[10px] uppercase tracking-wider text-corp-muted mb-1">
+          To
+        </div>
+        <select
+          className="jsp-input text-sm py-1"
+          value={toYear ?? ""}
+          onChange={(e) =>
+            onTo(e.target.value === "" ? null : Number(e.target.value))
+          }
+        >
+          <option value="">present</option>
+          {years.map((y) => (
+            <option key={y} value={y}>
+              {y}
+            </option>
+          ))}
+        </select>
+      </div>
+      <button
+        type="button"
+        className="jsp-btn-ghost text-xs"
+        onClick={onFit}
+        disabled={!isZoomed}
+        title="Reset to full date range"
+      >
+        Fit to content
+      </button>
+    </div>
+  );
+}
+
 
 function Legend({
   kinds,

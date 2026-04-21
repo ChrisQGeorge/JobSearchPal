@@ -81,6 +81,23 @@ class Education(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
+class CourseSkill(Base, IdMixin, TimestampMixin):
+    """Many-to-many: a course teaches / exercised certain skills."""
+
+    __tablename__ = "course_skills"
+    __table_args__ = (
+        UniqueConstraint("course_id", "skill_id", name="uq_course_skill"),
+    )
+
+    course_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("courses.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    skill_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("skills.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    usage_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
 class Course(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     __tablename__ = "courses"
 
@@ -256,4 +273,8 @@ class CustomEvent(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     start_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     end_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
-    metadata_: Mapped[Optional[dict]] = mapped_column("metadata", JSON, nullable=True)
+    # NOTE: stored as `event_metadata` (not `metadata`) to avoid colliding with
+    # SQLAlchemy's DeclarativeBase.metadata reserved name.
+    event_metadata: Mapped[Optional[dict]] = mapped_column(
+        "event_metadata", JSON, nullable=True
+    )

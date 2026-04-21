@@ -58,6 +58,7 @@ async def run_claude_prompt(
     timeout_seconds: int = 120,
     cwd: str | None = None,
     session_id: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> ClaudeResult:
     """Run the Claude Code CLI non-interactively and return parsed output.
 
@@ -94,6 +95,8 @@ async def run_claude_prompt(
     elif settings.ANTHROPIC_API_KEY:
         env["ANTHROPIC_API_KEY"] = settings.ANTHROPIC_API_KEY
     env.setdefault("CLAUDE_CONFIG_DIR", "/root/.claude")
+    if extra_env:
+        env.update(extra_env)
 
     log.info("Invoking Claude Code: %s (cwd=%s)", " ".join(cmd[:3] + ["…"]), effective_cwd)
 
