@@ -701,6 +701,24 @@ function RoundRow({
   onDelete: () => void;
 }) {
   const [editing, setEditing] = useState(false);
+  const [prepping, setPrepping] = useState(false);
+  const [retroOpen, setRetroOpen] = useState(false);
+  const [skillErr, setSkillErr] = useState<string | null>(null);
+
+  async function runPrep() {
+    setPrepping(true);
+    setSkillErr(null);
+    try {
+      await api.post(`/api/v1/jobs/${jobId}/rounds/${round.id}/prep`, {});
+      onChanged();
+    } catch (e) {
+      setSkillErr(
+        e instanceof ApiError ? `Prep failed (HTTP ${e.status}).` : "Prep failed.",
+      );
+    } finally {
+      setPrepping(false);
+    }
+  }
 
   if (editing) {
     return (
@@ -711,6 +729,22 @@ function RoundRow({
           onCancel={() => setEditing(false)}
           onSaved={() => {
             setEditing(false);
+            onChanged();
+          }}
+        />
+      </li>
+    );
+  }
+
+  if (retroOpen) {
+    return (
+      <li className="jsp-card p-4">
+        <RetrospectiveForm
+          jobId={jobId}
+          roundId={round.id}
+          onCancel={() => setRetroOpen(false)}
+          onSaved={() => {
+            setRetroOpen(false);
             onChanged();
           }}
         />
@@ -766,7 +800,22 @@ function RoundRow({
             <p className="text-sm mt-2 whitespace-pre-wrap">{round.notes_md}</p>
           ) : null}
         </div>
-        <div className="flex gap-2 shrink-0">
+        <div className="flex gap-2 shrink-0 flex-wrap justify-end">
+          <button
+            className="jsp-btn-ghost text-xs"
+            onClick={runPrep}
+            disabled={prepping}
+            title="Ask the Companion to draft a prep doc (saves to prep_notes_md)"
+          >
+            {prepping ? "Prepping..." : "Prep"}
+          </button>
+          <button
+            className="jsp-btn-ghost text-xs"
+            onClick={() => setRetroOpen(true)}
+            title="Write a retrospective after the round"
+          >
+            Retro
+          </button>
           <button className="jsp-btn-ghost" onClick={() => setEditing(true)}>
             Edit
           </button>
@@ -778,7 +827,189 @@ function RoundRow({
           </button>
         </div>
       </div>
+      {skillErr ? (
+        <div className="text-xs text-corp-danger mt-2">{skillErr}</div>
+      ) : null}
     </li>
+  );
+}
+
+function RetrospectiveForm({
+  jobId,
+  roundId,
+  onCancel,
+  onSaved,
+}: {
+  jobId: number;
+  roundId: number;
+  onCancel: () => void;
+  onSaved: () => void;
+}) {
+  const [recap, setRecap] = useState("");
+  const [selfRating, setSelfRating] = useState<number | "">("");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [result, setResult] = useState<{
+    retrospective_md: string;
+    went_well: string[];
+    went_poorly: string[];
+    skill_gaps_observed: string[];
+    topics_to_brush_up: string[];
+    followup_action?: string | null;
+    rerun_confidence?: number | null;
+    warning?: string | null;
+  } | null>(null);
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!recap.trim()) {
+      setErr("Describe the round first.");
+      return;
+    }
+    setSaving(true);
+    setErr(null);
+    try {
+      const r = await api.post<typeof result & object>(
+        `/api/v1/jobs/${jobId}/rounds/${roundId}/retrospective`,
+        {
+          user_recap: recap,
+          self_rating: selfRating === "" ? null : Number(selfRating),
+        },
+      );
+      setResult(r);
+    } catch (e) {
+      setErr(
+        e instanceof ApiError ? `Retrospective failed (HTTP ${e.status}).` : "Retrospective failed.",
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (result) {
+    return (
+      <div className="space-y-3">
+        <h3 className="text-sm uppercase tracking-wider text-corp-muted">
+          Retrospective saved
+        </h3>
+        {result.warning ? (
+          <div className="text-xs text-corp-accent2 bg-corp-accent2/10 border border-corp-accent2/40 p-2 rounded">
+            ⚠ {result.warning}
+          </div>
+        ) : null}
+        {result.rerun_confidence !== null && result.rerun_confidence !== undefined ? (
+          <div className="text-xs text-corp-muted">
+            Re-run confidence: {result.rerun_confidence}/100
+          </div>
+        ) : null}
+        <div className="grid grid-cols-2 gap-3 text-sm">
+          {result.went_well.length ? (
+            <BulletGroup label="Went well" items={result.went_well} tone="good" />
+          ) : null}
+          {result.went_poorly.length ? (
+            <BulletGroup label="Went poorly" items={result.went_poorly} tone="warn" />
+          ) : null}
+          {result.skill_gaps_observed.length ? (
+            <BulletGroup
+              label="Skill gaps surfaced"
+              items={result.skill_gaps_observed}
+            />
+          ) : null}
+          {result.topics_to_brush_up.length ? (
+            <BulletGroup label="Brush up" items={result.topics_to_brush_up} />
+          ) : null}
+        </div>
+        {result.followup_action ? (
+          <div className="text-sm">
+            <span className="text-[10px] uppercase tracking-wider text-corp-accent">
+              Follow-up:
+            </span>{" "}
+            {result.followup_action}
+          </div>
+        ) : null}
+        <pre className="text-sm whitespace-pre-wrap font-mono bg-corp-surface2 border border-corp-border p-3 rounded max-h-80 overflow-auto">
+          {result.retrospective_md}
+        </pre>
+        <div className="flex justify-end">
+          <button className="jsp-btn-primary" onClick={onSaved} type="button">
+            Close
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <form onSubmit={submit} className="space-y-3">
+      <h3 className="text-sm uppercase tracking-wider text-corp-muted">
+        Interview retrospective
+      </h3>
+      <p className="text-[11px] text-corp-muted">
+        Paste or dictate a raw recap of the round — what they asked, how you
+        answered, what felt off. The Companion structures it into wins, gaps,
+        and brush-up topics.
+      </p>
+      <div>
+        <label className="jsp-label">Raw recap</label>
+        <textarea
+          className="jsp-input min-h-[140px]"
+          value={recap}
+          onChange={(e) => setRecap(e.target.value)}
+          placeholder="They asked about X. I explained Y but stumbled on Z…"
+        />
+      </div>
+      <div>
+        <label className="jsp-label">Self-rating (1–5, optional)</label>
+        <input
+          type="number"
+          min={1}
+          max={5}
+          className="jsp-input w-28"
+          value={selfRating}
+          onChange={(e) =>
+            setSelfRating(e.target.value === "" ? "" : Number(e.target.value))
+          }
+        />
+      </div>
+      {err ? <div className="text-xs text-corp-danger">{err}</div> : null}
+      <div className="flex justify-end gap-2">
+        <button type="button" className="jsp-btn-ghost" onClick={onCancel}>
+          Cancel
+        </button>
+        <button type="submit" className="jsp-btn-primary" disabled={saving}>
+          {saving ? "Writing..." : "Write retrospective"}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function BulletGroup({
+  label,
+  items,
+  tone,
+}: {
+  label: string;
+  items: string[];
+  tone?: "good" | "warn";
+}) {
+  const toneClass =
+    tone === "good"
+      ? "text-emerald-300"
+      : tone === "warn"
+        ? "text-corp-accent2"
+        : "text-corp-muted";
+  return (
+    <div>
+      <div className={`text-[10px] uppercase tracking-wider mb-1 ${toneClass}`}>
+        {label}
+      </div>
+      <ul className="list-disc list-inside space-y-0.5">
+        {items.map((it, i) => (
+          <li key={i}>{it}</li>
+        ))}
+      </ul>
+    </div>
   );
 }
 
@@ -1219,12 +1450,18 @@ function ArtifactRow({
           {artifact.file_url ? (
             <div className="mt-1">
               <a
-                href={artifact.file_url}
+                href={
+                  artifact.file_url.startsWith("/api/v1/")
+                    ? apiUrl(artifact.file_url)
+                    : artifact.file_url
+                }
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-sm text-corp-accent hover:underline break-all"
               >
-                {artifact.file_url}
+                {artifact.source === "uploaded"
+                  ? `Open ${artifact.title}`
+                  : artifact.file_url}
               </a>
             </div>
           ) : null}
@@ -1409,6 +1646,17 @@ function ArtifactForm({
             placeholder="https://..."
           />
         </div>
+        {!initial.id ? (
+          <div className="col-span-2">
+            <ArtifactFileUpload
+              jobId={jobId}
+              form={form}
+              tagsText={tagsText}
+              onSaved={onSaved}
+              setErr={setErr}
+            />
+          </div>
+        ) : null}
         <div className="col-span-2">
           <label className="jsp-label">Content (markdown)</label>
           <textarea
@@ -1429,6 +1677,75 @@ function ArtifactForm({
         </button>
       </div>
     </form>
+  );
+}
+
+function ArtifactFileUpload({
+  jobId,
+  form,
+  tagsText,
+  onSaved,
+  setErr,
+}: {
+  jobId: number;
+  form: Partial<InterviewArtifact>;
+  tagsText: string;
+  onSaved: () => void;
+  setErr: (s: string | null) => void;
+}) {
+  const [uploading, setUploading] = useState(false);
+  const fileRef = useRef<HTMLInputElement | null>(null);
+
+  async function handle(file: File) {
+    setUploading(true);
+    setErr(null);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      fd.append("kind", form.kind || "other");
+      if (form.title?.trim()) fd.append("title", form.title.trim());
+      if (form.interview_round_id != null)
+        fd.append("interview_round_id", String(form.interview_round_id));
+      if (tagsText.trim()) fd.append("tags", tagsText.trim());
+      const res = await fetch(
+        apiUrl(`/api/v1/jobs/${jobId}/artifacts/upload`),
+        { method: "POST", credentials: "include", body: fd },
+      );
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(`HTTP ${res.status}: ${txt.slice(0, 240)}`);
+      }
+      onSaved();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Upload failed.");
+    } finally {
+      setUploading(false);
+      if (fileRef.current) fileRef.current.value = "";
+    }
+  }
+
+  return (
+    <div className="flex items-center gap-2">
+      <label
+        className={`jsp-btn-ghost text-xs cursor-pointer inline-flex ${
+          uploading ? "opacity-50 pointer-events-none" : ""
+        }`}
+      >
+        {uploading ? "Uploading..." : "Upload file directly"}
+        <input
+          ref={fileRef}
+          type="file"
+          className="hidden"
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) handle(f);
+          }}
+        />
+      </label>
+      <span className="text-[11px] text-corp-muted">
+        or paste a URL / content below and click Create instead.
+      </span>
+    </div>
   );
 }
 

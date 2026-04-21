@@ -162,6 +162,72 @@ async def _get_owned_document(
 # --- CRUD -------------------------------------------------------------------
 
 
+class ManualCreateIn(BaseModel):
+    doc_type: str = Field(description="One of DOC_TYPES.")
+    title: str = Field(min_length=1, max_length=255)
+    tracked_job_id: Optional[int] = None
+    content_md: Optional[str] = None
+
+
+@router.post(
+    "",
+    response_model=GeneratedDocumentOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_document_manual(
+    payload: ManualCreateIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> GeneratedDocument:
+    """Create a GeneratedDocument from scratch — no tailor, no upload.
+
+    Lets the user start a blank resume / note / reference doc in the Studio
+    and write it themselves. Optional tracked_job_id attaches it to a job;
+    otherwise it lives in the "Unaffiliated" bucket of the Studio list.
+    """
+    if payload.doc_type not in DOC_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown doc_type '{payload.doc_type}'. Allowed: {sorted(DOC_TYPES)}",
+        )
+    if payload.tracked_job_id is not None:
+        await _get_owned_job(db, payload.tracked_job_id, user.id)
+
+    # Version per (user, tracked_job_id, doc_type).
+    prev_row = (
+        await db.execute(
+            select(GeneratedDocument.id, GeneratedDocument.version)
+            .where(
+                GeneratedDocument.user_id == user.id,
+                GeneratedDocument.tracked_job_id == payload.tracked_job_id,
+                GeneratedDocument.doc_type == payload.doc_type,
+                GeneratedDocument.deleted_at.is_(None),
+            )
+            .order_by(GeneratedDocument.version.desc())
+            .limit(1)
+        )
+    ).first()
+    next_version = (prev_row[1] + 1) if prev_row else 1
+    parent_version_id = prev_row[0] if prev_row else None
+
+    doc = GeneratedDocument(
+        user_id=user.id,
+        tracked_job_id=payload.tracked_job_id,
+        doc_type=payload.doc_type,
+        title=payload.title.strip()[:255],
+        content_md=payload.content_md,
+        content_structured={"source": "manual"},
+        version=next_version,
+        parent_version_id=parent_version_id,
+        humanized=False,
+        source_skill="manual",
+    )
+    db.add(doc)
+    await db.commit()
+    await db.refresh(doc)
+    return doc
+
+
 @router.get("", response_model=list[GeneratedDocumentOut])
 async def list_documents(
     tracked_job_id: Optional[int] = None,
@@ -573,9 +639,10 @@ async def _run_tailor(
     )
 
     # Version: one more than the highest existing version for this job + doc_type.
-    max_version_row = (
+    # Also grab the id of that previous version so we can thread parent_version_id.
+    prev_row = (
         await db.execute(
-            select(GeneratedDocument.version)
+            select(GeneratedDocument.id, GeneratedDocument.version)
             .where(
                 GeneratedDocument.user_id == user.id,
                 GeneratedDocument.tracked_job_id == job.id,
@@ -586,7 +653,8 @@ async def _run_tailor(
             .limit(1)
         )
     ).first()
-    next_version = (max_version_row[0] + 1) if max_version_row else 1
+    next_version = (prev_row[1] + 1) if prev_row else 1
+    parent_version_id = prev_row[0] if prev_row else None
 
     structured = {
         "notes": data.get("notes"),
@@ -601,6 +669,7 @@ async def _run_tailor(
         content_md=content_md,
         content_structured=structured,
         version=next_version,
+        parent_version_id=parent_version_id,
         humanized=False,
         persona_id=persona_id,
         source_skill=f"tailor-{doc_type}",
@@ -764,27 +833,21 @@ async def upload_document(
     dest_path = dest_dir / stored_name
     dest_path.write_bytes(data)
 
-    # If it's small-ish text, also persist the decoded content so the viewer
-    # can show it inline without a separate fetch.
-    content_md: Optional[str] = None
-    is_texty = (
-        mime.startswith("text/")
-        or mime == "application/json"
-        or original_name.lower().endswith((".md", ".txt", ".markdown"))
-    )
-    if is_texty and len(data) <= 2_000_000:
-        try:
-            content_md = data.decode("utf-8")
-        except UnicodeDecodeError:
-            content_md = None
+    # Extract text content when we can — plain text, PDF, DOCX, HTML all get
+    # decoded so the Companion and the in-app editor can work on them.
+    # Failures are non-fatal; the original file is always preserved.
+    from app.skills.doc_text import extract_text, kind_of
+
+    content_md: Optional[str] = extract_text(data, mime, original_name)
+    source_kind = kind_of(mime, original_name)
 
     effective_title = (title or "").strip() or Path(original_name).stem or "Uploaded document"
 
     # Version per (user, tracked_job_id, doc_type) — same as tailoring so
     # uploads and generations interleave cleanly on the Documents tab.
-    max_version_row = (
+    prev_row = (
         await db.execute(
-            select(GeneratedDocument.version)
+            select(GeneratedDocument.id, GeneratedDocument.version)
             .where(
                 GeneratedDocument.user_id == user.id,
                 GeneratedDocument.tracked_job_id == tracked_job_id,
@@ -795,7 +858,8 @@ async def upload_document(
             .limit(1)
         )
     ).first()
-    next_version = (max_version_row[0] + 1) if max_version_row else 1
+    next_version = (prev_row[1] + 1) if prev_row else 1
+    parent_version_id = prev_row[0] if prev_row else None
 
     # Store file reference in content_structured (no schema migration needed).
     structured = {
@@ -805,6 +869,10 @@ async def upload_document(
         "mime_type": mime,
         "size_bytes": len(data),
         "has_inline_text": content_md is not None,
+        # What format the content_md was extracted FROM. "text" means the
+        # upload was already text-like; "pdf"/"docx"/"html" mean we decoded
+        # binary content; "binary" means we couldn't extract anything.
+        "extracted_from": source_kind,
     }
 
     doc = GeneratedDocument(
@@ -815,6 +883,7 @@ async def upload_document(
         content_md=content_md,
         content_structured=structured,
         version=next_version,
+        parent_version_id=parent_version_id,
         humanized=False,
         source_skill="upload",
     )
@@ -1310,6 +1379,8 @@ async def selection_edit(
     ).first()
     next_version = (max_version_row[0] + 1) if max_version_row else 1
 
+    # For selection-derived new docs the "parent" is the source document the
+    # selection came from, even if it's a different doc_type.
     new_doc = GeneratedDocument(
         user_id=user.id,
         tracked_job_id=doc.tracked_job_id,
@@ -1324,6 +1395,7 @@ async def selection_edit(
             "instruction": payload.instruction.strip()[:500],
         },
         version=next_version,
+        parent_version_id=doc.id,
         humanized=False,
         source_skill="selection-new-doc",
         prompt_snapshot=prompt[:20000],
@@ -1338,3 +1410,177 @@ async def selection_edit(
         notes=data.get("notes"),
         warning=data.get("warning"),
     )
+
+
+# --- Humanizer --------------------------------------------------------------
+
+_HUMANIZE_PROMPT = """You are rewriting a document in the user's own voice,
+using their writing samples as the reference corpus for tone, sentence shape,
+and word choice. This is NOT a full rewrite — preserve the structure,
+headings, bullet content, and factual claims of the source. Change only HOW
+things are said.
+
+Source document:
+-----
+{source_body}
+-----
+
+User's writing samples (treat each as an independent example of their
+natural voice — mimic cadence and vocabulary, not topic):
+
+{samples_block}
+
+Rules
+-----
+- NEVER add claims, metrics, companies, or stories not in the source.
+- Preserve section structure: if the source is a resume with headings, output
+  a resume with the same headings. If it's a cover letter, keep it a cover
+  letter.
+- Kill AI tells: over-polished parallelism, "moreover", "furthermore", "leveraging",
+  empty-phrase openers ("I am excited to…"), triplets-of-adjectives patterns.
+- Match the samples' contraction rate, punctuation tics, sentence-length
+  distribution, whether they use em-dashes or not, first-person density.
+- If a sample contradicts another sample, trust the one that feels closer to
+  the source's genre.
+
+Return ONE JSON object, no prose, no markdown fences:
+
+{{
+  "content_md": string,
+  "notes": string | null,
+  "warning": string | null
+}}
+"""
+
+
+class HumanizeIn(BaseModel):
+    sample_tags: Optional[list[str]] = None
+    max_samples: int = Field(default=5, ge=1, le=20)
+
+
+@router.post(
+    "/{doc_id:int}/humanize",
+    response_model=GeneratedDocumentOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def humanize_document(
+    doc_id: int,
+    payload: HumanizeIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> GeneratedDocument:
+    """Rewrite a document in the user's voice using their writing samples.
+
+    Creates a NEW document version (does not mutate the source) with
+    `humanized=True`, `parent_version_id` pointing at the source doc, and
+    `humanized_from_samples` listing which sample IDs were used.
+    """
+    source = await _get_owned_document(db, doc_id, user.id)
+    if not (source.content_md and source.content_md.strip()):
+        raise HTTPException(
+            status_code=422,
+            detail="Source document has no text to humanize.",
+        )
+
+    # Pull writing samples. If the caller asked for a tag filter, match any of
+    # the requested tags; otherwise take the most recent N.
+    stmt = (
+        select(WritingSample)
+        .where(
+            WritingSample.user_id == user.id,
+            WritingSample.deleted_at.is_(None),
+        )
+        .order_by(WritingSample.created_at.desc())
+    )
+    samples: list[WritingSample] = list((await db.execute(stmt)).scalars().all())
+    if payload.sample_tags:
+        wanted = set(payload.sample_tags)
+        samples = [
+            s for s in samples if set(s.tags or []) & wanted
+        ] or samples[: payload.max_samples]
+    else:
+        samples = samples[: payload.max_samples]
+
+    if not samples:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "No writing samples on file. Add at least one on the Writing "
+                "Samples page before humanizing."
+            ),
+        )
+
+    def _trim(text: str, cap: int = 2000) -> str:
+        return text if len(text) <= cap else text[:cap] + "\n[… truncated …]"
+
+    samples_block_parts: list[str] = []
+    for i, s in enumerate(samples, 1):
+        tag_str = f" ({', '.join(s.tags)})" if s.tags else ""
+        samples_block_parts.append(
+            f"--- sample {i}: {s.title}{tag_str} ---\n{_trim(s.content_md)}"
+        )
+    samples_block = "\n\n".join(samples_block_parts)
+
+    prompt = _HUMANIZE_PROMPT.format(
+        source_body=source.content_md,
+        samples_block=samples_block,
+    )
+
+    try:
+        result = await run_claude_prompt(
+            prompt=prompt,
+            output_format="json",
+            allowed_tools=[],
+            timeout_seconds=180,
+        )
+    except ClaudeCodeError as exc:
+        log.warning("Humanize failed for doc %s: %s", doc_id, exc)
+        raise HTTPException(status_code=502, detail=f"Claude Code error: {exc}")
+
+    data = _extract_json_object(result.result) or {}
+    content_md = (data.get("content_md") or "").strip()
+    if not content_md:
+        raise HTTPException(
+            status_code=502, detail="Humanizer returned no content."
+        )
+
+    # Version per (user, tracked_job_id, doc_type). Humanized output lives in
+    # the same stream as the original — it's just another version of the doc.
+    max_version_row = (
+        await db.execute(
+            select(GeneratedDocument.version)
+            .where(
+                GeneratedDocument.user_id == user.id,
+                GeneratedDocument.tracked_job_id == source.tracked_job_id,
+                GeneratedDocument.doc_type == source.doc_type,
+                GeneratedDocument.deleted_at.is_(None),
+            )
+            .order_by(GeneratedDocument.version.desc())
+            .limit(1)
+        )
+    ).first()
+    next_version = (max_version_row[0] + 1) if max_version_row else 1
+
+    humanized_doc = GeneratedDocument(
+        user_id=user.id,
+        tracked_job_id=source.tracked_job_id,
+        doc_type=source.doc_type,
+        title=f"{source.title} (humanized)"[:255],
+        content_md=content_md,
+        content_structured={
+            "notes": data.get("notes"),
+            "warning": data.get("warning"),
+            "humanized_source_doc_id": source.id,
+        },
+        version=next_version,
+        parent_version_id=source.id,
+        humanized=True,
+        humanized_from_samples=[s.id for s in samples],
+        persona_id=source.persona_id,
+        source_skill="humanizer",
+        prompt_snapshot=prompt[:20000],
+    )
+    db.add(humanized_doc)
+    await db.commit()
+    await db.refresh(humanized_doc)
+    return humanized_doc

@@ -49,7 +49,26 @@ export default function DocumentEditorPage({
   const [loadErr, setLoadErr] = useState<string | null>(null);
 
   const [popup, setPopup] = useState<PopupState | null>(null);
+  const [showDiff, setShowDiff] = useState(false);
+  const [parentDoc, setParentDoc] = useState<GeneratedDocument | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  // Load the parent doc lazily when the user wants the diff view.
+  useEffect(() => {
+    if (!showDiff || !doc?.parent_version_id) return;
+    let cancelled = false;
+    api
+      .get<GeneratedDocument>(`/api/v1/documents/${doc.parent_version_id}`)
+      .then((p) => {
+        if (!cancelled) setParentDoc(p);
+      })
+      .catch(() => {
+        /* non-fatal */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [showDiff, doc?.parent_version_id]);
 
   async function load() {
     try {
@@ -168,15 +187,19 @@ export default function DocumentEditorPage({
     original_filename?: string | null;
     stored_path?: string | null;
     mime_type?: string | null;
+    extracted_from?: string | null;
   } | null;
   const isUpload = !!structured?.stored_path;
+  const extractedFrom = structured?.extracted_from ?? null;
+  const isExtracted =
+    isUpload && extractedFrom && extractedFrom !== "text";
 
   return (
     <PageShell
       title={doc.title}
       subtitle={`${doc.doc_type.replace(/_/g, " ")} · v${doc.version}`}
       actions={
-        <div className="flex gap-2 items-center">
+        <div className="flex gap-2 items-center flex-wrap">
           {doc.tracked_job_id ? (
             <Link
               href={`/jobs/${doc.tracked_job_id}`}
@@ -194,6 +217,21 @@ export default function DocumentEditorPage({
             >
               Open file
             </a>
+          ) : null}
+          {doc.content_md && !isUpload ? (
+            <HumanizeButton
+              docId={doc.id}
+              onCreated={(newId) => router.push(`/studio/${newId}`)}
+            />
+          ) : null}
+          {doc.parent_version_id ? (
+            <button
+              className="jsp-btn-ghost text-xs"
+              onClick={() => setShowDiff((v) => !v)}
+              title="Compare against the previous version"
+            >
+              {showDiff ? "Hide diff" : `Diff vs v${doc.version - 1}`}
+            </button>
           ) : null}
           <button
             className="jsp-btn-primary"
@@ -217,8 +255,8 @@ export default function DocumentEditorPage({
 
       {isUpload && !doc.content_md ? (
         <div className="jsp-card p-5 mt-3 text-sm text-corp-muted">
-          This document is an uploaded binary file — there&apos;s no editable
-          text body. Use{" "}
+          No readable text body — we couldn&apos;t extract anything from this
+          file. Use{" "}
           <a
             className="text-corp-accent hover:underline"
             href={apiUrl(`/api/v1/documents/${doc.id}/file`)}
@@ -227,7 +265,7 @@ export default function DocumentEditorPage({
           >
             Open file
           </a>{" "}
-          to view it.
+          to view the original.
         </div>
       ) : (
         <>
@@ -236,10 +274,25 @@ export default function DocumentEditorPage({
               Select any span of text to ask the Companion to rewrite it,
               answer a question about it, or spin off a new document.
             </span>
+            {isExtracted ? (
+              <span className="text-corp-accent2">
+                · Extracted from {extractedFrom?.toUpperCase()}. Edits save to the
+                text version; the original {extractedFrom} is still available
+                via Open file.
+              </span>
+            ) : null}
             {saveErr ? (
               <span className="text-corp-danger ml-auto">{saveErr}</span>
             ) : null}
           </div>
+          {showDiff && parentDoc ? (
+            <DiffPanel
+              previous={parentDoc.content_md ?? ""}
+              current={body}
+              previousVersion={parentDoc.version}
+              currentVersion={doc.version}
+            />
+          ) : null}
           <div className="jsp-card p-0 mt-2 relative">
             <textarea
               ref={textareaRef}
@@ -538,5 +591,158 @@ function ModeButton({
     >
       {label}
     </button>
+  );
+}
+
+function HumanizeButton({
+  docId,
+  onCreated,
+}: {
+  docId: number;
+  onCreated: (newId: number) => void;
+}) {
+  const [running, setRunning] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function run() {
+    setRunning(true);
+    setErr(null);
+    try {
+      const created = await api.post<GeneratedDocument>(
+        `/api/v1/documents/${docId}/humanize`,
+        { max_samples: 5 },
+      );
+      onCreated(created.id);
+    } catch (e) {
+      setErr(
+        e instanceof ApiError
+          ? `Humanize failed (HTTP ${e.status}).`
+          : "Humanize failed.",
+      );
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  return (
+    <div className="flex flex-col items-end">
+      <button
+        type="button"
+        className="jsp-btn-ghost text-xs"
+        onClick={run}
+        disabled={running}
+        title="Rewrite this document in your voice using your Writing Samples"
+      >
+        {running ? "Humanizing..." : "Humanize"}
+      </button>
+      {err ? (
+        <span className="text-[10px] text-corp-danger mt-0.5">{err}</span>
+      ) : null}
+    </div>
+  );
+}
+
+// Minimal line-based diff — good enough for markdown documents where
+// paragraphs are naturally line-separated. Myers' algorithm is overkill for
+// the short documents we ship; a longest-common-subsequence on lines is fine.
+function diffLines(prev: string, curr: string): Array<
+  { type: "same" | "add" | "remove"; text: string }
+> {
+  const a = prev.split("\n");
+  const b = curr.split("\n");
+  // LCS DP table.
+  const m = a.length;
+  const n = b.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, () =>
+    new Array(n + 1).fill(0),
+  );
+  for (let i = m - 1; i >= 0; i--) {
+    for (let j = n - 1; j >= 0; j--) {
+      if (a[i] === b[j]) dp[i][j] = dp[i + 1][j + 1] + 1;
+      else dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const out: Array<{ type: "same" | "add" | "remove"; text: string }> = [];
+  let i = 0;
+  let j = 0;
+  while (i < m && j < n) {
+    if (a[i] === b[j]) {
+      out.push({ type: "same", text: a[i] });
+      i++;
+      j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      out.push({ type: "remove", text: a[i] });
+      i++;
+    } else {
+      out.push({ type: "add", text: b[j] });
+      j++;
+    }
+  }
+  while (i < m) {
+    out.push({ type: "remove", text: a[i++] });
+  }
+  while (j < n) {
+    out.push({ type: "add", text: b[j++] });
+  }
+  return out;
+}
+
+function DiffPanel({
+  previous,
+  current,
+  previousVersion,
+  currentVersion,
+}: {
+  previous: string;
+  current: string;
+  previousVersion: number;
+  currentVersion: number;
+}) {
+  const diff = diffLines(previous, current);
+  const added = diff.filter((d) => d.type === "add").length;
+  const removed = diff.filter((d) => d.type === "remove").length;
+
+  return (
+    <div className="jsp-card p-0 mt-2 overflow-hidden">
+      <div className="px-3 py-2 text-[11px] text-corp-muted border-b border-corp-border flex items-center justify-between">
+        <span>
+          Diff · v{previousVersion} → v{currentVersion}
+        </span>
+        <span>
+          <span className="text-emerald-300">+{added}</span>{" "}
+          <span className="text-corp-danger">-{removed}</span>
+        </span>
+      </div>
+      <pre className="font-mono text-xs leading-relaxed max-h-[60vh] overflow-auto">
+        {diff.map((d, i) => {
+          if (d.type === "same") {
+            if (d.text === "" && i !== 0 && i !== diff.length - 1)
+              return <div key={i} className="px-3">&nbsp;</div>;
+            return (
+              <div key={i} className="px-3 text-corp-muted">
+                {d.text || "\u00a0"}
+              </div>
+            );
+          }
+          if (d.type === "add") {
+            return (
+              <div
+                key={i}
+                className="px-3 bg-emerald-500/10 text-emerald-300"
+              >
+                <span className="inline-block w-3 text-emerald-400">+</span>
+                {d.text || "\u00a0"}
+              </div>
+            );
+          }
+          return (
+            <div key={i} className="px-3 bg-corp-danger/10 text-corp-danger">
+              <span className="inline-block w-3 text-corp-danger">-</span>
+              {d.text || "\u00a0"}
+            </div>
+          );
+        })}
+      </pre>
+    </div>
   );
 }

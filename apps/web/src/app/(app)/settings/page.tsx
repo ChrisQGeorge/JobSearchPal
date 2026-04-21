@@ -1,11 +1,10 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { PageShell } from "@/components/PageShell";
-import { ComingSoon } from "@/components/ComingSoon";
-import { api, ApiError } from "@/lib/api";
+import { api, apiUrl, ApiError } from "@/lib/api";
 
 type ClaudeHealth = {
   claude_cli_available: boolean;
@@ -35,16 +34,8 @@ export default function SettingsPage() {
     >
       <div className="space-y-4">
         <ClaudeAuthPanel />
-        <ComingSoon
-          title="AI Persona"
-          description="Pick from built-in personas or define custom ones with name, tone descriptors, system prompt, and avatar."
-          plannedFor="R5"
-        />
-        <ComingSoon
-          title="Data Export / Reset"
-          description="JSON + SQL dump export. Credential rotation. Full data purge."
-          plannedFor="R0+"
-        />
+        <PersonaManager />
+        <DataIoPanel />
       </div>
     </PageShell>
   );
@@ -167,6 +158,378 @@ function ClaudeAuthPanel() {
       {error ? (
         <div className="mt-3 text-sm text-corp-danger">{error}</div>
       ) : null}
+    </section>
+  );
+}
+
+// ---------- Persona manager -------------------------------------------------
+
+type Persona = {
+  id: number;
+  name: string;
+  description?: string | null;
+  tone_descriptors?: string[] | null;
+  system_prompt: string;
+  avatar_url?: string | null;
+  is_builtin: boolean;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+function PersonaManager() {
+  const [personas, setPersonas] = useState<Persona[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+  const [editing, setEditing] = useState<Persona | "new" | null>(null);
+
+  async function refresh() {
+    setLoading(true);
+    setErr(null);
+    try {
+      setPersonas(await api.get<Persona[]>("/api/v1/personas"));
+    } catch (e) {
+      setErr(e instanceof ApiError ? `HTTP ${e.status}` : "Failed to load personas.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+  }, []);
+
+  async function activate(id: number) {
+    try {
+      await api.post(`/api/v1/personas/${id}/activate`);
+      await refresh();
+    } catch (e) {
+      setErr(
+        e instanceof ApiError ? `Activation failed (HTTP ${e.status}).` : "Activation failed.",
+      );
+    }
+  }
+
+  async function deactivateAll() {
+    try {
+      await api.post("/api/v1/personas/deactivate");
+      await refresh();
+    } catch (e) {
+      setErr(
+        e instanceof ApiError
+          ? `Deactivation failed (HTTP ${e.status}).`
+          : "Deactivation failed.",
+      );
+    }
+  }
+
+  async function remove(id: number) {
+    if (!confirm("Delete this persona? Cannot be undone.")) return;
+    try {
+      await api.delete(`/api/v1/personas/${id}`);
+      await refresh();
+    } catch (e) {
+      setErr(e instanceof ApiError ? `Delete failed (HTTP ${e.status}).` : "Delete failed.");
+    }
+  }
+
+  const active = personas.find((p) => p.is_active) ?? null;
+
+  return (
+    <section className="jsp-card p-5">
+      <header className="flex items-start justify-between gap-4 mb-3 flex-wrap">
+        <div>
+          <h2 className="text-sm uppercase tracking-wider text-corp-muted">AI Persona</h2>
+          <p className="text-xs text-corp-muted mt-1">
+            Preset tone and voice instructions that ride along with every Companion
+            invocation. One persona can be active at a time.{" "}
+            {active ? (
+              <span className="text-corp-accent">Active: {active.name}.</span>
+            ) : (
+              <span>No persona is currently active.</span>
+            )}
+          </p>
+        </div>
+        <div className="flex gap-2">
+          {active ? (
+            <button className="jsp-btn-ghost" onClick={deactivateAll}>
+              Deactivate all
+            </button>
+          ) : null}
+          <button className="jsp-btn-primary" onClick={() => setEditing("new")}>
+            + New persona
+          </button>
+        </div>
+      </header>
+
+      {err ? <div className="text-sm text-corp-danger mb-2">{err}</div> : null}
+
+      {editing ? (
+        <div className="jsp-card p-4 mb-3 bg-corp-surface2">
+          <PersonaForm
+            initial={editing === "new" ? null : editing}
+            onCancel={() => setEditing(null)}
+            onSaved={() => {
+              setEditing(null);
+              refresh();
+            }}
+          />
+        </div>
+      ) : null}
+
+      {loading ? (
+        <p className="text-sm text-corp-muted">Loading...</p>
+      ) : personas.length === 0 ? (
+        <p className="text-sm text-corp-muted">
+          No personas yet. Examples: Brisk Hiring Manager · Dry Analyst · Warm Mentor.
+        </p>
+      ) : (
+        <ul className="divide-y divide-corp-border">
+          {personas.map((p) => (
+            <li
+              key={p.id}
+              className="flex items-center gap-3 py-2 first:pt-0 last:pb-0"
+            >
+              <div className="min-w-0 flex-1">
+                <div className="flex items-baseline gap-2 flex-wrap">
+                  <span className="text-sm font-medium">{p.name}</span>
+                  {p.is_active ? (
+                    <span className="inline-block px-2 py-0.5 rounded text-[10px] uppercase tracking-wider bg-corp-accent/25 text-corp-accent border border-corp-accent/40">
+                      active
+                    </span>
+                  ) : null}
+                  {p.tone_descriptors && p.tone_descriptors.length > 0 ? (
+                    <span className="text-[11px] text-corp-muted">
+                      · {p.tone_descriptors.join(", ")}
+                    </span>
+                  ) : null}
+                </div>
+                {p.description ? (
+                  <div className="text-[11px] text-corp-muted truncate">
+                    {p.description}
+                  </div>
+                ) : null}
+              </div>
+              <div className="flex gap-1 shrink-0">
+                {!p.is_active ? (
+                  <button
+                    className="jsp-btn-ghost text-xs"
+                    onClick={() => activate(p.id)}
+                  >
+                    Activate
+                  </button>
+                ) : null}
+                <button
+                  className="jsp-btn-ghost text-xs"
+                  onClick={() => setEditing(p)}
+                >
+                  Edit
+                </button>
+                <button
+                  className="jsp-btn-ghost text-xs text-corp-danger border-corp-danger/40"
+                  onClick={() => remove(p.id)}
+                >
+                  Delete
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+function PersonaForm({
+  initial,
+  onCancel,
+  onSaved,
+}: {
+  initial: Persona | null;
+  onCancel: () => void;
+  onSaved: () => void;
+}) {
+  const [name, setName] = useState(initial?.name ?? "");
+  const [description, setDescription] = useState(initial?.description ?? "");
+  const [tonesText, setTonesText] = useState(
+    (initial?.tone_descriptors ?? []).join(", "),
+  );
+  const [systemPrompt, setSystemPrompt] = useState(initial?.system_prompt ?? "");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!name.trim()) {
+      setErr("Name is required.");
+      return;
+    }
+    setSaving(true);
+    setErr(null);
+    try {
+      const tones = tonesText
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const payload = {
+        name: name.trim(),
+        description: description.trim() || null,
+        tone_descriptors: tones.length ? tones : null,
+        system_prompt: systemPrompt,
+      };
+      if (initial) {
+        await api.put(`/api/v1/personas/${initial.id}`, payload);
+      } else {
+        await api.post("/api/v1/personas", payload);
+      }
+      onSaved();
+    } catch (e) {
+      setErr(e instanceof ApiError ? `Save failed (HTTP ${e.status}).` : "Save failed.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <form onSubmit={submit} className="space-y-3">
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className="jsp-label">Name</label>
+          <input
+            className="jsp-input"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="Dry Analyst"
+          />
+        </div>
+        <div>
+          <label className="jsp-label">Tone descriptors (comma-separated)</label>
+          <input
+            className="jsp-input"
+            value={tonesText}
+            onChange={(e) => setTonesText(e.target.value)}
+            placeholder="precise, terse, skeptical"
+          />
+        </div>
+        <div className="col-span-2">
+          <label className="jsp-label">Description (optional)</label>
+          <input
+            className="jsp-input"
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder="Short summary for this persona's style."
+          />
+        </div>
+        <div className="col-span-2">
+          <label className="jsp-label">Custom instructions</label>
+          <textarea
+            className="jsp-input min-h-[140px] font-mono text-sm"
+            value={systemPrompt}
+            onChange={(e) => setSystemPrompt(e.target.value)}
+            placeholder="Additional rules for the Companion while this persona is active. E.g. 'Never use exclamation marks. Prefer Latin-root verbs. Flag hype language in the user's drafts.'"
+          />
+        </div>
+      </div>
+      {err ? <div className="text-xs text-corp-danger">{err}</div> : null}
+      <div className="flex justify-end gap-2">
+        <button type="button" className="jsp-btn-ghost" onClick={onCancel}>
+          Cancel
+        </button>
+        <button type="submit" className="jsp-btn-primary" disabled={saving}>
+          {saving ? "Saving..." : initial ? "Save" : "Create"}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function DataIoPanel() {
+  const [importing, setImporting] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement | null>(null);
+
+  async function doExport() {
+    setErr(null);
+    try {
+      const res = await fetch(apiUrl("/api/v1/admin/export"), {
+        credentials: "include",
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const ts = new Date().toISOString().replace(/[:T]/g, "-").slice(0, 19);
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `jsp-export-${ts}.json`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      setMsg("Export downloaded.");
+      setTimeout(() => setMsg(null), 2500);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Export failed.");
+    }
+  }
+
+  async function doImport(file: File) {
+    if (!confirm(
+      "Import rows from this file? Existing data is kept; new rows will be added alongside it.",
+    )) return;
+    setImporting(true);
+    setErr(null);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await fetch(apiUrl("/api/v1/admin/import"), {
+        method: "POST",
+        credentials: "include",
+        body: fd,
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      const r = (await res.json()) as { imported: Record<string, number> };
+      const total = Object.values(r.imported).reduce((a, b) => a + b, 0);
+      setMsg(`Imported ${total} rows across ${Object.keys(r.imported).length} tables.`);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Import failed.");
+    } finally {
+      setImporting(false);
+      if (fileRef.current) fileRef.current.value = "";
+    }
+  }
+
+  return (
+    <section className="jsp-card p-5">
+      <h2 className="text-sm uppercase tracking-wider text-corp-muted mb-2">
+        Data Export / Import
+      </h2>
+      <p className="text-xs text-corp-muted mb-3">
+        Full JSON dump of everything you own — jobs, history, documents, personas,
+        preferences, chat transcripts. Import re-inserts rows with fresh ids;
+        nothing is overwritten.
+      </p>
+      <div className="flex flex-wrap gap-2 items-center">
+        <button type="button" className="jsp-btn-primary" onClick={doExport}>
+          Export JSON
+        </button>
+        <label
+          className={`jsp-btn-ghost cursor-pointer inline-flex ${
+            importing ? "opacity-50 pointer-events-none" : ""
+          }`}
+        >
+          {importing ? "Importing..." : "Import JSON..."}
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".json,application/json"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) doImport(f);
+            }}
+          />
+        </label>
+        {msg ? <span className="text-xs text-corp-muted">{msg}</span> : null}
+        {err ? <span className="text-xs text-corp-danger">{err}</span> : null}
+      </div>
     </section>
   );
 }

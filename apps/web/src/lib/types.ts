@@ -217,6 +217,7 @@ export type TrackedJobSummary = {
   experience_years_max?: number | null;
   employment_type?: EmploymentType | null;
   fit_score?: number | null;
+  red_flag_count?: number | null;
 };
 
 export type TrackedJob = {
@@ -385,6 +386,7 @@ export type GeneratedDocument = {
   version: number;
   parent_version_id?: number | null;
   humanized: boolean;
+  humanized_from_samples?: number[] | null;
   model_used?: string | null;
   persona_id?: number | null;
   source_skill?: string | null;

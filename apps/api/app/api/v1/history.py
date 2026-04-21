@@ -583,6 +583,19 @@ async def timeline(
         org_names = {row[0]: row[1] for row in rows}
 
     for w in works:
+        gaps: list[str] = []
+        if not w.start_date:
+            gaps.append("no start date")
+        if not w.end_date and not (w.reason_for_leaving or "").lower().startswith(
+            ("current", "ongoing", "present")
+        ):
+            # No end_date AND no signal that the role is ongoing → probably stale.
+            # (Work doesn't have an is_ongoing flag — we infer from end_date absence.)
+            pass  # intentional: absence of end_date is the ongoing signal
+        if not (w.highlights or []):
+            gaps.append("no highlights")
+        if not w.summary:
+            gaps.append("no summary")
         events.append(
             TimelineEvent(
                 kind="work",
@@ -591,11 +604,20 @@ async def timeline(
                 subtitle=org_names.get(w.organization_id) if w.organization_id else None,
                 start_date=w.start_date,
                 end_date=w.end_date,
-                metadata={"location": w.location, "employment_type": w.employment_type},
+                metadata={
+                    "location": w.location,
+                    "employment_type": w.employment_type,
+                    "gaps": gaps,
+                },
             )
         )
     for e in educations:
         org_name = org_names.get(e.organization_id) if e.organization_id else None
+        e_gaps: list[str] = []
+        if not e.start_date:
+            e_gaps.append("no start date")
+        if not e.degree and not e.field_of_study:
+            e_gaps.append("no degree")
         events.append(
             TimelineEvent(
                 kind="education",
@@ -608,7 +630,10 @@ async def timeline(
                 subtitle=org_name,
                 start_date=e.start_date,
                 end_date=e.end_date,
-                metadata={"gpa": float(e.gpa) if e.gpa is not None else None},
+                metadata={
+                    "gpa": float(e.gpa) if e.gpa is not None else None,
+                    "gaps": e_gaps,
+                },
             )
         )
     for a in await _list_for_user(db, Achievement, user.id):
@@ -638,6 +663,11 @@ async def timeline(
         )
 
     for p in await _list_for_user(db, Project, user.id):
+        p_gaps: list[str] = []
+        if not (p.highlights or []):
+            p_gaps.append("no highlights")
+        if not p.summary and not p.description_md:
+            p_gaps.append("no summary")
         events.append(
             TimelineEvent(
                 kind="project",
@@ -646,7 +676,11 @@ async def timeline(
                 subtitle=p.role,
                 start_date=p.start_date,
                 end_date=None if p.is_ongoing else p.end_date,
-                metadata={"is_ongoing": p.is_ongoing, "visibility": p.visibility},
+                metadata={
+                    "is_ongoing": p.is_ongoing,
+                    "visibility": p.visibility,
+                    "gaps": p_gaps,
+                },
             )
         )
 

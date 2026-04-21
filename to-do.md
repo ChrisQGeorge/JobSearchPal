@@ -52,12 +52,12 @@ Snapshot of what's built vs. what's left, organized by the SRS §2.6 release pla
 ## What's left
 
 ### R1 — History polish (small)
-- [ ] Timeline: optional grouping by role vs. kind.
+- ✅ **Timeline: highlight entities with unresolved gaps** — backend computes a `metadata.gaps[]` list per event (missing highlights, missing summary, missing start date, etc.); frontend rings each event in the accent color and shows a `⚠` prefix. New "⚠ gaps (N)" toggle filters to only incomplete entries.
+- ✅ **Timeline: optional grouping by role vs. kind** — new "By kind / By org" segmented toggle. Org mode groups events by subtitle (organization / issuer / venue) onto a single row each; kind mode is unchanged.
 - [ ] Optional: upgrade Achievement / Certification / Publication / VolunteerWork issuer / venue fields to use the `OrganizationCombobox` (schema change + migration; deferred because free-text is fine for now).
-- [ ] Timeline: highlight entities with unresolved gaps (e.g., Work with no highlights).
 
 ### R2 — Job Tracking polish (medium)
-- [ ] **Inline action buttons** on Job Detail header (Research Company / draft outreach email). JD Analyze + resume/cover-letter tailoring are already wired through tabs.
+- ✅ **Inline action buttons** — all the header actions are already live on Job Detail (Research Company as a panel on Overview; JD Analyze panel on Overview; Write / Upload on the Documents tab with a type selector that includes outreach_email / thank_you / followup).
 
 ### R3 — Skills MVP (big — the main remaining work)
 Project skill definitions already exist at `/skills/<name>/SKILL.md`. Wire them through the API → DB → UI so the user (and Companion) can invoke them.
@@ -66,41 +66,45 @@ Project skill definitions already exist at `/skills/<name>/SKILL.md`. Wire them 
   - [ ] Chain through `writing-humanizer` when R4 ships.
 - ✅ **email-drafter** — the unified tailor endpoint handles `outreach_email`, `thank_you`, and `followup` doc types with a purpose-specific email prompt.
 - ✅ **company-researcher** — `POST /organizations/{id}/research` populates research_notes / tech_stack_hints / reputation_signals (engineering culture, work-life balance, layoffs, recent news, red/green flags). UI on Job Detail Overview and the Organizations edit form.
-- [ ] **application-tracker** skill: conversational ingestion of "I just applied to X" — proposes `TrackedJob` + `ApplicationEvent` diffs, writes on user confirmation.
-- [ ] **history-interviewer** skill for filling gaps in user history.
-- [ ] **companion-persona** wrapper — pass the active `Persona` into every skill invocation.
-- [ ] Surface **skill invocations inline** in Companion chat — show "invoked: resume-tailor" pills with cost/duration.
-- [ ] Stream Companion responses (`--output-format stream-json`) so the UI shows tokens as they arrive.
-- [ ] Rich **`GeneratedDocument` editor** (inline edit, diff against previous version, one-click re-tailor-with-changes). Current viewer is read-only + copy/download.
+- ✅ **application-tracker workflow** — Companion primer now includes the exact step-by-step ingestion pattern (ask for URL → POST /jobs/queue or /jobs with desired_status=applied → log ApplicationEvent → confirm). Quick-prompt "Log a job I just applied to" on the Companion empty state.
+- ✅ **history-interviewer workflow** — primer describes the gap-filling loop (audit via GET /history/*, one question at a time, PUT on confirm). Quick-prompt "Fill gaps in my history" on the Companion empty state.
+- ✅ **companion-persona** wrapper — `Persona` model + full CRUD at `/api/v1/personas` + UI on Settings. Active persona (`name`, `description`, `tone_descriptors`, `system_prompt`) is appended to the Companion primer on every turn.
+- ✅ Surface **skill invocations inline** in Companion chat — parsed endpoint + tool hints render as small chips under each assistant bubble alongside cost / duration / turns metadata. Cached in `tool_results` JSON so historical messages also show the data.
+- ✅ Stream Companion responses (`--output-format stream-json`) — new `POST /companion/conversations/{id}/messages-stream` endpoint streams text deltas and tool-use events as Server-Sent Events. Frontend reads the stream with `fetch` + `ReadableStream`, updates the assistant bubble incrementally, persists server-side on `done`.
+- ✅ Rich **`GeneratedDocument` editor** — `/studio/[id]` has a full-screen editor with textarea + selection-based AI (Rewrite / Answer / Create new document). Diff-against-previous-version is still R4 proper.
 
 ### R4 — Humanization & Studio (big)
-- ✅ **Writing Samples Library** CRUD page: paste-in, tag, `.txt`/`.md` upload. (`.pdf`/`.docx` extraction still pending — requires adding pypdf / python-docx deps.)
-- [ ] **writing-humanizer** skill wired to the backend; default-on for cover letters and emails. Should read from `/documents/samples` and pick matching-tag samples as reference corpus.
-- ✅ **Document Studio** (basic): `/studio` browses every GeneratedDocument with type/job filters, inline markdown edit, PDF/image preview, link back to job.
-  - [ ] Regenerate / humanize / diff controls and `parent_version_id` threading (R4 proper).
-- [ ] **Global editor "Send to Companion → rewrite selection"** — `selection-rewriter` skill, triggered from any rich-text editor, records `DocumentEdit` rows.
-- [ ] **Interview Artifacts: file upload** — the Artifacts tab accepts pasted-text content + `file_url` today. Still missing: actual file upload into `/app/uploads` + mime sniffing so the user can drop a whiteboard photo / take-home .pdf in directly.
+- ✅ **Writing Samples Library** CRUD page: paste-in, tag, `.txt`/`.md` upload.
+- ✅ **writing-humanizer** — `POST /documents/{id}/humanize` rewrites a generated document in the user's voice using up-to-N writing samples (optional tag filter). Creates a new doc with `humanized=true`, `parent_version_id` → source, and `humanized_from_samples` recording which samples were consulted. "Humanize" button on the editor triggers it.
+- ✅ **Document Studio**: `/studio` lists every GeneratedDocument with type/job filters, inline markdown edit, PDF/image preview, link back to job. `/studio/[id]` is a full editor.
+- ✅ **parent_version_id threading + diff controls** — every new tailor/upload/humanize/selection-new-doc version writes `parent_version_id` pointing at the previous version. Editor has a "Diff vs v{N-1}" toggle that fetches the parent and renders a line-level LCS diff (+/- line colors, add/remove counts).
+- ✅ **Global editor "Send to Companion → rewrite selection"** — fulfilled by the `/studio/[id]` selection popup, which writes `DocumentEdit` rows for every rewrite / answer / new-doc action.
+- ✅ **Interview Artifacts: file upload** — `POST /jobs/{id}/artifacts/upload` (multipart, 25 MB cap, any mime), `GET /jobs/{id}/artifacts/{id}/file` to stream. Text-ish files get `content_md` extracted via the same `doc_text` pipeline as documents. New "Upload file directly" button on the artifact create form.
 
 ### R5 — Analytics, Preferences, Personas (medium-big)
 - ✅ **Dashboard charts** — live KPI tiles (active apps, response rate, offers won, applied this week + 30-day), status-distribution bar chart, pipeline funnel, and a 30-day activity sparkline. Hand-rolled SVG, no chart lib dependency.
-- [ ] **Preferences & Identity** forms (three panels): `JobPreferences` (three-tier scalars), `JobCriterion` list, `WorkAuthorization`, `Demographics` with per-field share policies.
-- [ ] **job-fit-scorer** skill — compute `fit_summary` on every `TrackedJob`. Surface dealbreakers prominently in Job Tracker list.
+- ✅ **Preferences & Identity** — `/preferences` page with four tabs (Job Preferences / Work Authorization / Criteria List / Demographics). Backend endpoints at `/api/v1/preferences/{job,authorization,criteria,demographics}` with singleton-upsert semantics (criteria is a list).
+- ✅ **job-fit-scorer** — `POST /jobs/batch-analyze-jd` batches analyze-jd over every job with a description. `TrackedJobSummary` now exposes `red_flag_count`; Job Tracker renders a `⚠{n}` beside the fit score. "Score all" button in the tracker header.
 - [ ] **application-autofiller** skill with placeholder substitution (no demographic data in LLM prompts).
-- [ ] **Persona editor + gallery** in Settings; apply active persona globally.
-- [ ] **interview-prep** and **interview-retrospective** skills. Interview-prep button on each `InterviewRound`.
+- ✅ **Persona editor + gallery** in Settings; active persona applied globally via Companion primer.
+- ✅ **interview-prep** and **interview-retrospective** skills — `POST /jobs/{id}/rounds/{id}/prep` and `/retrospective`. Each round row on the Job Detail Rounds tab has Prep + Retro buttons; Retro opens an inline form and surfaces went-well / went-poorly / gaps / brush-up on submit.
 - [ ] **job-strategy-advisor** reading from `MetricSnapshot`.
 - [ ] `MetricSnapshot` materialization job (cron / on-demand).
+
+### Companion & Studio enhancements
+- ✅ **File attach in Companion** — paperclip button on both the full `/companion` composer and the `CompanionDock` widget. Uploads go through `POST /documents/upload` (so the file is preserved in the user's Documents), and the resulting id is passed via `attached_document_ids` on the next message. Backend prefixes the user's prompt with an "USER ATTACHMENTS" block containing each file's extracted `content_md` (PDF/DOCX/HTML text extracted automatically, binary-only files noted with a URL to /file).
+- ✅ **New document creation in Studio** — "+ New document" button on `/studio` opens a form with doc-type selector, optional tracked-job attachment, and optional starter content. Creates the document via `POST /documents` and routes straight into the editor.
 
 ## Known minor issues
 
 - [ ] **UTF-8 mojibake** in Companion responses (e.g., `résumé` → `rÃ©sumÃ©`). ASCII is fine. Suspect double-encoding somewhere between subprocess stdout → FastAPI → JSON.
 - [ ] **Organization soft-delete references**: the timeline/history still show the stale name when an org is soft-deleted (by design), but there's no "reassign or hard-delete" workflow yet.
-- [ ] **Settings stubs**: "AI Persona" and "Data Export / Reset" placeholders still say Coming Soon.
+- ✅ **Settings stubs**: AI Persona now has full CRUD + activate/deactivate. Data Export / Reset still Coming Soon.
 - [ ] **Spend cap** (SRS REQ-COST-002): enforce a per-month LLM spend ceiling.
 - [ ] **Observability** (SRS §3.3.5): `/metrics` Prometheus endpoint, structured JSON logs with PII scrubbing.
 - ✅ **Sidebar collapse / mobile layout**: drawer-style sidebar on viewports below `md`, with a fixed hamburger top bar. Desktop layout unchanged.
 - [ ] **Accessibility pass** (WCAG 2.1 AA per SRS §3.1.1): keyboard traversal audit, ARIA labels on charts (once charts exist), focus indicators in the combobox.
-- [ ] **Streaming output** in the Companion — long replies drop as a single 5-second wait + full message.
+- ✅ **Streaming output** in the Companion — text deltas arrive live via SSE on `/messages-stream`; bubble fills as the model writes.
 - [ ] **Circular link cleanup**: no UI for "linked from" — if A links to B there's no reverse view on B.
 - [ ] `/tmp/jsp-login-debug/*.bin` files inside the container's `claude_config` volume accumulate from OAuth runs; add a cleanup task.
 

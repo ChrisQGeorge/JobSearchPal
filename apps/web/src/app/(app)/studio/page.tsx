@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import { PageShell } from "@/components/PageShell";
 import { api, apiUrl, ApiError } from "@/lib/api";
@@ -14,12 +15,14 @@ import {
 type DocFilter = "all" | DocType;
 
 export default function StudioPage() {
+  const router = useRouter();
   const [docs, setDocs] = useState<GeneratedDocument[]>([]);
   const [jobs, setJobs] = useState<TrackedJobSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [filterType, setFilterType] = useState<DocFilter>("all");
   const [filterJob, setFilterJob] = useState<number | "all">("all");
+  const [creating, setCreating] = useState(false);
 
   async function refresh() {
     setLoading(true);
@@ -77,9 +80,31 @@ export default function StudioPage() {
     <PageShell
       title="Document Studio"
       subtitle="Every resume, cover letter, and uploaded file in one place."
+      actions={
+        <button
+          className="jsp-btn-primary"
+          onClick={() => setCreating(true)}
+          disabled={creating}
+        >
+          + New document
+        </button>
+      }
     >
       {err ? (
         <div className="jsp-card p-4 text-sm text-corp-danger">{err}</div>
+      ) : null}
+
+      {creating ? (
+        <div className="jsp-card p-4 mb-3">
+          <NewDocumentForm
+            jobs={jobs}
+            onCancel={() => setCreating(false)}
+            onCreated={(d) => {
+              setCreating(false);
+              router.push(`/studio/${d.id}`);
+            }}
+          />
+        </div>
       ) : null}
 
       <div className="jsp-card p-4">
@@ -245,5 +270,126 @@ function StudioListRow({
         </button>
       </div>
     </li>
+  );
+}
+
+function NewDocumentForm({
+  jobs,
+  onCancel,
+  onCreated,
+}: {
+  jobs: TrackedJobSummary[];
+  onCancel: () => void;
+  onCreated: (doc: GeneratedDocument) => void;
+}) {
+  const [docType, setDocType] = useState<DocType>("resume");
+  const [title, setTitle] = useState("");
+  const [trackedJobId, setTrackedJobId] = useState<number | "none">("none");
+  const [contentMd, setContentMd] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!title.trim()) {
+      setErr("Title is required.");
+      return;
+    }
+    setSaving(true);
+    setErr(null);
+    try {
+      const doc = await api.post<GeneratedDocument>("/api/v1/documents", {
+        doc_type: docType,
+        title: title.trim(),
+        tracked_job_id: trackedJobId === "none" ? null : trackedJobId,
+        content_md: contentMd || null,
+      });
+      onCreated(doc);
+    } catch (e) {
+      setErr(
+        e instanceof ApiError ? `Create failed (HTTP ${e.status}).` : "Create failed.",
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <form onSubmit={submit} className="space-y-3">
+      <h3 className="text-sm uppercase tracking-wider text-corp-muted">
+        New document
+      </h3>
+      <p className="text-[11px] text-corp-muted">
+        Starts a blank document you can write yourself. For AI-assisted
+        drafting, open a job and use the Documents tab&apos;s Write button instead.
+      </p>
+      <div className="grid grid-cols-[160px_1fr] gap-3">
+        <div>
+          <label className="jsp-label">Type</label>
+          <select
+            className="jsp-input"
+            value={docType}
+            onChange={(e) => setDocType(e.target.value as DocType)}
+            disabled={saving}
+          >
+            {DOC_TYPES.map((t) => (
+              <option key={t} value={t}>
+                {t.replace(/_/g, " ")}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label className="jsp-label">Title</label>
+          <input
+            className="jsp-input"
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            placeholder="Base resume · 2026"
+            disabled={saving}
+          />
+        </div>
+      </div>
+      <div>
+        <label className="jsp-label">Attach to job (optional)</label>
+        <select
+          className="jsp-input"
+          value={trackedJobId}
+          onChange={(e) =>
+            setTrackedJobId(
+              e.target.value === "none" ? "none" : Number(e.target.value),
+            )
+          }
+          disabled={saving}
+        >
+          <option value="none">— Unaffiliated (general document)</option>
+          {jobs.map((j) => (
+            <option key={j.id} value={j.id}>
+              {j.title}
+              {j.organization_name ? ` · ${j.organization_name}` : ""}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div>
+        <label className="jsp-label">Starter content (optional)</label>
+        <textarea
+          className="jsp-input font-mono text-sm min-h-[140px]"
+          value={contentMd}
+          onChange={(e) => setContentMd(e.target.value)}
+          placeholder="# Heading\n\nLeave blank and write in the editor, or paste seed text here."
+          disabled={saving}
+        />
+      </div>
+      {err ? <div className="text-xs text-corp-danger">{err}</div> : null}
+      <div className="flex justify-end gap-2">
+        <button type="button" className="jsp-btn-ghost" onClick={onCancel}>
+          Cancel
+        </button>
+        <button type="submit" className="jsp-btn-primary" disabled={saving}>
+          {saving ? "Creating..." : "Create & open editor"}
+        </button>
+      </div>
+    </form>
   );
 }

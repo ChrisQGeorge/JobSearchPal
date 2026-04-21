@@ -176,6 +176,8 @@ export default function TimelinePage() {
   // button resets both to null.
   const [fromYear, setFromYear] = useState<number | null>(null);
   const [toYear, setToYear] = useState<number | null>(null);
+  const [onlyGaps, setOnlyGaps] = useState(false);
+  const [groupMode, setGroupMode] = useState<"kind" | "org">("kind");
 
   useEffect(() => {
     api
@@ -235,6 +237,10 @@ export default function TimelinePage() {
       // Keep events that overlap the visible window at all (so a multi-year
       // role that started before `from` still shows its relevant portion).
       if (pos.endMs < visibleFromMs || pos.startMs > visibleToMs) continue;
+      if (onlyGaps) {
+        const gaps = (ev.metadata as { gaps?: string[] } | null | undefined)?.gaps ?? [];
+        if (gaps.length === 0) continue;
+      }
       (byKind[pos.kind] ??= []).push(pos);
     }
 
@@ -245,7 +251,38 @@ export default function TimelinePage() {
     min -= span * 0.03;
     max += span * 0.03;
     return { byKind, undated, minMs: min, maxMs: max };
-  }, [events, nowMs, fromYear, toYear, dataMin, dataMax]);
+  }, [events, nowMs, fromYear, toYear, dataMin, dataMax, onlyGaps]);
+
+  // Organization-grouped view: one row per unique subtitle (typically org /
+  // issuer / venue). Events without a subtitle collect under "Unaffiliated".
+  const byOrg = useMemo(() => {
+    const groups = new Map<string, PositionedEvent[]>();
+    for (const list of Object.values(byKind)) {
+      if (!list) continue;
+      for (const ev of list) {
+        const key = ev.subtitle?.trim() || "Unaffiliated";
+        const arr = groups.get(key);
+        if (arr) arr.push(ev);
+        else groups.set(key, [ev]);
+      }
+    }
+    return Array.from(groups.entries()).sort((a, b) => {
+      // "Unaffiliated" pinned last; otherwise alphabetical.
+      if (a[0] === "Unaffiliated") return 1;
+      if (b[0] === "Unaffiliated") return -1;
+      return a[0].localeCompare(b[0]);
+    });
+  }, [byKind]);
+
+  const totalGaps = useMemo(
+    () =>
+      events.filter(
+        (e) =>
+          ((e.metadata as { gaps?: string[] } | null | undefined)?.gaps ?? [])
+            .length > 0,
+      ).length,
+    [events],
+  );
 
   const kindsPresent = KIND_DISPLAY_ORDER.filter(
     (k) => (byKind[k]?.length ?? 0) > 0,
@@ -287,33 +324,96 @@ export default function TimelinePage() {
               enabled={enabledKinds}
               onToggle={toggleKind}
             />
-            <RangeControls
-              fromYear={fromYear}
-              toYear={toYear}
-              dataMinYear={dataMinYear}
-              dataMaxYear={dataMaxYear}
-              onFrom={setFromYear}
-              onTo={setToYear}
-              onFit={fitToContent}
-              isZoomed={isZoomed}
-            />
+            <div className="flex gap-3 items-end">
+              <div className="inline-flex rounded-md border border-corp-border overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => setGroupMode("kind")}
+                  className={`px-2.5 py-1 text-xs uppercase tracking-wider ${
+                    groupMode === "kind"
+                      ? "bg-corp-accent/25 text-corp-accent"
+                      : "bg-corp-surface2 text-corp-muted hover:text-corp-text"
+                  }`}
+                  title="Group rows by kind (work / education / project / ...)"
+                >
+                  By kind
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setGroupMode("org")}
+                  className={`px-2.5 py-1 text-xs uppercase tracking-wider border-l border-corp-border ${
+                    groupMode === "org"
+                      ? "bg-corp-accent/25 text-corp-accent"
+                      : "bg-corp-surface2 text-corp-muted hover:text-corp-text"
+                  }`}
+                  title="Group rows by organization / issuer"
+                >
+                  By org
+                </button>
+              </div>
+              <button
+                type="button"
+                onClick={() => setOnlyGaps((v) => !v)}
+                className={`px-2.5 py-1 rounded-md text-xs uppercase tracking-wider border transition-opacity ${
+                  onlyGaps
+                    ? "bg-corp-accent2/20 text-corp-accent2 border-corp-accent2/40"
+                    : "bg-corp-surface2 text-corp-muted border-corp-border hover:text-corp-text"
+                }`}
+                title={
+                  onlyGaps
+                    ? "Showing only entries with missing fields"
+                    : `Toggle to show only the ${totalGaps} entr${
+                        totalGaps === 1 ? "y" : "ies"
+                      } with missing fields`
+                }
+                disabled={totalGaps === 0}
+              >
+                ⚠ gaps {totalGaps > 0 ? `(${totalGaps})` : ""}
+              </button>
+              <RangeControls
+                fromYear={fromYear}
+                toYear={toYear}
+                dataMinYear={dataMinYear}
+                dataMaxYear={dataMaxYear}
+                onFrom={setFromYear}
+                onTo={setToYear}
+                onFit={fitToContent}
+                isZoomed={isZoomed}
+              />
+            </div>
           </div>
 
           <div className="jsp-card p-4 mt-4 overflow-x-auto">
             <div className="min-w-[48rem]">
               <YearAxis minMs={minMs} maxMs={maxMs} nowMs={nowMs} />
               <div className="space-y-4 mt-2">
-                {kindsPresent
-                  .filter((k) => enabledKinds.has(k))
-                  .map((k) => (
-                    <KindRow
-                      key={k}
-                      kind={k}
-                      events={byKind[k] ?? []}
-                      minMs={minMs}
-                      maxMs={maxMs}
-                    />
-                  ))}
+                {groupMode === "kind"
+                  ? kindsPresent
+                      .filter((k) => enabledKinds.has(k))
+                      .map((k) => (
+                        <KindRow
+                          key={k}
+                          kind={k}
+                          events={byKind[k] ?? []}
+                          minMs={minMs}
+                          maxMs={maxMs}
+                        />
+                      ))
+                  : byOrg
+                      .map(([org, evs]) => [
+                        org,
+                        evs.filter((e) => enabledKinds.has(e.kind)),
+                      ] as const)
+                      .filter(([, evs]) => evs.length > 0)
+                      .map(([org, evs]) => (
+                        <OrgRow
+                          key={org}
+                          org={org}
+                          events={evs}
+                          minMs={minMs}
+                          maxMs={maxMs}
+                        />
+                      ))}
               </div>
             </div>
           </div>
@@ -546,6 +646,61 @@ function KindRow({
   );
 }
 
+function OrgRow({
+  org,
+  events,
+  minMs,
+  maxMs,
+}: {
+  org: string;
+  events: PositionedEvent[];
+  minMs: number;
+  maxMs: number;
+}) {
+  const lanes = useMemo(() => assignLanes(events), [events]);
+  const LANE_HEIGHT = 28;
+  return (
+    <div className="flex items-start gap-3">
+      <div className="w-28 shrink-0 pt-1 text-[11px] uppercase tracking-wider text-corp-muted border-l-4 pl-2 border-corp-accent2 truncate">
+        {org}
+      </div>
+      <div
+        className="relative flex-1"
+        style={{ height: lanes.length * LANE_HEIGHT }}
+      >
+        {axisYears(minMs, maxMs).map((y) => {
+          const ms = new Date(y, 0, 1).getTime();
+          if (ms < minMs || ms > maxMs) return null;
+          return (
+            <div
+              key={y}
+              className="absolute top-0 bottom-0 border-l border-corp-border/40"
+              style={{ left: `${pct(ms, minMs, maxMs)}%` }}
+            />
+          );
+        })}
+        {lanes.map((lane, laneIdx) => (
+          <div
+            key={laneIdx}
+            className="absolute left-0 right-0"
+            style={{ top: laneIdx * LANE_HEIGHT, height: LANE_HEIGHT }}
+          >
+            {lane.map((ev) => (
+              <EventBar
+                key={`${ev.kind}-${ev.id}`}
+                ev={ev}
+                minMs={minMs}
+                maxMs={maxMs}
+                style={KIND_STYLES[ev.kind]}
+              />
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function EventBar({
   ev,
   minMs,
@@ -561,13 +716,20 @@ function EventBar({
   const right = pct(ev.endMs, minMs, maxMs);
   const width = Math.max(right - left, 0.5);
 
+  const gaps = (ev.metadata as { gaps?: string[] } | null | undefined)?.gaps ?? [];
+  const hasGaps = gaps.length > 0;
+
   const label = ev.subtitle ? `${ev.title} · ${ev.subtitle}` : ev.title;
-  const title = `${label}\n${formatRange(ev)}`;
+  const title = hasGaps
+    ? `${label}\n${formatRange(ev)}\n⚠ ${gaps.join(", ")}`
+    : `${label}\n${formatRange(ev)}`;
 
   if (ev.isPoint) {
     return (
       <div
-        className={`absolute top-1 h-5 w-5 rotate-45 rounded-sm ${style.bar} cursor-default`}
+        className={`absolute top-1 h-5 w-5 rotate-45 rounded-sm ${style.bar} cursor-default ${
+          hasGaps ? "ring-2 ring-corp-accent2" : ""
+        }`}
         style={{ left: `calc(${left}% - 10px)` }}
         title={title}
       >
@@ -578,10 +740,17 @@ function EventBar({
 
   return (
     <div
-      className={`absolute top-1 bottom-1 rounded ${style.bar} text-[11px] px-2 flex items-center overflow-hidden cursor-default shadow-sm`}
+      className={`absolute top-1 bottom-1 rounded ${style.bar} text-[11px] px-2 flex items-center overflow-hidden cursor-default shadow-sm ${
+        hasGaps ? "ring-2 ring-corp-accent2" : ""
+      }`}
       style={{ left: `${left}%`, width: `${width}%` }}
       title={title}
     >
+      {hasGaps ? (
+        <span className="mr-1 text-corp-bg text-[10px]" aria-hidden="true">
+          ⚠
+        </span>
+      ) : null}
       <span className="text-corp-bg font-medium truncate">{ev.title}</span>
       {ev.isOngoing ? (
         <span className="ml-1 text-[9px] uppercase tracking-wider text-corp-bg/80">· present</span>

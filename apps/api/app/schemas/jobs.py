@@ -108,6 +108,9 @@ class TrackedJobSummary(BaseModel):
     employment_type: Optional[str] = None
     # Populated by the JD analyzer — surfaced on the tracker list for quick triage.
     fit_score: Optional[int] = None
+    # Count of red-flag items from jd_analysis.red_flags. Tracker row flags a
+    # warning icon when > 0.
+    red_flag_count: int = 0
 
 
 # --------- InterviewRound ----------------------------------------------------

@@ -7,8 +7,56 @@ import type {
   ConversationDetail,
   ConversationMessage,
   ConversationSummary,
-  SendMessageResponse,
 } from "@/lib/types";
+
+type AttachedDoc = {
+  id: number;
+  title: string;
+  filename: string | null;
+  size_bytes: number | null;
+  extracted_from: string | null;
+  has_inline_text: boolean;
+};
+
+function formatSize(n: number | null): string {
+  if (!n) return "";
+  if (n > 1_000_000) return `${(n / 1_000_000).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(n / 1024))} KB`;
+}
+
+const QUICK_PROMPTS: { label: string; prompt: string }[] = [
+  {
+    label: "Log a job I just applied to",
+    prompt:
+      "I just applied to a job. Ask me for the details one at a time " +
+      "(URL or title, company, date applied, status), then create the " +
+      "TrackedJob via the API and log an ApplicationEvent. Don't write " +
+      "anything yet — confirm the extracted fields with me first.",
+  },
+  {
+    label: "Fill gaps in my history",
+    prompt:
+      "Walk through my work experience, education, and skills via the " +
+      "API and find entries with incomplete data — missing highlights, " +
+      "end dates, skill links, etc. Ask me pointed questions one at a " +
+      "time to fill them in, then update the records when I confirm.",
+  },
+  {
+    label: "Strategize my pipeline",
+    prompt:
+      "Pull my tracked jobs and give me a short strategy read: which " +
+      "applications are stalled, which should I follow up on, which " +
+      "look like weak fits worth dropping.",
+  },
+  {
+    label: "Draft an interview prep doc",
+    prompt:
+      "Pick one of my upcoming interview rounds. Pull the JD and my " +
+      "history and draft a prep doc: likely questions, talking points " +
+      "from my history, smart questions to ask them, and things to " +
+      "watch for based on the JD analysis and company research.",
+  },
+];
 
 type ClaudeHealth = {
   claude_cli_available: boolean;
@@ -83,22 +131,102 @@ export default function CompanionPage() {
     await refreshList();
   }
 
-  function onMessageExchanged(res: SendMessageResponse) {
-    // Append both messages to the open conversation.
+  function onStreamingStart(
+    userMsg: ConversationMessage,
+    assistantPlaceholder: ConversationMessage,
+  ) {
     setDetail((prev) =>
       prev
         ? {
             ...prev,
-            messages: [...prev.messages, res.user_message, res.assistant_message],
+            messages: [...prev.messages, userMsg, assistantPlaceholder],
           }
         : prev,
     );
-    // Update the sidebar entry so the new title / updated_at reflects.
+  }
+
+  function onAssistantDelta(tempId: number, text: string) {
+    setDetail((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        messages: prev.messages.map((m) =>
+          m.id === tempId ? { ...m, content_md: text } : m,
+        ),
+      };
+    });
+  }
+
+  function onAssistantMeta(
+    tempId: number,
+    tools: { name: string; input: unknown }[],
+  ) {
+    setDetail((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        messages: prev.messages.map((m) =>
+          m.id === tempId ? { ...m, tool_calls: tools } : m,
+        ),
+      };
+    });
+  }
+
+  function onStreamingDone(fresh: ConversationDetail) {
+    setDetail(fresh);
     setConversations((prev) =>
-      prev.map((c) => (c.id === res.conversation.id ? res.conversation : c)).sort(
-        (a, b) => b.updated_at.localeCompare(a.updated_at),
-      ),
+      prev
+        .map((c) =>
+          c.id === fresh.id
+            ? {
+                id: fresh.id,
+                title: fresh.title,
+                summary: fresh.summary,
+                pinned: fresh.pinned,
+                related_tracked_job_id: fresh.related_tracked_job_id,
+                created_at: fresh.created_at,
+                updated_at: fresh.updated_at,
+              }
+            : c,
+        )
+        .sort((a, b) => b.updated_at.localeCompare(a.updated_at)),
     );
+  }
+
+  function onStreamingLocalDone(
+    tempId: number,
+    finalText: string,
+    skillsInferred: string[],
+  ) {
+    setDetail((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        messages: prev.messages.map((m) =>
+          m.id === tempId
+            ? {
+                ...m,
+                content_md: finalText,
+                tool_results: skillsInferred.length
+                  ? { ...(m.tool_results as object | null), skills_inferred: skillsInferred }
+                  : m.tool_results,
+              }
+            : m,
+        ),
+      };
+    });
+  }
+
+  function onStreamingAbort(userTempId: number, assistantTempId: number) {
+    setDetail((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        messages: prev.messages.filter(
+          (m) => m.id !== userTempId && m.id !== assistantTempId,
+        ),
+      };
+    });
   }
 
   return (
@@ -127,9 +255,14 @@ export default function CompanionPage() {
           onDelete={deleteConversation}
         />
         <ChatPane
+          onStreamingStart={onStreamingStart}
+          onAssistantDelta={onAssistantDelta}
+          onAssistantMeta={onAssistantMeta}
+          onStreamingDone={onStreamingDone}
+          onStreamingLocalDone={onStreamingLocalDone}
+          onStreamingAbort={onStreamingAbort}
           detail={detail}
           loading={loadingDetail}
-          onMessageExchanged={onMessageExchanged}
           onNew={createConversation}
         />
       </div>
@@ -202,18 +335,91 @@ function ConversationsList({
 function ChatPane({
   detail,
   loading,
-  onMessageExchanged,
+  onStreamingStart,
+  onAssistantDelta,
+  onAssistantMeta,
+  onStreamingDone,
+  onStreamingLocalDone,
+  onStreamingAbort,
   onNew,
 }: {
   detail: ConversationDetail | null;
   loading: boolean;
-  onMessageExchanged: (res: SendMessageResponse) => void;
+  onStreamingStart: (
+    userMsg: ConversationMessage,
+    assistantPlaceholder: ConversationMessage,
+  ) => void;
+  onAssistantDelta: (tempId: number, text: string) => void;
+  onAssistantMeta: (
+    tempId: number,
+    tools: { name: string; input: unknown }[],
+  ) => void;
+  onStreamingDone: (fresh: ConversationDetail) => void;
+  onStreamingLocalDone: (
+    tempId: number,
+    finalText: string,
+    skillsInferred: string[],
+  ) => void;
+  onStreamingAbort: (userTempId: number, assistantTempId: number) => void;
   onNew: () => void;
 }) {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [attachments, setAttachments] = useState<AttachedDoc[]>([]);
+  const [attaching, setAttaching] = useState(false);
+  const attachRef = useRef<HTMLInputElement | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  async function attachFile(file: File) {
+    setAttaching(true);
+    setError(null);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      fd.append("doc_type", "other");
+      const res = await fetch(apiUrl("/api/v1/documents/upload"), {
+        method: "POST",
+        credentials: "include",
+        body: fd,
+      });
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(`HTTP ${res.status}: ${txt.slice(0, 200)}`);
+      }
+      const doc = (await res.json()) as {
+        id: number;
+        title: string;
+        content_structured?: {
+          original_filename?: string | null;
+          size_bytes?: number | null;
+          extracted_from?: string | null;
+          has_inline_text?: boolean | null;
+        } | null;
+      };
+      const s = doc.content_structured ?? null;
+      setAttachments((prev) => [
+        ...prev,
+        {
+          id: doc.id,
+          title: doc.title,
+          filename: s?.original_filename ?? null,
+          size_bytes: s?.size_bytes ?? null,
+          extracted_from: s?.extracted_from ?? null,
+          has_inline_text: !!s?.has_inline_text,
+        },
+      ]);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Attach failed.");
+    } finally {
+      setAttaching(false);
+      if (attachRef.current) attachRef.current.value = "";
+    }
+  }
+
+  function removeAttachment(id: number) {
+    setAttachments((prev) => prev.filter((a) => a.id !== id));
+  }
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -227,24 +433,115 @@ function ChatPane({
     setSending(true);
     const content = input;
     setInput("");
+
+    // Optimistic user message so the bubble appears instantly.
+    const optimisticUserId = -Date.now();
+    const tempAssistantId = optimisticUserId + 1;
+    const now = new Date().toISOString();
+    onStreamingStart(
+      {
+        id: optimisticUserId,
+        conversation_id: detail.id,
+        role: "user",
+        content_md: content,
+        skill_invoked: null,
+        tool_calls: null,
+        tool_results: null,
+        created_at: now,
+      },
+      {
+        id: tempAssistantId,
+        conversation_id: detail.id,
+        role: "assistant",
+        content_md: "",
+        skill_invoked: null,
+        tool_calls: null,
+        tool_results: null,
+        created_at: now,
+      },
+    );
+
     try {
-      const res = await api.post<SendMessageResponse>(
-        `/api/v1/companion/conversations/${detail.id}/messages`,
-        { content },
+      const attachedIds = attachments.map((a) => a.id);
+      const res = await fetch(
+        apiUrl(`/api/v1/companion/conversations/${detail.id}/messages-stream`),
+        {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            content,
+            attached_document_ids: attachedIds.length ? attachedIds : null,
+          }),
+        },
       );
-      onMessageExchanged(res);
-    } catch (err) {
-      if (err instanceof ApiError) {
-        const detailMsg =
-          typeof err.detail === "object" && err.detail && "detail" in err.detail
-            ? String((err.detail as { detail: unknown }).detail)
-            : `HTTP ${err.status}`;
-        setError(detailMsg);
-      } else {
-        setError("Unexpected error.");
+      if (!res.ok || !res.body) {
+        throw new Error(`HTTP ${res.status}`);
       }
-      // Restore the draft so the user can retry.
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let assistantText = "";
+      let skillsInferred: string[] = [];
+      const toolsUsed: { name: string; input: unknown }[] = [];
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop() ?? "";
+        for (const frame of frames) {
+          const line = frame.trim();
+          if (!line.startsWith("data:")) continue;
+          const payload = line.slice(5).trim();
+          if (!payload) continue;
+          let ev: {
+            type: string;
+            text?: string;
+            name?: string;
+            input?: unknown;
+            message?: string;
+            skills_inferred?: string[];
+            [k: string]: unknown;
+          };
+          try {
+            ev = JSON.parse(payload);
+          } catch {
+            continue;
+          }
+          if (ev.type === "text_delta" && typeof ev.text === "string") {
+            assistantText += ev.text;
+            onAssistantDelta(tempAssistantId, assistantText);
+          } else if (ev.type === "tool_use") {
+            toolsUsed.push({ name: String(ev.name ?? ""), input: ev.input });
+            onAssistantMeta(tempAssistantId, toolsUsed);
+          } else if (ev.type === "error" && typeof ev.message === "string") {
+            setError(ev.message);
+          } else if (ev.type === "done") {
+            if (Array.isArray(ev.skills_inferred)) {
+              skillsInferred = ev.skills_inferred as string[];
+            }
+          }
+        }
+      }
+
+      // Reload the full conversation so we get real IDs / persisted metadata.
+      try {
+        const fresh = await api.get<ConversationDetail>(
+          `/api/v1/companion/conversations/${detail.id}`,
+        );
+        onStreamingDone(fresh);
+      } catch {
+        // Fall back to what we have in memory.
+        onStreamingLocalDone(tempAssistantId, assistantText, skillsInferred);
+      }
+      // Clear attachments after a successful exchange.
+      setAttachments([]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unexpected error.");
       setInput(content);
+      onStreamingAbort(optimisticUserId, tempAssistantId);
     } finally {
       setSending(false);
     }
@@ -293,10 +590,25 @@ function ChatPane({
         {loading ? (
           <p className="text-corp-muted text-sm">Loading...</p>
         ) : detail.messages.length === 0 && !sending ? (
-          <p className="text-corp-muted text-sm text-center mt-8">
-            The Companion is ready. Ask about your job search, request a resume
-            review, or just say hi.
-          </p>
+          <div className="text-corp-muted text-sm text-center mt-8 space-y-4">
+            <p>
+              The Companion is ready. Ask about your job search, request a
+              resume review, or just say hi.
+            </p>
+            <div className="flex flex-wrap gap-2 justify-center">
+              {QUICK_PROMPTS.map((qp) => (
+                <button
+                  key={qp.label}
+                  type="button"
+                  className="jsp-btn-ghost text-xs"
+                  onClick={() => setInput(qp.prompt)}
+                  title={qp.prompt}
+                >
+                  {qp.label}
+                </button>
+              ))}
+            </div>
+          </div>
         ) : null}
         {detail.messages.map((m) => (
           <MessageBubble key={m.id} message={m} />
@@ -316,7 +628,58 @@ function ChatPane({
         </div>
       ) : null}
 
+      {attachments.length > 0 ? (
+        <div className="border-t border-corp-border px-3 py-2 flex flex-wrap gap-1.5">
+          {attachments.map((a) => (
+            <span
+              key={a.id}
+              className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-corp-surface2 border border-corp-border"
+              title={
+                a.has_inline_text
+                  ? `${a.extracted_from} · text extracted`
+                  : "Binary file — content not inlined"
+              }
+            >
+              <span>📎</span>
+              <span className="max-w-[18ch] truncate">
+                {a.filename ?? a.title}
+              </span>
+              {a.size_bytes ? (
+                <span className="text-corp-muted">· {formatSize(a.size_bytes)}</span>
+              ) : null}
+              {!a.has_inline_text ? (
+                <span className="text-corp-accent2 text-[10px]">binary</span>
+              ) : null}
+              <button
+                type="button"
+                className="text-corp-muted hover:text-corp-danger"
+                onClick={() => removeAttachment(a.id)}
+                aria-label={`Remove ${a.title}`}
+              >
+                ×
+              </button>
+            </span>
+          ))}
+        </div>
+      ) : null}
       <div className="border-t border-corp-border p-3 flex gap-2 items-end">
+        <label
+          className={`jsp-btn-ghost cursor-pointer inline-flex ${
+            attaching ? "opacity-50 pointer-events-none" : ""
+          }`}
+          title="Attach a file (PDF, DOCX, HTML, txt, md — up to 25 MB)"
+        >
+          {attaching ? "..." : "📎"}
+          <input
+            ref={attachRef}
+            type="file"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) attachFile(f);
+            }}
+          />
+        </label>
         <textarea
           className="jsp-input flex-1 min-h-[3rem] max-h-40 resize-none"
           placeholder="Message the Companion... (Enter to send, Shift+Enter for newline)"
@@ -609,18 +972,60 @@ function ClaudeLoginPanel({ onAuthed }: { onAuthed: () => void }) {
 function MessageBubble({ message }: { message: ConversationMessage }) {
   const isUser = message.role === "user";
   const isSystem = message.role === "system";
+
+  // Pull cached metadata out of tool_results (set by the backend on persist).
+  const toolResults = (message.tool_results ?? null) as
+    | {
+        meta?: {
+          cost_usd?: number | null;
+          duration_ms?: number | null;
+          num_turns?: number | null;
+        } | null;
+        skills_inferred?: string[] | null;
+      }
+    | null;
+  const meta = toolResults?.meta ?? null;
+  const skillsInferred = toolResults?.skills_inferred ?? null;
+
+  const metaBits: string[] = [];
+  if (meta?.num_turns) metaBits.push(`${meta.num_turns} turn${meta.num_turns === 1 ? "" : "s"}`);
+  if (meta?.duration_ms)
+    metaBits.push(
+      meta.duration_ms >= 1000
+        ? `${(meta.duration_ms / 1000).toFixed(1)}s`
+        : `${meta.duration_ms}ms`,
+    );
+  if (meta?.cost_usd != null) metaBits.push(`$${meta.cost_usd.toFixed(3)}`);
+
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
-      <div
-        className={`max-w-[80%] px-3 py-2 rounded-lg whitespace-pre-wrap text-sm ${
-          isUser
-            ? "bg-corp-accent text-corp-bg"
-            : isSystem
-              ? "border border-corp-danger/40 text-corp-danger bg-corp-danger/10"
-              : "jsp-card"
-        }`}
-      >
-        {message.content_md ?? ""}
+      <div className={`max-w-[80%] flex flex-col gap-1 ${isUser ? "items-end" : "items-start"}`}>
+        <div
+          className={`px-3 py-2 rounded-lg whitespace-pre-wrap text-sm ${
+            isUser
+              ? "bg-corp-accent text-corp-bg"
+              : isSystem
+                ? "border border-corp-danger/40 text-corp-danger bg-corp-danger/10"
+                : "jsp-card"
+          }`}
+        >
+          {message.content_md ?? ""}
+        </div>
+        {!isUser && !isSystem && (skillsInferred?.length || metaBits.length) ? (
+          <div className="flex flex-wrap gap-1 items-center text-[10px] text-corp-muted">
+            {skillsInferred?.map((s) => (
+              <span
+                key={s}
+                className="inline-block px-1.5 py-0.5 rounded bg-corp-surface2 border border-corp-border"
+              >
+                {s}
+              </span>
+            ))}
+            {metaBits.length ? (
+              <span className="italic">{metaBits.join(" · ")}</span>
+            ) : null}
+          </div>
+        ) : null}
       </div>
     </div>
   );

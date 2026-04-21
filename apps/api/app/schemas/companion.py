@@ -41,6 +41,11 @@ class CreateConversationIn(BaseModel):
 
 class SendMessageIn(BaseModel):
     content: str = Field(min_length=1, max_length=16000)
+    # GeneratedDocument ids the user wants inlined for this turn's context.
+    # The frontend uploads files via POST /documents/upload first, then passes
+    # the resulting ids here so the Companion can read them alongside the
+    # message text. Silently skipped if the doc doesn't belong to the user.
+    attached_document_ids: Optional[list[int]] = None
 
 
 class SendMessageOut(BaseModel):

@@ -14,13 +14,14 @@ from fastapi import (
     APIRouter,
     Depends,
     File,
+    Form,
     HTTPException,
     Query,
     UploadFile,
     status as http_status,
 )
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -186,6 +187,12 @@ async def list_jobs(
             raw = fs.get("score")
             if isinstance(raw, (int, float)):
                 fit_score = int(raw)
+        red_flag_count = 0
+        jda = j.jd_analysis
+        if isinstance(jda, dict):
+            rfs = jda.get("red_flags")
+            if isinstance(rfs, list):
+                red_flag_count = len(rfs)
         out.append(
             TrackedJobSummary(
                 id=j.id,
@@ -211,6 +218,7 @@ async def list_jobs(
                 experience_years_max=j.experience_years_max,
                 employment_type=j.employment_type,
                 fit_score=fit_score,
+                red_flag_count=red_flag_count,
             )
         )
     return out
@@ -585,6 +593,384 @@ async def delete_artifact(
     await db.commit()
 
 
+# --- Interview prep / retrospective skills ----------------------------------
+
+_INTERVIEW_PREP_PROMPT = """You are preparing the user for an interview round.
+Pull what you need from the API — job description, JD analysis, their skills /
+work history, company research, any existing prep notes. Then draft a prep
+doc.
+
+Environment: $JSP_API_BASE_URL and $JSP_API_TOKEN (bearer).
+Useful calls:
+  curl -sS -H "Authorization: Bearer $JSP_API_TOKEN" "$JSP_API_BASE_URL/api/v1/jobs/{job_id}"
+  curl -sS -H "Authorization: Bearer $JSP_API_TOKEN" "$JSP_API_BASE_URL/api/v1/jobs/{job_id}/rounds"
+  curl -sS -H "Authorization: Bearer $JSP_API_TOKEN" "$JSP_API_BASE_URL/api/v1/history/skills"
+  curl -sS -H "Authorization: Bearer $JSP_API_TOKEN" "$JSP_API_BASE_URL/api/v1/history/work-experiences"
+  curl -sS -H "Authorization: Bearer $JSP_API_TOKEN" "$JSP_API_BASE_URL/api/v1/organizations/$ORG_ID"
+
+Target round
+------------
+job_id: {job_id}
+round_id: {round_id}
+round_number: {round_number}
+round_type: {round_type}
+scheduled_at: {scheduled_at}
+format: {format_}
+existing prep_notes_md:
+---
+{prep_notes_md}
+---
+
+Return ONE JSON object, no prose, no markdown fences:
+
+{{
+  "prep_doc_md": string,        // the full prep doc the user will read
+  "focus_areas": string[],      // 3-6 bullet points — concrete topics to drill
+  "likely_questions": string[], // 5-10 realistic questions they should prep for
+  "stories_to_tell": string[],  // bullet points referencing specific history
+                                // entries ("the Acme rewrite", not "a rewrite")
+  "questions_to_ask": string[], // smart questions the user should ask them
+  "warning": string | null      // concrete gaps or concerns, or null
+}}
+"""
+
+
+_INTERVIEW_RETRO_PROMPT = """You are helping the user write an interview
+retrospective. They just finished a round; you'll produce structured notes
+they can reference later and that the job-fit-scorer / strategy-advisor
+skills can read.
+
+Round details
+-------------
+job_id: {job_id}
+round_id: {round_id}
+round_number: {round_number}
+round_type: {round_type}
+outcome: {outcome}
+self_rating: {self_rating}
+existing notes_md:
+---
+{notes_md}
+---
+
+User's raw recap of the round (write-up they pasted or dictated):
+---
+{user_recap}
+---
+
+Return ONE JSON object, no prose, no markdown fences:
+
+{{
+  "retrospective_md": string,   // clean structured prose retrospective
+  "went_well": string[],        // what the candidate executed on
+  "went_poorly": string[],      // what didn't land
+  "skill_gaps_observed": string[], // gaps surfaced by the questions asked
+  "topics_to_brush_up": string[],
+  "followup_action": string | null, // one concrete next action (e.g. "send
+                                    // Priya the example from the rebuild")
+  "rerun_confidence": number | null,  // 0-100, the candidate's confidence in
+                                    // passing if they had to retake this round
+  "warning": string | null
+}}
+"""
+
+
+class InterviewPrepIn(BaseModel):
+    extra_notes: Optional[str] = None
+
+
+class InterviewPrepOut(BaseModel):
+    prep_doc_md: str
+    focus_areas: list[str] = []
+    likely_questions: list[str] = []
+    stories_to_tell: list[str] = []
+    questions_to_ask: list[str] = []
+    warning: Optional[str] = None
+
+
+class InterviewRetroIn(BaseModel):
+    user_recap: str = Field(min_length=1)
+    self_rating: Optional[int] = Field(default=None, ge=1, le=5)
+
+
+class InterviewRetroOut(BaseModel):
+    retrospective_md: str
+    went_well: list[str] = []
+    went_poorly: list[str] = []
+    skill_gaps_observed: list[str] = []
+    topics_to_brush_up: list[str] = []
+    followup_action: Optional[str] = None
+    rerun_confidence: Optional[int] = None
+    warning: Optional[str] = None
+
+
+@router.post(
+    "/{job_id:int}/rounds/{round_id:int}/prep",
+    response_model=InterviewPrepOut,
+)
+async def interview_prep(
+    job_id: int,
+    round_id: int,
+    payload: InterviewPrepIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> InterviewPrepOut:
+    from app.core.security import create_access_token
+
+    rnd = await _get_owned_round(db, round_id, job_id, user.id)
+
+    prompt = _INTERVIEW_PREP_PROMPT.format(
+        job_id=job_id,
+        round_id=round_id,
+        round_number=rnd.round_number,
+        round_type=rnd.round_type or "(unspecified)",
+        scheduled_at=rnd.scheduled_at.isoformat() if rnd.scheduled_at else "(unscheduled)",
+        format_=rnd.format or "(unspecified)",
+        prep_notes_md=rnd.prep_notes_md or "(none yet)",
+    )
+    if payload.extra_notes and payload.extra_notes.strip():
+        prompt += "\n\nUser guidance for this prep pass:\n" + payload.extra_notes.strip()
+
+    api_token = create_access_token(
+        subject=str(user.id), extra={"purpose": "interview_prep"}
+    )
+
+    try:
+        result = await run_claude_prompt(
+            prompt=prompt,
+            output_format="json",
+            allowed_tools=["Bash"],
+            timeout_seconds=180,
+            extra_env={
+                "JSP_API_BASE_URL": "http://localhost:8000",
+                "JSP_API_TOKEN": api_token,
+            },
+        )
+    except ClaudeCodeError as exc:
+        log.warning("interview-prep failed for round %s: %s", round_id, exc)
+        raise HTTPException(status_code=502, detail=f"Claude Code error: {exc}")
+
+    data = _extract_json_object(result.result) or {}
+    prep_doc = (data.get("prep_doc_md") or "").strip()
+    if not prep_doc:
+        raise HTTPException(
+            status_code=502, detail="Prep skill returned no document."
+        )
+
+    # Persist onto the round's prep_notes_md so the user sees it on the tab.
+    rnd.prep_notes_md = prep_doc
+    await db.commit()
+
+    return InterviewPrepOut(
+        prep_doc_md=prep_doc,
+        focus_areas=list(data.get("focus_areas") or [])[:8],
+        likely_questions=list(data.get("likely_questions") or [])[:12],
+        stories_to_tell=list(data.get("stories_to_tell") or [])[:8],
+        questions_to_ask=list(data.get("questions_to_ask") or [])[:8],
+        warning=data.get("warning"),
+    )
+
+
+@router.post(
+    "/{job_id:int}/rounds/{round_id:int}/retrospective",
+    response_model=InterviewRetroOut,
+)
+async def interview_retrospective(
+    job_id: int,
+    round_id: int,
+    payload: InterviewRetroIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> InterviewRetroOut:
+    rnd = await _get_owned_round(db, round_id, job_id, user.id)
+
+    prompt = _INTERVIEW_RETRO_PROMPT.format(
+        job_id=job_id,
+        round_id=round_id,
+        round_number=rnd.round_number,
+        round_type=rnd.round_type or "(unspecified)",
+        outcome=rnd.outcome or "unknown",
+        self_rating=rnd.self_rating if rnd.self_rating is not None else "(none)",
+        notes_md=rnd.notes_md or "(none yet)",
+        user_recap=payload.user_recap,
+    )
+
+    try:
+        result = await run_claude_prompt(
+            prompt=prompt,
+            output_format="json",
+            allowed_tools=[],
+            timeout_seconds=120,
+        )
+    except ClaudeCodeError as exc:
+        log.warning("interview-retro failed for round %s: %s", round_id, exc)
+        raise HTTPException(status_code=502, detail=f"Claude Code error: {exc}")
+
+    data = _extract_json_object(result.result) or {}
+    retro_md = (data.get("retrospective_md") or "").strip()
+    if not retro_md:
+        raise HTTPException(
+            status_code=502, detail="Retrospective skill returned no document."
+        )
+
+    # Append to the round's notes_md (never overwrite raw user input).
+    ts = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+    block = f"\n\n---\n## Retrospective ({ts})\n\n{retro_md}\n"
+    rnd.notes_md = (rnd.notes_md or "") + block
+    if payload.self_rating is not None:
+        rnd.self_rating = payload.self_rating
+    await db.commit()
+
+    return InterviewRetroOut(
+        retrospective_md=retro_md,
+        went_well=list(data.get("went_well") or [])[:8],
+        went_poorly=list(data.get("went_poorly") or [])[:8],
+        skill_gaps_observed=list(data.get("skill_gaps_observed") or [])[:8],
+        topics_to_brush_up=list(data.get("topics_to_brush_up") or [])[:8],
+        followup_action=data.get("followup_action"),
+        rerun_confidence=(
+            int(data["rerun_confidence"])
+            if isinstance(data.get("rerun_confidence"), (int, float))
+            else None
+        ),
+        warning=data.get("warning"),
+    )
+
+
+@router.post(
+    "/{job_id:int}/artifacts/upload",
+    response_model=InterviewArtifactOut,
+    status_code=http_status.HTTP_201_CREATED,
+)
+async def upload_artifact(
+    job_id: int,
+    file: UploadFile = File(...),
+    kind: str = Form(default="other"),
+    title: Optional[str] = Form(default=None),
+    interview_round_id: Optional[int] = Form(default=None),
+    tags: Optional[str] = Form(default=None),  # comma-separated
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> InterviewArtifact:
+    """Multipart upload variant for interview artifacts — lets the user drop
+    in a whiteboard photo, take-home .pdf, offer letter, etc. without having
+    to host the file elsewhere first.
+
+    Stores the raw bytes under `/app/uploads/artifacts/<user_id>/<uuid>_<name>`
+    and sets `file_url` to the streaming endpoint path (`/api/v1/jobs/{id}/
+    artifacts/{id}/file`). For plain-text / markdown uploads, also decodes
+    into `content_md` so the viewer can show the content inline.
+    """
+    _validate_artifact_kind(kind)
+    await _get_owned_job(db, job_id, user.id)
+    if interview_round_id is not None:
+        await _get_owned_round(db, interview_round_id, job_id, user.id)
+
+    import mimetypes as _mt
+    import uuid as _uuid
+    from pathlib import Path as _Path
+
+    _UPLOADS_ROOT = _Path("/app/uploads")
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=422, detail="Uploaded file is empty.")
+    if len(data) > 25 * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="File too large (max 25 MB).",
+        )
+
+    original_name = _Path(file.filename or "artifact").name
+    original_name = re.sub(r"[^\w.\-]+", "_", original_name)[:120] or "artifact"
+    mime = (
+        file.content_type
+        or _mt.guess_type(original_name)[0]
+        or "application/octet-stream"
+    )
+
+    dest_dir = _UPLOADS_ROOT / "artifacts" / str(user.id)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    stored_name = f"{_uuid.uuid4().hex[:12]}_{original_name}"
+    dest_path = dest_dir / stored_name
+    dest_path.write_bytes(data)
+
+    # Plain-text / markdown → also inline in content_md for the collapsed view.
+    from app.skills.doc_text import extract_text as _extract_text
+    content_md = _extract_text(data, mime, original_name)
+
+    tag_list: Optional[list[str]] = None
+    if tags and tags.strip():
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+
+    effective_title = (title or "").strip() or _Path(original_name).stem or "Artifact"
+
+    art = InterviewArtifact(
+        tracked_job_id=job_id,
+        interview_round_id=interview_round_id,
+        kind=kind,
+        title=effective_title[:255],
+        file_url=f"/api/v1/jobs/{job_id}/artifacts/{{id}}/file",  # placeholder until we know the id
+        mime_type=mime,
+        content_md=content_md,
+        source="uploaded",
+        tags=tag_list,
+    )
+    db.add(art)
+    await db.flush()
+    # Now that we have an id, update file_url to the real streaming path.
+    art.file_url = f"/api/v1/jobs/{job_id}/artifacts/{art.id}/file"
+    # Stash the stored path on a JSON-ish marker inside mime_type's twin? No —
+    # we don't have a spare column. Encode the filename suffix inside the URL
+    # instead, and resolve from filesystem on serve. Keep it simple: we save
+    # the relative path on a hidden convention derived from (user_id, stored).
+    # For now, record the mapping via a deterministic filesystem path that the
+    # serve endpoint reconstructs from (user_id, artifact_id) — not possible
+    # without storing it. Solution: store the path suffix in file_url query.
+    art.file_url = (
+        f"/api/v1/jobs/{job_id}/artifacts/{art.id}/file?p={stored_name}"
+    )
+    await db.commit()
+    await db.refresh(art)
+    return art
+
+
+@router.get("/{job_id:int}/artifacts/{artifact_id:int}/file")
+async def download_artifact_file(
+    job_id: int,
+    artifact_id: int,
+    p: str,
+    download: bool = False,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Stream the raw bytes of an uploaded artifact. The stored filename is
+    passed via `?p=` (set by the upload endpoint); we verify it stays under
+    the user's artifact directory to prevent path traversal."""
+    from pathlib import Path as _Path
+    from fastapi.responses import FileResponse as _FR
+
+    art = await _get_owned_artifact(db, artifact_id, job_id, user.id)
+    if art.source != "uploaded":
+        raise HTTPException(
+            status_code=404, detail="This artifact is not a file upload."
+        )
+    uploads_root = _Path("/app/uploads")
+    base = uploads_root / "artifacts" / str(user.id)
+    candidate = base / p
+    try:
+        candidate.resolve().relative_to(base.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Invalid path.")
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail="Backing file not found.")
+    return _FR(
+        path=str(candidate),
+        media_type=art.mime_type or "application/octet-stream",
+        filename=art.title[:120] or "artifact",
+        content_disposition_type="attachment" if download else "inline",
+    )
+
+
 # --- JD analyzer -----------------------------------------------------------
 
 _JD_ANALYZE_PROMPT = """You are analyzing a job description for a candidate to decide
@@ -741,6 +1127,120 @@ async def analyze_jd(
     await db.commit()
     await db.refresh(job)
     return job
+
+
+class BatchAnalyzeOut(BaseModel):
+    analyzed: int
+    skipped_no_description: int
+    skipped_already_scored: int
+    errors: list[dict] = []
+
+
+@router.post("/batch-analyze-jd", response_model=BatchAnalyzeOut)
+async def batch_analyze_jd(
+    force: bool = False,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> BatchAnalyzeOut:
+    """Run the JD analyzer on every TrackedJob that has a job_description.
+
+    Default: only scores jobs without a fit_score yet. `?force=1` rescores
+    everything. Slow — serial calls to Claude, one per job.
+    """
+    from app.core.security import create_access_token
+
+    stmt = select(TrackedJob).where(
+        TrackedJob.user_id == user.id,
+        TrackedJob.deleted_at.is_(None),
+    )
+    jobs = list((await db.execute(stmt)).scalars().all())
+
+    skipped_no_desc = 0
+    skipped_scored = 0
+    errors: list[dict] = []
+    analyzed = 0
+
+    # Resolve org names once.
+    org_ids = [j.organization_id for j in jobs if j.organization_id]
+    org_names: dict[int, str] = {}
+    if org_ids:
+        rows = (
+            await db.execute(
+                select(Organization.id, Organization.name).where(
+                    Organization.id.in_(org_ids)
+                )
+            )
+        ).all()
+        org_names = {r[0]: r[1] for r in rows}
+
+    for j in jobs:
+        if not (j.job_description and j.job_description.strip()):
+            skipped_no_desc += 1
+            continue
+        already_scored = (
+            isinstance(j.fit_summary, dict) and j.fit_summary.get("score") is not None
+        )
+        if already_scored and not force:
+            skipped_scored += 1
+            continue
+
+        prompt = _JD_ANALYZE_PROMPT.format(
+            job_description=j.job_description,
+            title=j.title or "(untitled)",
+            organization=org_names.get(j.organization_id) if j.organization_id else "(unknown)",
+            location=j.location or "(unspecified)",
+            remote_policy=j.remote_policy or "(unspecified)",
+            salary_min=j.salary_min if j.salary_min is not None else "null",
+            salary_max=j.salary_max if j.salary_max is not None else "null",
+            experience_years_min=j.experience_years_min
+            if j.experience_years_min is not None
+            else "null",
+            experience_years_max=j.experience_years_max
+            if j.experience_years_max is not None
+            else "null",
+            experience_level=j.experience_level or "null",
+            employment_type=j.employment_type or "null",
+            required_skills=", ".join(j.required_skills or []) or "(none)",
+            nice_to_have_skills=", ".join(j.nice_to_have_skills or []) or "(none)",
+        )
+        api_token = create_access_token(
+            subject=str(user.id), extra={"purpose": "jd_analyzer_batch"}
+        )
+        try:
+            result = await run_claude_prompt(
+                prompt=prompt,
+                output_format="json",
+                allowed_tools=["Bash"],
+                timeout_seconds=180,
+                extra_env={
+                    "JSP_API_BASE_URL": "http://localhost:8000",
+                    "JSP_API_TOKEN": api_token,
+                },
+            )
+        except ClaudeCodeError as exc:
+            errors.append({"job_id": j.id, "error": str(exc)[:200]})
+            continue
+
+        data = _extract_json_object(result.result) or {}
+        analysis = JdAnalysis(
+            **{k: v for k, v in data.items() if k in JdAnalysis.model_fields}
+        )
+        j.jd_analysis = analysis.model_dump()
+        if analysis.fit_summary:
+            j.fit_summary = {
+                "summary": analysis.fit_summary,
+                "score": analysis.fit_score,
+            }
+        # Commit per-job so a long run doesn't lose progress if interrupted.
+        await db.commit()
+        analyzed += 1
+
+    return BatchAnalyzeOut(
+        analyzed=analyzed,
+        skipped_no_description=skipped_no_desc,
+        skipped_already_scored=skipped_scored,
+        errors=errors,
+    )
 
 
 # --- Fetch-from-URL autofill ------------------------------------------------

@@ -185,6 +185,7 @@ export default function JobTrackerPage() {
             className="hidden"
             onChange={(e) => onQueueImport(e.target.files?.[0] ?? null)}
           />
+          <ScoreAllButton onDone={refresh} />
           <button className="jsp-btn-primary" onClick={() => setCreating(true)}>
             + New Job
           </button>
@@ -286,7 +287,10 @@ export default function JobTrackerPage() {
                     />
                   </td>
                   <td className="py-2 px-4">
-                    <FitPill score={j.fit_score ?? null} />
+                    <FitPill
+                      score={j.fit_score ?? null}
+                      redFlagCount={j.red_flag_count ?? 0}
+                    />
                   </td>
                   <td className="py-2 px-4 text-corp-muted">
                     {j.rounds_count}
@@ -812,9 +816,77 @@ function NewJobForm({
   );
 }
 
-function FitPill({ score }: { score: number | null }) {
+function ScoreAllButton({ onDone }: { onDone: () => void }) {
+  const [running, setRunning] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  async function run() {
+    setRunning(true);
+    setMsg(null);
+    try {
+      const r = await api.post<{
+        analyzed: number;
+        skipped_no_description: number;
+        skipped_already_scored: number;
+        errors: { job_id: number; error: string }[];
+      }>("/api/v1/jobs/batch-analyze-jd");
+      setMsg(
+        `Analyzed ${r.analyzed}${
+          r.skipped_already_scored ? ` · ${r.skipped_already_scored} already scored` : ""
+        }${r.skipped_no_description ? ` · ${r.skipped_no_description} no JD` : ""}${
+          r.errors.length ? ` · ${r.errors.length} errors` : ""
+        }`,
+      );
+      onDone();
+    } catch (e) {
+      setMsg(
+        e instanceof ApiError ? `Batch failed (HTTP ${e.status}).` : "Batch failed.",
+      );
+    } finally {
+      setRunning(false);
+      setTimeout(() => setMsg(null), 5000);
+    }
+  }
+
+  return (
+    <div className="flex items-center gap-2">
+      <button
+        type="button"
+        className="jsp-btn-ghost"
+        onClick={run}
+        disabled={running}
+        title="Run JD analysis on every unscored job with a description"
+      >
+        {running ? "Scoring..." : "Score all"}
+      </button>
+      {msg ? (
+        <span className="text-[11px] text-corp-muted">{msg}</span>
+      ) : null}
+    </div>
+  );
+}
+
+function FitPill({
+  score,
+  redFlagCount,
+}: {
+  score: number | null;
+  redFlagCount: number;
+}) {
   if (score === null || score === undefined) {
-    return <span className="text-[11px] text-corp-muted">—</span>;
+    return (
+      <div className="flex items-center gap-1">
+        <span className="text-[11px] text-corp-muted">—</span>
+        {redFlagCount > 0 ? (
+          <span
+            className="text-[11px] text-corp-danger"
+            title={`${redFlagCount} red flag${redFlagCount === 1 ? "" : "s"} in JD analysis`}
+          >
+            ⚠{redFlagCount}
+          </span>
+        ) : null}
+      </div>
+    );
   }
   const tone =
     score >= 75
@@ -823,11 +895,21 @@ function FitPill({ score }: { score: number | null }) {
         ? "bg-corp-accent2/20 text-corp-accent2 border-corp-accent2/40"
         : "bg-corp-danger/20 text-corp-danger border-corp-danger/40";
   return (
-    <span
-      className={`inline-block px-2 py-0.5 rounded text-[11px] tabular-nums border ${tone}`}
-      title="JD fit score — run the analyzer on the job detail page to update"
-    >
-      {score}
-    </span>
+    <div className="flex items-center gap-1">
+      <span
+        className={`inline-block px-2 py-0.5 rounded text-[11px] tabular-nums border ${tone}`}
+        title="JD fit score — run the analyzer on the job detail page to update"
+      >
+        {score}
+      </span>
+      {redFlagCount > 0 ? (
+        <span
+          className="text-[11px] text-corp-danger"
+          title={`${redFlagCount} red flag${redFlagCount === 1 ? "" : "s"}`}
+        >
+          ⚠{redFlagCount}
+        </span>
+      ) : null}
+    </div>
   );
 }
