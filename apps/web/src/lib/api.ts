@@ -1,26 +1,21 @@
 // Thin fetch wrapper that always sends cookies and surfaces structured errors.
-
-// LAN-friendly API URL resolution:
-//   1. If NEXT_PUBLIC_API_URL is set at build time, use it verbatim.
-//   2. Otherwise, on the client, derive from window.location so the API is
-//      reached on the same host the browser used — works for localhost access
-//      and access from other devices on the LAN.
-//   3. Server-side fallback (never actually called in this app) is localhost.
-const API_PORT =
-  process.env.NEXT_PUBLIC_API_PORT && process.env.NEXT_PUBLIC_API_PORT.trim()
-    ? process.env.NEXT_PUBLIC_API_PORT
-    : "8000";
-
+//
+// API URLs are same-origin by default — the web server (Next.js) proxies
+// /api/* and /health/* to the api container via rewrites in next.config.mjs.
+// That way the browser only ever talks to WEB_PORT, CORS isn't a concern,
+// and changing API_PORT in .env doesn't require a frontend rebuild.
+//
+// NEXT_PUBLIC_API_URL remains an escape hatch: if set, requests go there
+// instead of the relative path. Useful when fronting with a reverse proxy
+// that doesn't sit on the same origin.
 function resolveBaseUrl(): string {
   const fromEnv = process.env.NEXT_PUBLIC_API_URL;
   if (fromEnv && fromEnv.trim()) return fromEnv.replace(/\/$/, "");
-  if (typeof window !== "undefined") {
-    return `${window.location.protocol}//${window.location.hostname}:${API_PORT}`;
-  }
-  return `http://localhost:${API_PORT}`;
+  return ""; // relative → same-origin → proxied via Next.js rewrites.
 }
 
-/** Absolute URL builder — used for APIs consumed via EventSource or iframe. */
+/** Absolute-or-relative URL builder — used for APIs consumed via EventSource,
+ * iframes, or <a href>. Relative paths work fine for same-origin proxying. */
 export function apiUrl(path: string): string {
   return path.startsWith("http") ? path : `${resolveBaseUrl()}${path}`;
 }

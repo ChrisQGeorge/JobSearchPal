@@ -68,6 +68,11 @@ services:
     environment:
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
       NEXT_PUBLIC_API_PORT: ${NEXT_PUBLIC_API_PORT}
+      # Used by next.config.mjs rewrites to proxy /api/* and /health/* to the
+      # api container over the internal Docker network. The api container
+      # always listens on 8000 inside the network regardless of API_PORT (which
+      # only controls the host-side port mapping).
+      INTERNAL_API_URL: http://api:8000
     depends_on:
       - api
     ports:
