@@ -39,6 +39,8 @@ services:
       ANTHROPIC_DEFAULT_MODEL: ${ANTHROPIC_DEFAULT_MODEL:-claude-sonnet-4-6}
       CLAUDE_CODE_BIN: ${CLAUDE_CODE_BIN:-claude}
       SKILLS_DIR: ${SKILLS_DIR:-/app/skills}
+      EXTRA_CORS_ORIGINS: ${EXTRA_CORS_ORIGINS:-}
+      ALLOW_ALL_ORIGINS: ${ALLOW_ALL_ORIGINS:-false}
     depends_on:
       db:
         condition: service_healthy

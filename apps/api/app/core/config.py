@@ -30,6 +30,16 @@ class Settings(BaseSettings):
     COOKIE_NAME: str = Field(default="jsp_session")
     COOKIE_SECURE: bool = Field(default=False)  # set True behind TLS
 
+    # CORS: the default regex already covers loopback, RFC1918 LAN, and
+    # *.local. For hosting on a public IP / DNS name / reverse proxy host,
+    # add those origins as a comma-separated list here. Example:
+    #   EXTRA_CORS_ORIGINS=http://jobs.mycompany.com,http://10.20.30.40:4000
+    # Or set ALLOW_ALL_ORIGINS=true to bypass the allowlist entirely
+    # (dev only — credentials: include still works but any site can call
+    # the API with your cookie if the user happens to visit them).
+    EXTRA_CORS_ORIGINS: str = Field(default="")
+    ALLOW_ALL_ORIGINS: bool = Field(default=False)
+
     @property
     def sync_database_url(self) -> str:
         return (

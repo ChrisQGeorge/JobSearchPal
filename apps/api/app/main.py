@@ -65,13 +65,34 @@ LAN_ORIGIN_REGEX = (
     r")$"
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=LAN_ORIGIN_REGEX,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Extra explicit origins (comma-separated env var). Useful when hosting on a
+# server whose hostname / public IP isn't covered by the LAN regex.
+_extra_origins = [
+    o.strip()
+    for o in (settings.EXTRA_CORS_ORIGINS or "").split(",")
+    if o.strip()
+]
+
+if settings.ALLOW_ALL_ORIGINS:
+    # Wildcard-plus-credentials isn't allowed by spec, so use a regex that
+    # matches everything but still lets credentials pass through.
+    log.warning("ALLOW_ALL_ORIGINS=true — CORS is wide open. Dev only.")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r".*",
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=LAN_ORIGIN_REGEX,
+        allow_origins=_extra_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 @app.get("/health", tags=["health"])
