@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { PageShell } from "@/components/PageShell";
-import { api, ApiError } from "@/lib/api";
+import { api, apiUrl, ApiError } from "@/lib/api";
 import {
   JOB_STATUSES,
   type JobFetchQueueItem,
@@ -308,6 +308,9 @@ export default function QueuePage() {
         <div className="jsp-card p-3 mb-3 text-sm text-corp-danger">{err}</div>
       ) : null}
 
+      <LiveStreamPanel />
+
+
       {visible.length === 0 ? (
         <div className="jsp-card p-6 text-sm text-corp-muted">
           {filter === "active"
@@ -493,5 +496,231 @@ function QueueRow({
         </button>
       </div>
     </li>
+  );
+}
+
+// ---------- Live stream panel ----------------------------------------------
+
+type StreamEvent = {
+  kind:
+    | "subscribed"
+    | "start"
+    | "system"
+    | "text"
+    | "tool_use"
+    | "result"
+    | "done"
+    | "error";
+  item_id?: number;
+  url?: string;
+  text?: string;
+  tool?: string;
+  input?: Record<string, unknown>;
+  cost_usd?: number | null;
+  duration_ms?: number | null;
+  num_turns?: number | null;
+  created_tracked_job_id?: number | null;
+  t?: string;
+};
+
+function LiveStreamPanel() {
+  const [open, setOpen] = useState(false);
+  const [events, setEvents] = useState<StreamEvent[]>([]);
+  const [connected, setConnected] = useState(false);
+  const [paused, setPaused] = useState(false);
+  const esRef = useRef<EventSource | null>(null);
+  const logRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!open) {
+      esRef.current?.close();
+      esRef.current = null;
+      setConnected(false);
+      return;
+    }
+    const es = new EventSource(apiUrl("/api/v1/jobs/queue/stream"), {
+      withCredentials: true,
+    });
+    esRef.current = es;
+    es.onopen = () => setConnected(true);
+    es.onerror = () => setConnected(false);
+    es.onmessage = (m) => {
+      try {
+        const ev = JSON.parse(m.data) as StreamEvent;
+        setEvents((prev) => {
+          const next = [...prev, ev];
+          // Cap to last 500 so the DOM doesn't balloon.
+          return next.length > 500 ? next.slice(next.length - 500) : next;
+        });
+      } catch {
+        /* ignore */
+      }
+    };
+    return () => {
+      es.close();
+      esRef.current = null;
+    };
+  }, [open]);
+
+  // Auto-scroll to the bottom unless the user paused.
+  useEffect(() => {
+    if (paused) return;
+    if (logRef.current) {
+      logRef.current.scrollTop = logRef.current.scrollHeight;
+    }
+  }, [events.length, paused]);
+
+  return (
+    <section className="jsp-card mb-3">
+      <header
+        className="flex items-center justify-between px-3 py-2 cursor-pointer select-none"
+        onClick={() => setOpen((v) => !v)}
+      >
+        <div className="flex items-center gap-2">
+          <h3 className="text-sm uppercase tracking-wider text-corp-muted">
+            Live stream
+          </h3>
+          {open ? (
+            <span
+              className={`text-[10px] px-1.5 py-0.5 rounded border ${
+                connected
+                  ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
+                  : "bg-corp-surface2 text-corp-muted border-corp-border"
+              }`}
+            >
+              {connected ? "● connected" : "○ reconnecting"}
+            </span>
+          ) : (
+            <span className="text-[11px] text-corp-muted">
+              Watch the Companion narrate what it&apos;s doing as it processes queue items.
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          {open ? (
+            <>
+              <button
+                type="button"
+                className="jsp-btn-ghost text-xs"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setPaused((v) => !v);
+                }}
+              >
+                {paused ? "Resume auto-scroll" : "Pause auto-scroll"}
+              </button>
+              <button
+                type="button"
+                className="jsp-btn-ghost text-xs"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setEvents([]);
+                }}
+              >
+                Clear
+              </button>
+            </>
+          ) : null}
+          <button type="button" className="jsp-btn-ghost text-xs">
+            {open ? "Hide" : "Show"}
+          </button>
+        </div>
+      </header>
+      {open ? (
+        <div
+          ref={logRef}
+          className="border-t border-corp-border bg-corp-bg font-mono text-[11px] leading-relaxed p-3 max-h-80 overflow-auto whitespace-pre-wrap"
+        >
+          {events.length === 0 ? (
+            <div className="text-corp-muted italic">
+              Waiting for the next item to run… (enqueue a URL or wait for a
+              queued item to start)
+            </div>
+          ) : (
+            events.map((ev, i) => <StreamLine key={i} ev={ev} />)
+          )}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function StreamLine({ ev }: { ev: StreamEvent }) {
+  const ts = ev.t ? new Date(ev.t).toLocaleTimeString() : "";
+  const itemTag = ev.item_id ? `#${ev.item_id}` : "";
+  const prefix = `[${ts}${itemTag ? ` ${itemTag}` : ""}]`;
+
+  if (ev.kind === "start") {
+    return (
+      <div className="text-corp-accent">
+        {prefix} ▶ start · {ev.url}
+      </div>
+    );
+  }
+  if (ev.kind === "system") {
+    return (
+      <div className="text-corp-muted">
+        {prefix} · {ev.text}
+      </div>
+    );
+  }
+  if (ev.kind === "subscribed") {
+    return (
+      <div className="text-corp-muted italic">
+        {prefix} — stream connected
+      </div>
+    );
+  }
+  if (ev.kind === "text") {
+    return (
+      <div className="text-corp-text">
+        {prefix} {ev.text}
+      </div>
+    );
+  }
+  if (ev.kind === "tool_use") {
+    const inp =
+      ev.input && Object.keys(ev.input).length
+        ? " " + JSON.stringify(ev.input)
+        : "";
+    return (
+      <div className="text-sky-300">
+        {prefix} ● {ev.tool}
+        {inp}
+      </div>
+    );
+  }
+  if (ev.kind === "result") {
+    const bits: string[] = [];
+    if (ev.num_turns) bits.push(`${ev.num_turns} turn${ev.num_turns === 1 ? "" : "s"}`);
+    if (ev.duration_ms)
+      bits.push(
+        ev.duration_ms >= 1000 ? `${(ev.duration_ms / 1000).toFixed(1)}s` : `${ev.duration_ms}ms`,
+      );
+    if (ev.cost_usd && ev.cost_usd > 0) bits.push(`$${ev.cost_usd.toFixed(3)}`);
+    return (
+      <div className="text-corp-muted italic">
+        {prefix} ✓ result · {bits.join(" · ") || "ok"}
+      </div>
+    );
+  }
+  if (ev.kind === "done") {
+    return (
+      <div className="text-emerald-300">
+        {prefix} ✓ done — tracked job #{ev.created_tracked_job_id}
+      </div>
+    );
+  }
+  if (ev.kind === "error") {
+    return (
+      <div className="text-corp-danger">
+        {prefix} ✗ {ev.text}
+      </div>
+    );
+  }
+  return (
+    <div className="text-corp-muted">
+      {prefix} {JSON.stringify(ev)}
+    </div>
   );
 }

@@ -1406,10 +1406,20 @@ def _extract_json_object(text: str) -> Optional[dict]:
     return None
 
 
-async def perform_fetch(db: AsyncSession, url: str) -> FetchedJobInfo:
-    """Core URL-fetch + org-enrichment pipeline, reusable from both the
-    interactive endpoint and the background queue worker. Raises
-    ClaudeCodeError on CLI failure; otherwise returns a FetchedJobInfo with
+async def perform_fetch(
+    db: AsyncSession,
+    url: str,
+    *,
+    on_event: "Optional[callable]" = None,
+) -> FetchedJobInfo:
+    """Core URL-fetch + org-enrichment pipeline.
+
+    When `on_event` is provided, uses the streaming Claude Code variant and
+    invokes the callback for each captured event (text chunk, tool_use,
+    result summary). Used by the queue worker to pipe live output to the
+    in-memory pub/sub. When None, runs the cheaper single-shot JSON mode.
+
+    Raises ClaudeCodeError on CLI failure; otherwise the FetchedJobInfo has
     organization_id set when an org was resolved or created.
     """
     url = url.strip()
@@ -1418,14 +1428,86 @@ async def perform_fetch(db: AsyncSession, url: str) -> FetchedJobInfo:
 
     prompt = _FETCH_PROMPT_TEMPLATE.format(url=url)
 
-    result = await run_claude_prompt(
-        prompt=prompt,
-        output_format="json",
-        allowed_tools=["WebFetch", "WebSearch"],
-        timeout_seconds=180,
-    )
+    final_text = ""
+    if on_event is not None:
+        from datetime import datetime as _dt, timezone as _tz
+        from app.skills.runner import (
+            ClaudeCodeError as _CCE,
+            stream_claude_prompt as _scp,
+        )
+        collected: list[str] = []
+        had_error: str | None = None
 
-    data = _extract_json_object(result.result) or {}
+        def _emit(ev: dict) -> None:
+            ev["t"] = _dt.now(tz=_tz.utc).isoformat(timespec="seconds")
+            try:
+                on_event(ev)
+            except Exception:  # pragma: no cover  (bus error must not kill fetch)
+                pass
+
+        async for raw in _scp(
+            prompt=prompt,
+            allowed_tools=["WebFetch", "WebSearch"],
+            timeout_seconds=240,
+        ):
+            ev_type = raw.get("type")
+            if ev_type == "system":
+                _emit({"kind": "system", "text": "Claude session started"})
+            elif ev_type == "error":
+                had_error = str(raw.get("message") or "streaming error")
+                _emit({"kind": "error", "text": had_error})
+            elif ev_type == "assistant":
+                msg = raw.get("message") or {}
+                for block in (msg.get("content") or []):
+                    btype = (block or {}).get("type")
+                    if btype == "text":
+                        text = block.get("text") or ""
+                        if text.strip():
+                            collected.append(text)
+                            _emit({"kind": "text", "text": text})
+                    elif btype == "tool_use":
+                        inp = block.get("input") or {}
+                        compact = {
+                            k: (
+                                (str(v)[:300] + "…")
+                                if isinstance(v, str) and len(str(v)) > 300
+                                else v
+                            )
+                            for k, v in inp.items()
+                        }
+                        _emit(
+                            {
+                                "kind": "tool_use",
+                                "tool": block.get("name"),
+                                "input": compact,
+                            }
+                        )
+            elif ev_type == "stream_event":
+                continue
+            elif ev_type == "result":
+                if not collected and raw.get("result"):
+                    collected.append(str(raw["result"]))
+                _emit(
+                    {
+                        "kind": "result",
+                        "cost_usd": raw.get("total_cost_usd") or raw.get("cost_usd"),
+                        "duration_ms": raw.get("duration_ms"),
+                        "num_turns": raw.get("num_turns"),
+                    }
+                )
+        final_text = "".join(collected)
+        if had_error and not final_text:
+            raise _CCE(had_error)
+    else:
+        result = await run_claude_prompt(
+            prompt=prompt,
+            output_format="json",
+            allowed_tools=["WebFetch", "WebSearch"],
+            timeout_seconds=180,
+        )
+        final_text = result.result
+
+    data = _extract_json_object(final_text) or {}
     if data.get("remote_policy") not in (None, "remote", "hybrid", "onsite"):
         data["remote_policy"] = None
     if data.get("source_platform") not in (
@@ -1544,6 +1626,57 @@ async def fetch_from_url(
 
 
 # --- JobFetchQueue ----------------------------------------------------------
+
+
+@router.get("/queue/stream")
+async def stream_queue_activity(
+    _: User = Depends(get_current_user),
+):
+    """Server-Sent-Events feed of live queue-worker activity.
+
+    Not persisted — each connected client just sees whatever the worker is
+    doing from the moment they subscribe. Events include:
+
+      {kind: "start", item_id, url}
+      {kind: "system", item_id, url, text}
+      {kind: "text", item_id, url, text}       — Claude's prose
+      {kind: "tool_use", item_id, url, tool, input}
+      {kind: "result", item_id, url, cost_usd, duration_ms, num_turns}
+      {kind: "done", item_id, url, created_tracked_job_id}
+      {kind: "error", item_id, url, text}
+
+    A periodic `: keepalive` comment keeps the connection warm through
+    proxies that drop idle streams.
+    """
+    import asyncio as _a
+    import json as _json
+
+    from fastapi.responses import StreamingResponse
+    from app.skills import queue_bus as _bus
+
+    q = _bus.subscribe()
+
+    async def gen():
+        try:
+            yield f'data: {_json.dumps({"kind": "subscribed"})}\n\n'.encode("utf-8")
+            while True:
+                try:
+                    ev = await _a.wait_for(q.get(), timeout=15.0)
+                    yield f"data: {_json.dumps(ev)}\n\n".encode("utf-8")
+                except _a.TimeoutError:
+                    yield b": keepalive\n\n"
+        finally:
+            _bus.unsubscribe(q)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @router.get("/queue", response_model=list[JobFetchQueueOut])
