@@ -305,44 +305,57 @@ async def delete_document(
 
 # --- Tailoring --------------------------------------------------------------
 
-_TAILOR_RESUME_PROMPT = """You are tailoring a professional resume for a specific
-job. The candidate's full, pre-fetched profile (identity, contact info, skills
-catalog, work experience, education, projects, certifications, publications,
-achievements, languages, volunteer work) is embedded below. Use it as your
-sole source of truth — do NOT invent anything, and do NOT make API calls
-unless the profile is clearly missing something you need. If something is
-not in the profile, omit it rather than fabricating.
+_TAILOR_RESUME_PROMPT = """You are TAILORING a resume for a SPECIFIC job posting.
 
-Candidate profile (everything the app knows about this user)
+"Tailoring" means: you read the target job carefully, then you pick, reorder,
+and rephrase from the candidate's real history to maximize the match for
+THIS job. Every section of the output must be informed by THIS job — the
+summary, the skills ordering, which roles get the most bullets, which
+highlights get surfaced, even which projects you include.
+
+If a role in the history isn't relevant to this job, shrink it to one line.
+If a skill isn't relevant, leave it off. If the JD emphasizes something the
+candidate has, foreground it. You are not producing a generic resume that
+merely happens to be for this company — you are producing THE resume for
+THIS posting.
+
+You have two inputs below:
+
+  1. TARGET JOB — the posting you're tailoring for. Read this first.
+  2. CANDIDATE PROFILE — everything the app knows about the candidate.
+     This is your pool of raw material. Do NOT invent anything outside it.
+
+You do NOT need to make API calls. Everything is pre-fetched. If something
+is missing, omit it rather than fabricating.
+
+============================================================
+TARGET JOB — this is what you are tailoring FOR
+============================================================
+
+{job_context}
+
+Existing JD fit analysis (if present, honour its `resume_emphasis` and
+prioritized skills — this was computed specifically for this candidate ×
+this JD pairing):
+
+{jd_analysis_blob}
+
+Companion's prior fit summary for this job (if present):
+
+{fit_summary_blob}
+
+User-supplied guidance for THIS tailoring run (highest priority — if set,
+these often specify tone, length, or sections to include/exclude):
+
+{extra_notes}
+
+============================================================
+CANDIDATE PROFILE — raw material you tailor FROM
 ============================================================
 
 {candidate_profile}
 
 ============================================================
-End of candidate profile.
-
-Target job
-----------
-Title:        {title}
-Organization: {organization}
-Location:     {location}
-
-Job description (verbatim):
-
----
-{job_description}
----
-
-Required skills: {required_skills}
-Nice to have:    {nice_to_have_skills}
-
-Existing fit analysis (if present, honour its resume_emphasis and prioritized skills):
-
-{jd_analysis_blob}
-
-User-supplied guidance for THIS tailoring run (if any — weight these heavily):
-
-{extra_notes}
 
 What a polished resume looks like
 ---------------------------------
@@ -419,67 +432,98 @@ coursework if directly relevant to the JD.
 
 - {{Title}} — {{Venue}}, {{Year}}
 
-Rules
------
+Tailoring rules (the important ones — read twice)
+--------------------------------------------------
+- **Tailor to THIS job, not a generic version.** Before you write each
+  section, ask: "does this help the reader see the candidate as a strong
+  match for THIS posting?" If not, trim or drop it.
+- **Rank ruthlessly by JD fit.** The summary, skill ordering, role order
+  within reverse-chronological, which bullets you pick per role, which
+  projects (if any) you include — all should reflect what THIS JD asks
+  for. A role from 8 years ago that matches the JD can get more bullets
+  than last year's role that doesn't.
+- **Mirror JD vocabulary.** If the JD says "distributed systems" and the
+  candidate's highlight says "scaled backend services", prefer the JD's
+  phrasing when it's honest. Don't invent — rephrase.
+- **Foreground required skills that the candidate actually has.** Put
+  them first in their category. If the JD requires a skill the candidate
+  doesn't have, DO NOT add it — just omit silently.
+
+Honesty rules
+-------------
 - NEVER invent experience, skills, companies, dates, metrics, accomplishments,
-  phone numbers, or links. If a field is missing on file, omit it rather than
-  make one up. If contact info is thin, use only what's there.
-- Reorder and rephrase to foreground JD relevance. Rephrase stored highlights
-  into tight, verb-led resume bullets — but do not fabricate metrics that
-  aren't present in the source.
+  phone numbers, or links. If a field is missing in the candidate profile,
+  omit it rather than make one up.
+- Rephrase stored highlights into tight, verb-led resume bullets — but do
+  not fabricate metrics that aren't in the source.
+
+Formatting rules
+----------------
 - Target length: one dense page (roughly 450–650 words of markdown body,
-  not counting headers). If the user's data supports more, lean toward
+  not counting headers). If the candidate's data supports more, lean toward
   1.5 pages for senior candidates; never pad.
 - Use consistent date formatting throughout: `Month YYYY – Month YYYY`,
   or `YYYY – YYYY` if only year is on file, or `… – Present` for current.
 - Capitalize proper nouns exactly as stored (AWS, PostgreSQL, Kubernetes).
 - Never include demographic data (pronouns, age, ethnicity, veteran status)
-  on the resume. Those endpoints are only useful for name and location.
-- If the user's stored data is too thin for a credible resume, set `warning`
-  explaining what's missing and produce the honest subset you can.
+  on the resume.
+- If the candidate's stored data is too thin for a credible resume, set
+  `warning` explaining what's missing and produce the honest subset you can.
 
 Return ONE JSON object, no prose, no markdown fences around the JSON:
 
 {{
   "title": string,          // e.g. "Resume – Acme Senior Engineer"
   "content_md": string,     // the full resume in Markdown, following the structure above
-  "notes": string,          // 1–2 sentences on what you emphasized and trimmed
+  "notes": string,          // 1–2 sentences explicitly naming WHICH aspects of the candidate you surfaced to match THIS JD, and what you trimmed
   "warning": string | null  // honest caveats (missing phone, no dated roles, etc.)
 }}
 """
 
 
-_TAILOR_COVER_LETTER_PROMPT = """You are writing a polished, human-sounding
-cover letter for a specific job. The candidate's full, pre-fetched profile
-is embedded below — use it as your sole source of truth. Do NOT invent
-anything and do NOT make API calls unless something critical is missing.
+_TAILOR_COVER_LETTER_PROMPT = """You are writing a cover letter TAILORED to a
+specific job posting. "Tailored" means: every sentence should be grounded in
+THIS job's specifics — the company, the team, the product, the stated
+requirements, the stated values — mapped to the candidate's REAL history.
 
-Candidate profile (everything the app knows about this user)
+A generic "I'm passionate about software and excited to apply" letter is a
+failure. The reader should be unable to swap in a different company name
+without the letter falling apart.
+
+You have two inputs below:
+
+  1. TARGET JOB — the posting and organization details. Read this first.
+  2. CANDIDATE PROFILE — everything the app knows about the candidate.
+
+You do NOT need to make API calls. Everything is pre-fetched. Never invent
+anything outside the profile.
+
+============================================================
+TARGET JOB — this is what you are tailoring FOR
+============================================================
+
+{job_context}
+
+Existing JD fit analysis (if present, `cover_letter_hook` is especially
+useful as your opener — it was computed specifically for this candidate):
+
+{jd_analysis_blob}
+
+Companion's prior fit summary for this job (if present):
+
+{fit_summary_blob}
+
+User guidance for THIS letter (highest priority — tone, length, angle):
+
+{extra_notes}
+
+============================================================
+CANDIDATE PROFILE — real history to draw stories from
 ============================================================
 
 {candidate_profile}
 
 ============================================================
-End of candidate profile.
-
-Target job
-----------
-Title:        {title}
-Organization: {organization}
-
-Job description (verbatim):
-
----
-{job_description}
----
-
-Existing fit analysis (cover_letter_hook is especially useful):
-
-{jd_analysis_blob}
-
-User guidance for THIS letter (optional but take seriously):
-
-{extra_notes}
 
 What a polished cover letter looks like
 ---------------------------------------
@@ -523,21 +567,37 @@ about this specific company/product/team, and a concrete next step
 Sincerely,
 {{Candidate Full Name}}
 
-Rules
------
-- NEVER invent employers, dates, metrics, products, or stories the user
-  hasn't recorded. Everything concrete must come from fetched data.
-- Reference the company name at least twice and at least one specific
-  detail from the JD (product area, responsibility phrase, named value,
-  team). Show you actually read the posting.
+Tailoring rules (critical)
+--------------------------
+- **The letter must not be swappable.** If a reader could replace the company
+  name with a different one and the letter still works, you've failed. Each
+  paragraph should contain at least one detail that's specific to THIS job
+  or organization (product, team, stated value, research note, tech stack
+  hint, responsibility phrase from the JD).
+- Pick proof stories based on JD fit, not recency or prestige. The strongest
+  story is the one that most directly answers a specific need in THIS JD.
+- Reference the company name at least twice by actual name.
+- If the candidate profile includes internal research notes on the org, mine
+  them for specificity (why this company specifically — don't just say
+  "I admire your mission").
+- If the JD mentions a particular product / team / stack, and the candidate
+  has relevant stored experience, name both explicitly in the letter.
+
+Honesty rules
+-------------
+- NEVER invent employers, dates, metrics, products, or stories the candidate
+  hasn't recorded. Everything concrete must come from the candidate profile.
+- If the profile is too thin to support two proof paragraphs, collapse to a
+  tighter 3-paragraph structure and flag it in `warning`.
+
+Formatting / tone rules
+-----------------------
 - Length: 300–450 words of body (paragraphs only, not counting header
   block and signature). Don't pad.
 - Tone: natural, specific, confident. Active voice. No "synergy",
   "passionate", "dynamic self-starter", "wear many hats".
-- If the user's stored history is too thin to support two proof paragraphs,
-  collapse to a tighter 3-paragraph structure and flag it in `warning`.
-- Use the candidate's preferred_name if available, otherwise legal first
-  + last name, otherwise display_name from /auth/me.
+- Use the candidate's preferred_name if available, otherwise their full
+  name as stored in the profile's identity section.
 
 Return ONE JSON object, no prose and no markdown fences:
 
@@ -549,44 +609,44 @@ Return ONE JSON object, no prose and no markdown fences:
 """
 
 
-_TAILOR_EMAIL_PROMPT = """You are drafting a short professional email for a
-specific job context. The candidate's full, pre-fetched profile is embedded
-below — use it as the source of truth.
+_TAILOR_EMAIL_PROMPT = """You are drafting a short professional email TAILORED
+to a specific job context. Tailored means: the email references something
+concrete about THIS company / role / stage — not a generic template.
 
-Candidate profile
-=================
-
-{candidate_profile}
-
-=================
+You have everything you need pre-fetched below.
 
 Email purpose for THIS run: {purpose_label}
 
-Target job
-----------
-Title:        {title}
-Organization: {organization}
+============================================================
+TARGET JOB — what this email is about
+============================================================
 
-Job description (verbatim):
+{job_context}
 
----
-{job_description}
----
-
-Existing fit analysis (if any):
+Existing JD fit analysis (if any):
 
 {jd_analysis_blob}
 
-User guidance for THIS email (optional):
+User guidance for THIS email:
 
 {extra_notes}
 
+============================================================
+CANDIDATE PROFILE — real history to draw from
+============================================================
+
+{candidate_profile}
+
+============================================================
+
 Your job
 --------
-Write a short, specific email (150–250 words). Include a subject line. No
-boilerplate openers. Reference something concrete — a product, a responsibility
-phrase, a named person from the user's contacts if applicable, or the stage
-they're at in the pipeline. Be warm but brief.
+Write a short, specific email (150–250 words) for the purpose named above.
+Include a subject line. No boilerplate openers. Reference something concrete
+about THIS job / company — a product, a responsibility phrase, a named
+person from the user's contacts if applicable, or the stage they're at in
+the pipeline. Be warm but brief, and tie at least one sentence back to the
+candidate's real history.
 
 Return ONE JSON object, no prose and no markdown fences:
 
@@ -598,29 +658,19 @@ Return ONE JSON object, no prose and no markdown fences:
 """
 
 
-_TAILOR_GENERIC_PROMPT = """You are drafting a document of type `{doc_type}` for
-a specific job context. The candidate's full, pre-fetched profile is embedded
-below — use it as the source of truth.
+_TAILOR_GENERIC_PROMPT = """You are drafting a `{doc_type}` document TAILORED
+to a specific job posting. Tailor every section to THIS job — the output
+should not work unchanged for a different posting.
 
-Candidate profile
-=================
+You have everything you need pre-fetched below; no API calls required.
 
-{candidate_profile}
+============================================================
+TARGET JOB — what this document is for
+============================================================
 
-=================
+{job_context}
 
-Target job
-----------
-Title:        {title}
-Organization: {organization}
-
-Job description (verbatim):
-
----
-{job_description}
----
-
-Existing fit analysis (if any):
+Existing JD fit analysis (if any):
 
 {jd_analysis_blob}
 
@@ -628,12 +678,21 @@ User guidance for THIS run (usually tells you exactly what they want — follow 
 
 {extra_notes}
 
+============================================================
+CANDIDATE PROFILE — real history to draw from
+============================================================
+
+{candidate_profile}
+
+============================================================
+
 Your job
 --------
-Produce a document in Markdown that fits the requested `doc_type`. Use the
-user's guidance above as the primary direction; if it's vague, infer a
-reasonable default for this doc type in a job-search context. Never invent
-experience, companies, or metrics the user has not recorded.
+Produce a document in Markdown that fits the requested `doc_type` and is
+TAILORED to the target job above. Use the user's guidance as the primary
+direction; if it's vague, infer a reasonable default for this doc type in a
+job-search context. Ground every concrete claim in the candidate profile —
+never invent experience, companies, or metrics the user hasn't recorded.
 
 Return ONE JSON object, no prose and no markdown fences:
 
@@ -1121,6 +1180,101 @@ async def _build_candidate_profile_block(
     return "\n".join(out)
 
 
+def _build_job_context_block(
+    job: TrackedJob, org: Optional[Organization]
+) -> str:
+    """Assemble a readable block covering everything we know about the target
+    job + employer. The resume/cover-letter prompts tailor TO this block.
+    """
+    out: list[str] = []
+    out.append("## Role")
+    out.append(f"- Title: {job.title or '(untitled)'}")
+    out.append(f"- Organization: {org.name if org else '(unknown)'}")
+    if job.location: out.append(f"- Location: {job.location}")
+    if job.remote_policy: out.append(f"- Remote policy: {job.remote_policy}")
+    if job.employment_type: out.append(f"- Employment type: {job.employment_type}")
+    if job.experience_level: out.append(f"- Seniority: {job.experience_level}")
+    if job.experience_years_min is not None or job.experience_years_max is not None:
+        lo = job.experience_years_min
+        hi = job.experience_years_max
+        if lo is not None and hi is not None:
+            rng = f"{lo}–{hi} yrs"
+        elif lo is not None:
+            rng = f"{lo}+ yrs"
+        else:
+            rng = f"up to {hi} yrs"
+        out.append(f"- Experience required: {rng}")
+    if job.education_required:
+        out.append(f"- Education required: {job.education_required}")
+    if job.salary_min or job.salary_max:
+        cur = job.salary_currency or "USD"
+        bits = []
+        if job.salary_min: bits.append(f"min {cur} {float(job.salary_min):,.0f}")
+        if job.salary_max: bits.append(f"max {cur} {float(job.salary_max):,.0f}")
+        out.append(f"- Salary: {' · '.join(bits)}")
+    if job.visa_sponsorship_offered is not None:
+        out.append(f"- Visa sponsorship offered: {'yes' if job.visa_sponsorship_offered else 'no'}")
+    if job.relocation_offered is not None:
+        out.append(f"- Relocation offered: {'yes' if job.relocation_offered else 'no'}")
+    if job.source_url:
+        out.append(f"- Source URL: {job.source_url}")
+    if job.source_platform:
+        out.append(f"- Source platform: {job.source_platform}")
+    if job.date_posted:
+        out.append(f"- Date posted: {_fmt_date(job.date_posted)}")
+
+    if job.required_skills:
+        out.append("")
+        out.append("## Required skills (from the JD)")
+        out.append(", ".join(str(s) for s in job.required_skills))
+    if job.nice_to_have_skills:
+        out.append("")
+        out.append("## Nice-to-have skills (from the JD)")
+        out.append(", ".join(str(s) for s in job.nice_to_have_skills))
+
+    if org:
+        org_bits: list[str] = []
+        if org.industry: org_bits.append(f"industry: {org.industry}")
+        if org.size: org_bits.append(f"size: {org.size}")
+        if org.headquarters_location: org_bits.append(f"HQ: {org.headquarters_location}")
+        if org.website: org_bits.append(f"website: {org.website}")
+        if org_bits or org.description or org.research_notes or org.tech_stack_hints:
+            out.append("")
+            out.append(f"## About the organization — {org.name}")
+            if org_bits:
+                out.append(" · ".join(org_bits))
+            if org.description:
+                out.append("")
+                out.append("Description:")
+                out.append(org.description.strip())
+            if org.research_notes:
+                out.append("")
+                out.append("Internal research notes (useful for cover letter specificity):")
+                out.append(org.research_notes.strip())
+            if org.tech_stack_hints:
+                out.append("")
+                out.append(
+                    "Tech stack hints: "
+                    + ", ".join(str(t) for t in org.tech_stack_hints)
+                )
+
+    if job.notes:
+        out.append("")
+        out.append("## User's private notes on this job")
+        out.append(
+            "(Weight these — they often contain context the JD doesn't capture.)"
+        )
+        out.append(job.notes.strip())
+
+    out.append("")
+    out.append("## Job description (verbatim)")
+    out.append("---")
+    out.append((job.job_description or "").strip())
+    out.append("---")
+
+    return "\n".join(out)
+
+
 async def _run_tailor(
     *,
     db: AsyncSession,
@@ -1139,20 +1293,24 @@ async def _run_tailor(
             detail="This job has no description stored. Add one before tailoring.",
         )
 
-    org_name = None
+    org: Optional[Organization] = None
     if job.organization_id:
-        org_row = (
+        org = (
             await db.execute(
-                select(Organization.name).where(Organization.id == job.organization_id)
+                select(Organization).where(Organization.id == job.organization_id)
             )
-        ).first()
-        org_name = org_row[0] if org_row else None
+        ).scalar_one_or_none()
+    org_name = org.name if org else None
 
     jd_analysis_blob = (
         json.dumps(job.jd_analysis, indent=2) if job.jd_analysis else "(no analysis yet)"
     )
+    fit_summary_blob = (
+        json.dumps(job.fit_summary, indent=2) if job.fit_summary else "(none)"
+    )
 
     candidate_profile = await _build_candidate_profile_block(db, user)
+    job_context = _build_job_context_block(job, org)
 
     # User-supplied values may contain literal `{` / `}` (code blocks,
     # `{foo}` template placeholders, JSON examples inside the JD, etc.).
@@ -1170,8 +1328,10 @@ async def _run_tailor(
         "required_skills": _esc(", ".join(job.required_skills or []) or "(none)"),
         "nice_to_have_skills": _esc(", ".join(job.nice_to_have_skills or []) or "(none)"),
         "jd_analysis_blob": _esc(jd_analysis_blob),
+        "fit_summary_blob": _esc(fit_summary_blob),
         "extra_notes": _esc(extra_notes or "(none)"),
         "candidate_profile": _esc(candidate_profile),
+        "job_context": _esc(job_context),
     }
     if extra_format_args:
         for k, v in extra_format_args.items():
