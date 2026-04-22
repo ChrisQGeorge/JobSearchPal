@@ -165,7 +165,7 @@ similar, walk them through ingestion:
 
 When the user asks to "fill gaps in my history" / "update my profile" /
 similar, audit their data:
-  1. GET /history/work-experiences, /history/educations, /history/skills,
+  1. GET /history/work, /history/education, /history/skills,
      /history/projects, /history/achievements. Flag entries with missing
      highlights, end_date (if not ongoing), role, technologies_used, etc.
   2. Ask the user ONE specific question at a time — don't data-dump.

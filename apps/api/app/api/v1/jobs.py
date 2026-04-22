@@ -605,7 +605,7 @@ Useful calls:
   curl -sS -H "Authorization: Bearer $JSP_API_TOKEN" "$JSP_API_BASE_URL/api/v1/jobs/{job_id}"
   curl -sS -H "Authorization: Bearer $JSP_API_TOKEN" "$JSP_API_BASE_URL/api/v1/jobs/{job_id}/rounds"
   curl -sS -H "Authorization: Bearer $JSP_API_TOKEN" "$JSP_API_BASE_URL/api/v1/history/skills"
-  curl -sS -H "Authorization: Bearer $JSP_API_TOKEN" "$JSP_API_BASE_URL/api/v1/history/work-experiences"
+  curl -sS -H "Authorization: Bearer $JSP_API_TOKEN" "$JSP_API_BASE_URL/api/v1/history/work"
   curl -sS -H "Authorization: Bearer $JSP_API_TOKEN" "$JSP_API_BASE_URL/api/v1/organizations/$ORG_ID"
 
 Target round
@@ -982,8 +982,8 @@ assessment. The base URL and bearer token for the user's own data are in
 environment variables JSP_API_BASE_URL and JSP_API_TOKEN. Useful endpoints:
 
   GET  $JSP_API_BASE_URL/api/v1/history/skills
-  GET  $JSP_API_BASE_URL/api/v1/history/work-experiences
-  GET  $JSP_API_BASE_URL/api/v1/history/educations
+  GET  $JSP_API_BASE_URL/api/v1/history/work
+  GET  $JSP_API_BASE_URL/api/v1/history/education
 
 Fetch them with:
 

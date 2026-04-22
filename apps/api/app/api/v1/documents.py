@@ -300,8 +300,8 @@ The base URL and bearer token are in environment variables JSP_API_BASE_URL
 and JSP_API_TOKEN. Useful endpoints (all return JSON, auth via
 `Authorization: Bearer $JSP_API_TOKEN`):
 
-  GET  $JSP_API_BASE_URL/api/v1/history/work-experiences
-  GET  $JSP_API_BASE_URL/api/v1/history/educations
+  GET  $JSP_API_BASE_URL/api/v1/history/work
+  GET  $JSP_API_BASE_URL/api/v1/history/education
   GET  $JSP_API_BASE_URL/api/v1/history/skills
   GET  $JSP_API_BASE_URL/api/v1/history/projects
   GET  $JSP_API_BASE_URL/api/v1/history/certifications
@@ -311,7 +311,7 @@ and JSP_API_TOKEN. Useful endpoints (all return JSON, auth via
 Fetch what you need with curl, e.g.:
 
   curl -sS -H "Authorization: Bearer $JSP_API_TOKEN" \\
-       "$JSP_API_BASE_URL/api/v1/history/work-experiences"
+       "$JSP_API_BASE_URL/api/v1/history/work"
 
 Target job
 ----------
@@ -389,7 +389,7 @@ need.
 Environment: $JSP_API_BASE_URL and $JSP_API_TOKEN (bearer).
 Useful endpoints:
 
-  GET  $JSP_API_BASE_URL/api/v1/history/work-experiences
+  GET  $JSP_API_BASE_URL/api/v1/history/work
   GET  $JSP_API_BASE_URL/api/v1/history/skills
   GET  $JSP_API_BASE_URL/api/v1/history/projects
   GET  $JSP_API_BASE_URL/api/v1/history/achievements
@@ -444,7 +444,7 @@ what you need.
 
 Environment: $JSP_API_BASE_URL and $JSP_API_TOKEN (bearer). Useful endpoints:
 
-  GET  $JSP_API_BASE_URL/api/v1/history/work-experiences
+  GET  $JSP_API_BASE_URL/api/v1/history/work
   GET  $JSP_API_BASE_URL/api/v1/history/skills
 
 Email purpose for THIS run: {purpose_label}
@@ -491,7 +491,7 @@ what you need.
 
 Environment: $JSP_API_BASE_URL and $JSP_API_TOKEN (bearer). Useful endpoints:
 
-  GET  $JSP_API_BASE_URL/api/v1/history/work-experiences
+  GET  $JSP_API_BASE_URL/api/v1/history/work
   GET  $JSP_API_BASE_URL/api/v1/history/skills
   GET  $JSP_API_BASE_URL/api/v1/history/projects
   GET  $JSP_API_BASE_URL/api/v1/history/achievements
