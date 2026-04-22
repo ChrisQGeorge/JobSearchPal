@@ -22,6 +22,7 @@ from app.models.preferences import (
     Demographics,
     JobCriterion,
     JobPreferences,
+    ResumeProfile,
     WorkAuthorization,
 )
 from app.models.user import User
@@ -253,6 +254,81 @@ async def upsert_demographics(
     data = payload.model_dump()
     if existing is None:
         existing = Demographics(user_id=user.id, **data)
+        db.add(existing)
+    else:
+        for k, v in data.items():
+            setattr(existing, k, v)
+    await db.commit()
+    await db.refresh(existing)
+    return existing
+
+
+# --- ResumeProfile ----------------------------------------------------------
+
+
+class ResumeLinkIn(BaseModel):
+    label: str = Field(min_length=1, max_length=64)
+    url: str = Field(min_length=1, max_length=1024)
+
+
+class ResumeProfileIn(BaseModel):
+    full_name: Optional[str] = Field(default=None, max_length=255)
+    headline: Optional[str] = Field(default=None, max_length=255)
+    email: Optional[str] = Field(default=None, max_length=255)
+    phone: Optional[str] = Field(default=None, max_length=64)
+    location: Optional[str] = Field(default=None, max_length=255)
+    linkedin_url: Optional[str] = Field(default=None, max_length=1024)
+    github_url: Optional[str] = Field(default=None, max_length=1024)
+    portfolio_url: Optional[str] = Field(default=None, max_length=1024)
+    website_url: Optional[str] = Field(default=None, max_length=1024)
+    other_links: Optional[list[ResumeLinkIn]] = None
+    professional_summary: Optional[str] = None
+
+
+class ResumeProfileOut(ResumeProfileIn):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+
+@router.get("/resume-profile", response_model=Optional[ResumeProfileOut])
+async def get_resume_profile(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Optional[ResumeProfile]:
+    return (
+        await db.execute(
+            select(ResumeProfile).where(
+                ResumeProfile.user_id == user.id,
+                ResumeProfile.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+
+
+@router.put("/resume-profile", response_model=ResumeProfileOut)
+async def upsert_resume_profile(
+    payload: ResumeProfileIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ResumeProfile:
+    existing = (
+        await db.execute(
+            select(ResumeProfile).where(
+                ResumeProfile.user_id == user.id,
+                ResumeProfile.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    data = payload.model_dump()
+    # Normalize other_links into plain dicts (list[ResumeLinkIn] → list[dict]).
+    if data.get("other_links") is not None:
+        data["other_links"] = [
+            {"label": x["label"], "url": x["url"]} for x in data["other_links"]
+        ]
+    if existing is None:
+        existing = ResumeProfile(user_id=user.id, **data)
         db.add(existing)
     else:
         for k, v in data.items():

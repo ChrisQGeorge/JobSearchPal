@@ -35,7 +35,20 @@ from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.core.security import create_access_token
 from app.models.documents import DocumentEdit, GeneratedDocument, WritingSample
-from app.models.jobs import TrackedJob
+from app.models.history import (
+    Achievement,
+    Certification,
+    Education,
+    Language,
+    Project,
+    Publication,
+    Skill,
+    VolunteerWork,
+    WorkExperience,
+    WorkExperienceSkill,
+)
+from app.models.jobs import Organization, TrackedJob
+from app.models.preferences import Demographics, ResumeProfile, WorkAuthorization
 from app.models.user import User
 from app.skills.runner import ClaudeCodeError, run_claude_prompt
 
@@ -293,28 +306,20 @@ async def delete_document(
 # --- Tailoring --------------------------------------------------------------
 
 _TAILOR_RESUME_PROMPT = """You are tailoring a professional resume for a specific
-job. The user already has their full work/education/skills history saved in
-this app — you MUST pull it via the API before writing. Do not invent
-anything; everything in the resume must come from fetched data.
+job. The candidate's full, pre-fetched profile (identity, contact info, skills
+catalog, work experience, education, projects, certifications, publications,
+achievements, languages, volunteer work) is embedded below. Use it as your
+sole source of truth — do NOT invent anything, and do NOT make API calls
+unless the profile is clearly missing something you need. If something is
+not in the profile, omit it rather than fabricating.
 
-The base URL and bearer token are in environment variables JSP_API_BASE_URL
-and JSP_API_TOKEN. Endpoints (all JSON, auth via `Authorization: Bearer $JSP_API_TOKEN`):
+Candidate profile (everything the app knows about this user)
+============================================================
 
-  GET  $JSP_API_BASE_URL/api/v1/auth/me                       (login identity: email, display_name)
-  GET  $JSP_API_BASE_URL/api/v1/preferences/demographics      (preferred_name, legal names, pronouns)
-  GET  $JSP_API_BASE_URL/api/v1/preferences/authorization     (current_location_city, current_location_region)
-  GET  $JSP_API_BASE_URL/api/v1/history/work
-  GET  $JSP_API_BASE_URL/api/v1/history/education
-  GET  $JSP_API_BASE_URL/api/v1/history/skills
-  GET  $JSP_API_BASE_URL/api/v1/history/projects
-  GET  $JSP_API_BASE_URL/api/v1/history/certifications
-  GET  $JSP_API_BASE_URL/api/v1/history/publications
-  GET  $JSP_API_BASE_URL/api/v1/history/achievements
+{candidate_profile}
 
-Fetch in parallel with curl, e.g.:
-
-  curl -sS -H "Authorization: Bearer $JSP_API_TOKEN" \\
-       "$JSP_API_BASE_URL/api/v1/history/work"
+============================================================
+End of candidate profile.
 
 Target job
 ----------
@@ -445,18 +450,17 @@ Return ONE JSON object, no prose, no markdown fences around the JSON:
 
 
 _TAILOR_COVER_LETTER_PROMPT = """You are writing a polished, human-sounding
-cover letter for a specific job. The user's full history is behind the same
-API — pull what you need before writing.
+cover letter for a specific job. The candidate's full, pre-fetched profile
+is embedded below — use it as your sole source of truth. Do NOT invent
+anything and do NOT make API calls unless something critical is missing.
 
-Environment: $JSP_API_BASE_URL and $JSP_API_TOKEN (bearer). Endpoints:
+Candidate profile (everything the app knows about this user)
+============================================================
 
-  GET  $JSP_API_BASE_URL/api/v1/auth/me                    (email, display_name)
-  GET  $JSP_API_BASE_URL/api/v1/preferences/demographics   (preferred_name, legal names)
-  GET  $JSP_API_BASE_URL/api/v1/preferences/authorization  (current_location_city, _region)
-  GET  $JSP_API_BASE_URL/api/v1/history/work
-  GET  $JSP_API_BASE_URL/api/v1/history/skills
-  GET  $JSP_API_BASE_URL/api/v1/history/projects
-  GET  $JSP_API_BASE_URL/api/v1/history/achievements
+{candidate_profile}
+
+============================================================
+End of candidate profile.
 
 Target job
 ----------
@@ -546,13 +550,15 @@ Return ONE JSON object, no prose and no markdown fences:
 
 
 _TAILOR_EMAIL_PROMPT = """You are drafting a short professional email for a
-specific job context. The user's full history is behind the same API — pull
-what you need.
+specific job context. The candidate's full, pre-fetched profile is embedded
+below — use it as the source of truth.
 
-Environment: $JSP_API_BASE_URL and $JSP_API_TOKEN (bearer). Useful endpoints:
+Candidate profile
+=================
 
-  GET  $JSP_API_BASE_URL/api/v1/history/work
-  GET  $JSP_API_BASE_URL/api/v1/history/skills
+{candidate_profile}
+
+=================
 
 Email purpose for THIS run: {purpose_label}
 
@@ -593,15 +599,15 @@ Return ONE JSON object, no prose and no markdown fences:
 
 
 _TAILOR_GENERIC_PROMPT = """You are drafting a document of type `{doc_type}` for
-a specific job context. The user's full history is behind the same API — pull
-what you need.
+a specific job context. The candidate's full, pre-fetched profile is embedded
+below — use it as the source of truth.
 
-Environment: $JSP_API_BASE_URL and $JSP_API_TOKEN (bearer). Useful endpoints:
+Candidate profile
+=================
 
-  GET  $JSP_API_BASE_URL/api/v1/history/work
-  GET  $JSP_API_BASE_URL/api/v1/history/skills
-  GET  $JSP_API_BASE_URL/api/v1/history/projects
-  GET  $JSP_API_BASE_URL/api/v1/history/achievements
+{candidate_profile}
+
+=================
 
 Target job
 ----------
@@ -660,6 +666,461 @@ def _prompt_for_doc_type(doc_type: str) -> tuple[str, dict]:
     return _TAILOR_GENERIC_PROMPT, {"doc_type": doc_type}
 
 
+# ----------------------------------------------------------------------------
+# Candidate profile assembler
+#
+# Builds a single, readable text block the tailor prompt injects so Claude has
+# everything it needs at hand — no per-endpoint curl calls required. The block
+# is ordered by resume-relevance (identity → summary → skills → experience →
+# education → projects → certs/pubs/ach → languages → volunteer). Every
+# section is optional; missing data is simply omitted.
+# ----------------------------------------------------------------------------
+
+
+def _fmt_date(d: Optional[Any]) -> Optional[str]:
+    if not d:
+        return None
+    try:
+        return d.strftime("%b %Y")
+    except Exception:
+        return str(d)
+
+
+def _fmt_date_range(
+    start: Optional[Any], end: Optional[Any], *, ongoing_label: str = "Present"
+) -> Optional[str]:
+    s = _fmt_date(start)
+    e = _fmt_date(end) or (ongoing_label if start else None)
+    if s and e:
+        return f"{s} – {e}"
+    return s or e
+
+
+def _fmt_list(items: Optional[list]) -> Optional[str]:
+    if not items:
+        return None
+    return ", ".join(str(x) for x in items if str(x).strip())
+
+
+async def _build_candidate_profile_block(
+    db: AsyncSession, user: User
+) -> str:
+    """Assemble a Markdown block covering every stored entity that could
+    plausibly appear on a tailored resume or cover letter.
+    """
+
+    # --- 1. Identity & contact ---------------------------------------------
+    rp = (
+        await db.execute(
+            select(ResumeProfile).where(
+                ResumeProfile.user_id == user.id,
+                ResumeProfile.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    demo = (
+        await db.execute(
+            select(Demographics).where(
+                Demographics.user_id == user.id,
+                Demographics.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    wa = (
+        await db.execute(
+            select(WorkAuthorization).where(
+                WorkAuthorization.user_id == user.id,
+                WorkAuthorization.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+
+    # Resolve the canonical display name:
+    #   resume_profile.full_name > preferred_name > legal_first + legal_last
+    #   > display_name > email local-part
+    name = None
+    if rp and rp.full_name:
+        name = rp.full_name.strip()
+    elif demo and demo.preferred_name:
+        name = demo.preferred_name.strip()
+        if demo.legal_last_name:
+            name = f"{name} {demo.legal_last_name.strip()}"
+    elif demo and (demo.legal_first_name or demo.legal_last_name):
+        parts = [demo.legal_first_name, demo.legal_middle_name, demo.legal_last_name]
+        name = " ".join(p.strip() for p in parts if p and p.strip())
+    elif user.display_name:
+        name = user.display_name.strip()
+
+    email = (rp.email if rp and rp.email else user.email) or None
+    phone = rp.phone if rp and rp.phone else None
+    location = None
+    if rp and rp.location:
+        location = rp.location.strip()
+    elif wa and (wa.current_location_city or wa.current_location_region):
+        loc_parts = [wa.current_location_city, wa.current_location_region]
+        location = ", ".join(p.strip() for p in loc_parts if p and p.strip()) or None
+
+    links: list[tuple[str, str]] = []
+    if rp:
+        if rp.linkedin_url: links.append(("LinkedIn", rp.linkedin_url))
+        if rp.github_url: links.append(("GitHub", rp.github_url))
+        if rp.portfolio_url: links.append(("Portfolio", rp.portfolio_url))
+        if rp.website_url: links.append(("Website", rp.website_url))
+        for extra in (rp.other_links or []):
+            if isinstance(extra, dict) and extra.get("label") and extra.get("url"):
+                links.append((str(extra["label"]), str(extra["url"])))
+
+    out: list[str] = []
+    out.append("## Identity & contact")
+    out.append(f"- Full name: {name or '(not set)'}")
+    if rp and rp.headline:
+        out.append(f"- Headline / title: {rp.headline}")
+    out.append(f"- Email: {email or '(not set)'}")
+    if phone: out.append(f"- Phone: {phone}")
+    if location: out.append(f"- Location: {location}")
+    for label, url in links:
+        out.append(f"- {label}: {url}")
+    if demo and demo.preferred_name:
+        out.append(f"- Preferred name (for salutation): {demo.preferred_name}")
+    if rp and rp.professional_summary:
+        out.append("")
+        out.append("### User-authored default summary (use as a seed; rephrase for this JD)")
+        out.append(rp.professional_summary.strip())
+
+    # --- 2. Skills (pulled first, both as a catalog and to annotate jobs) ---
+    skills_rows = (
+        await db.execute(
+            select(Skill).where(
+                Skill.user_id == user.id,
+                Skill.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    skill_by_id = {s.id: s for s in skills_rows}
+
+    if skills_rows:
+        by_cat: dict[str, list[Skill]] = {}
+        for s in skills_rows:
+            by_cat.setdefault(s.category or "general", []).append(s)
+        out.append("")
+        out.append("## Skills catalog")
+        out.append(
+            "(Every skill the user has on file. Only include the ones actually "
+            "relevant to this JD in the final resume — this list is your source of truth.)"
+        )
+        for cat in sorted(by_cat.keys()):
+            out.append(f"### {cat}")
+            for s in sorted(by_cat[cat], key=lambda x: x.name.lower()):
+                bits = [s.name]
+                if s.proficiency:
+                    bits.append(f"proficiency: {s.proficiency}")
+                if s.years_experience is not None:
+                    bits.append(f"{float(s.years_experience):g} yrs")
+                last = _fmt_date(s.last_used_date)
+                if last:
+                    bits.append(f"last used {last}")
+                aliases = s.aliases or []
+                if aliases:
+                    bits.append("aka " + ", ".join(str(a) for a in aliases))
+                out.append(f"- {' · '.join(bits)}")
+
+    # --- 3. Work experience + linked skills --------------------------------
+    work_rows = (
+        await db.execute(
+            select(WorkExperience).where(
+                WorkExperience.user_id == user.id,
+                WorkExperience.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    work_rows.sort(
+        key=lambda w: (w.end_date or w.start_date or __import__("datetime").date.min),
+        reverse=True,
+    )
+
+    work_skill_rows = (
+        await db.execute(
+            select(WorkExperienceSkill).where(
+                WorkExperienceSkill.work_experience_id.in_(
+                    [w.id for w in work_rows] or [0]
+                )
+            )
+        )
+    ).scalars().all()
+    skills_by_work: dict[int, list[tuple[str, Optional[str]]]] = {}
+    for link in work_skill_rows:
+        s = skill_by_id.get(link.skill_id)
+        if not s:
+            continue
+        skills_by_work.setdefault(link.work_experience_id, []).append(
+            (s.name, link.usage_notes)
+        )
+
+    org_ids: set[int] = set()
+    for w in work_rows:
+        if w.organization_id: org_ids.add(w.organization_id)
+
+    # --- 4. Education ------------------------------------------------------
+    edu_rows = (
+        await db.execute(
+            select(Education).where(
+                Education.user_id == user.id,
+                Education.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    edu_rows.sort(
+        key=lambda e: (e.end_date or e.start_date or __import__("datetime").date.min),
+        reverse=True,
+    )
+    for e in edu_rows:
+        if e.organization_id: org_ids.add(e.organization_id)
+
+    # --- 5. Fetch all referenced orgs in one query -------------------------
+    org_by_id: dict[int, Organization] = {}
+    if org_ids:
+        rows = (
+            await db.execute(
+                select(Organization).where(Organization.id.in_(org_ids))
+            )
+        ).scalars().all()
+        org_by_id = {o.id: o for o in rows}
+
+    def _org_name(oid: Optional[int]) -> Optional[str]:
+        if not oid: return None
+        o = org_by_id.get(oid)
+        return o.name if o else None
+
+    if work_rows:
+        out.append("")
+        out.append("## Work experience (most recent first)")
+        for w in work_rows:
+            header = w.title or "(untitled role)"
+            org = _org_name(w.organization_id)
+            if org: header += f" — {org}"
+            out.append(f"### {header}")
+            meta_bits = []
+            rng = _fmt_date_range(w.start_date, w.end_date)
+            if rng: meta_bits.append(rng)
+            if w.location: meta_bits.append(w.location)
+            if w.employment_type: meta_bits.append(w.employment_type)
+            if w.remote_policy: meta_bits.append(w.remote_policy)
+            if w.team_size: meta_bits.append(f"team of {w.team_size}")
+            if meta_bits:
+                out.append("*" + " · ".join(meta_bits) + "*")
+            if w.summary:
+                out.append(w.summary.strip())
+            if w.highlights:
+                out.append("Highlights:")
+                for h in w.highlights:
+                    out.append(f"- {h}")
+            tech = _fmt_list(w.technologies_used)
+            if tech: out.append(f"Technologies used: {tech}")
+            linked = skills_by_work.get(w.id) or []
+            if linked:
+                parts = []
+                for sname, notes in linked:
+                    parts.append(f"{sname}" + (f" ({notes})" if notes else ""))
+                out.append(f"Linked skills: {', '.join(parts)}")
+            if w.manager_name:
+                out.append(f"Manager: {w.manager_name}")
+
+    # --- 6. Education body -------------------------------------------------
+    if edu_rows:
+        out.append("")
+        out.append("## Education (most recent first)")
+        for e in edu_rows:
+            degree = e.degree or "(degree)"
+            field = e.field_of_study
+            header = degree
+            if field: header += f", {field}"
+            org = _org_name(e.organization_id)
+            if org: header += f" — {org}"
+            out.append(f"### {header}")
+            meta_bits = []
+            rng = _fmt_date_range(e.start_date, e.end_date, ongoing_label="Expected")
+            if rng: meta_bits.append(rng)
+            if e.concentration: meta_bits.append(f"concentration: {e.concentration}")
+            if e.minor: meta_bits.append(f"minor: {e.minor}")
+            if e.gpa is not None: meta_bits.append(f"GPA {float(e.gpa):.2f}")
+            if meta_bits:
+                out.append("*" + " · ".join(meta_bits) + "*")
+            honors = _fmt_list(e.honors)
+            if honors: out.append(f"Honors: {honors}")
+            if e.thesis_title:
+                out.append(f"Thesis: {e.thesis_title}")
+            if e.notes:
+                out.append(e.notes.strip())
+
+    # --- 7. Projects -------------------------------------------------------
+    projects = (
+        await db.execute(
+            select(Project).where(
+                Project.user_id == user.id,
+                Project.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    projects.sort(
+        key=lambda p: (p.end_date or p.start_date or __import__("datetime").date.min),
+        reverse=True,
+    )
+    if projects:
+        out.append("")
+        out.append("## Projects")
+        for p in projects:
+            header = p.name
+            if p.role: header += f" — {p.role}"
+            out.append(f"### {header}")
+            meta_bits = []
+            rng = _fmt_date_range(p.start_date, p.end_date)
+            if rng: meta_bits.append(rng)
+            elif p.is_ongoing: meta_bits.append("ongoing")
+            if p.url: meta_bits.append(p.url)
+            if p.repo_url: meta_bits.append(p.repo_url)
+            if meta_bits:
+                out.append("*" + " · ".join(meta_bits) + "*")
+            if p.summary: out.append(p.summary.strip())
+            if p.highlights:
+                for h in p.highlights:
+                    out.append(f"- {h}")
+            tech = _fmt_list(p.technologies_used)
+            if tech: out.append(f"Technologies: {tech}")
+
+    # --- 8. Certifications -------------------------------------------------
+    certs = (
+        await db.execute(
+            select(Certification).where(
+                Certification.user_id == user.id,
+                Certification.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    certs.sort(
+        key=lambda c: (c.issued_date or __import__("datetime").date.min), reverse=True
+    )
+    if certs:
+        out.append("")
+        out.append("## Certifications")
+        for c in certs:
+            line = c.name
+            if c.issuer: line += f" — {c.issuer}"
+            issued = _fmt_date(c.issued_date)
+            if issued: line += f" · issued {issued}"
+            expires = _fmt_date(c.expires_date)
+            if expires: line += f" · expires {expires}"
+            if c.credential_url: line += f" · {c.credential_url}"
+            out.append(f"- {line}")
+
+    # --- 9. Publications ---------------------------------------------------
+    pubs = (
+        await db.execute(
+            select(Publication).where(
+                Publication.user_id == user.id,
+                Publication.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    pubs.sort(
+        key=lambda p: (p.publication_date or __import__("datetime").date.min),
+        reverse=True,
+    )
+    if pubs:
+        out.append("")
+        out.append("## Publications")
+        for p in pubs:
+            line = p.title
+            if p.venue: line += f" — {p.venue}"
+            d = _fmt_date(p.publication_date)
+            if d: line += f" · {d}"
+            if p.url: line += f" · {p.url}"
+            out.append(f"- {line}")
+
+    # --- 10. Achievements --------------------------------------------------
+    achs = (
+        await db.execute(
+            select(Achievement).where(
+                Achievement.user_id == user.id,
+                Achievement.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    achs.sort(
+        key=lambda a: (a.date_awarded or __import__("datetime").date.min), reverse=True
+    )
+    if achs:
+        out.append("")
+        out.append("## Achievements")
+        for a in achs:
+            line = a.title
+            if a.issuer: line += f" — {a.issuer}"
+            d = _fmt_date(a.date_awarded)
+            if d: line += f" · {d}"
+            out.append(f"- {line}")
+            if a.description:
+                out.append(f"  {a.description.strip()}")
+
+    # --- 11. Languages -----------------------------------------------------
+    langs = (
+        await db.execute(
+            select(Language).where(
+                Language.user_id == user.id,
+                Language.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    if langs:
+        out.append("")
+        out.append("## Languages")
+        for lg in langs:
+            line = lg.name
+            if lg.proficiency: line += f" ({lg.proficiency})"
+            out.append(f"- {line}")
+
+    # --- 12. Volunteer work ------------------------------------------------
+    vols = (
+        await db.execute(
+            select(VolunteerWork).where(
+                VolunteerWork.user_id == user.id,
+                VolunteerWork.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    vols.sort(
+        key=lambda v: (v.end_date or v.start_date or __import__("datetime").date.min),
+        reverse=True,
+    )
+    if vols:
+        out.append("")
+        out.append("## Volunteer")
+        for v in vols:
+            header = v.organization
+            if v.role: header += f" — {v.role}"
+            out.append(f"### {header}")
+            meta_bits = []
+            rng = _fmt_date_range(v.start_date, v.end_date)
+            if rng: meta_bits.append(rng)
+            if v.cause_area: meta_bits.append(v.cause_area)
+            if v.hours_total: meta_bits.append(f"{v.hours_total}h total")
+            if meta_bits:
+                out.append("*" + " · ".join(meta_bits) + "*")
+            if v.summary: out.append(v.summary.strip())
+            if v.highlights:
+                for h in v.highlights:
+                    out.append(f"- {h}")
+
+    if len(out) <= 6:
+        # Only identity was populated — everything else is empty. Flag it so
+        # Claude knows to set a `warning` rather than fabricate.
+        out.append("")
+        out.append(
+            "_(No history entries on file yet — user must populate work, education, "
+            "or skills before a credible resume can be produced.)_"
+        )
+
+    return "\n".join(out)
+
+
 async def _run_tailor(
     *,
     db: AsyncSession,
@@ -680,7 +1141,6 @@ async def _run_tailor(
 
     org_name = None
     if job.organization_id:
-        from app.models.jobs import Organization
         org_row = (
             await db.execute(
                 select(Organization.name).where(Organization.id == job.organization_id)
@@ -691,6 +1151,8 @@ async def _run_tailor(
     jd_analysis_blob = (
         json.dumps(job.jd_analysis, indent=2) if job.jd_analysis else "(no analysis yet)"
     )
+
+    candidate_profile = await _build_candidate_profile_block(db, user)
 
     # User-supplied values may contain literal `{` / `}` (code blocks,
     # `{foo}` template placeholders, JSON examples inside the JD, etc.).
@@ -709,6 +1171,7 @@ async def _run_tailor(
         "nice_to_have_skills": _esc(", ".join(job.nice_to_have_skills or []) or "(none)"),
         "jd_analysis_blob": _esc(jd_analysis_blob),
         "extra_notes": _esc(extra_notes or "(none)"),
+        "candidate_profile": _esc(candidate_profile),
     }
     if extra_format_args:
         for k, v in extra_format_args.items():

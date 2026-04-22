@@ -24,6 +24,7 @@ from app.models.preferences import (
     DemographicSharePolicy,
     JobCriterion,
     JobPreferences,
+    ResumeProfile,
     WorkAuthorization,
 )
 from app.models.jobs import (
@@ -64,6 +65,7 @@ __all__ = [
     "WorkAuthorization",
     "Demographics",
     "DemographicSharePolicy",
+    "ResumeProfile",
     "Organization",
     "TrackedJob",
     "ApplicationEvent",

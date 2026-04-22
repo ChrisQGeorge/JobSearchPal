@@ -4,9 +4,10 @@ import { useEffect, useRef, useState } from "react";
 import { PageShell } from "@/components/PageShell";
 import { api, ApiError } from "@/lib/api";
 
-type Tab = "job" | "auth" | "criteria" | "demographics";
+type Tab = "resume" | "job" | "auth" | "criteria" | "demographics";
 
 const TABS: { key: Tab; label: string }[] = [
+  { key: "resume", label: "Resume Profile" },
   { key: "job", label: "Job Preferences" },
   { key: "auth", label: "Work Authorization" },
   { key: "criteria", label: "Criteria List" },
@@ -14,11 +15,11 @@ const TABS: { key: Tab; label: string }[] = [
 ];
 
 export default function PreferencesPage() {
-  const [tab, setTab] = useState<Tab>("job");
+  const [tab, setTab] = useState<Tab>("resume");
   return (
     <PageShell
       title="Preferences & Identity"
-      subtitle="What you want in a job, what you're authorized to do, and voluntary self-identification."
+      subtitle="What appears on your documents, what you want in a job, what you're authorized to do, and voluntary self-identification."
     >
       <div className="flex gap-2 mb-4 border-b border-corp-border">
         {TABS.map((t) => (
@@ -35,6 +36,7 @@ export default function PreferencesPage() {
           </button>
         ))}
       </div>
+      {tab === "resume" && <ResumeProfilePanel />}
       {tab === "job" && <JobPreferencesPanel />}
       {tab === "auth" && <WorkAuthorizationPanel />}
       {tab === "criteria" && <CriteriaPanel />}
@@ -143,6 +145,288 @@ function SaveBar({
       >
         {saving ? "Saving..." : dirty ? "Save" : "Saved"}
       </button>
+    </div>
+  );
+}
+
+// ---------- Resume Profile --------------------------------------------------
+
+type ResumeLink = { label: string; url: string };
+
+type ResumeProfile = {
+  id?: number;
+  full_name?: string | null;
+  headline?: string | null;
+  email?: string | null;
+  phone?: string | null;
+  location?: string | null;
+  linkedin_url?: string | null;
+  github_url?: string | null;
+  portfolio_url?: string | null;
+  website_url?: string | null;
+  other_links?: ResumeLink[] | null;
+  professional_summary?: string | null;
+};
+
+function ResumeProfilePanel() {
+  const [data, setData] = useState<ResumeProfile | null>(null);
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    api
+      .get<ResumeProfile | null>("/api/v1/preferences/resume-profile")
+      .then((d) => {
+        setData(d ?? {});
+        setLoaded(true);
+      })
+      .catch((e) => {
+        setErr(e instanceof ApiError ? `HTTP ${e.status}` : "Load failed.");
+        setLoaded(true);
+      });
+  }, []);
+
+  function set<K extends keyof ResumeProfile>(k: K, v: ResumeProfile[K]) {
+    setData((prev) => (prev ? { ...prev, [k]: v } : prev));
+    setDirty(true);
+    setMsg(null);
+  }
+
+  function setLink(idx: number, field: keyof ResumeLink, value: string) {
+    setData((prev) => {
+      if (!prev) return prev;
+      const list = [...(prev.other_links ?? [])];
+      list[idx] = { ...list[idx], [field]: value };
+      return { ...prev, other_links: list };
+    });
+    setDirty(true);
+    setMsg(null);
+  }
+
+  function addLink() {
+    setData((prev) =>
+      prev
+        ? {
+            ...prev,
+            other_links: [...(prev.other_links ?? []), { label: "", url: "" }],
+          }
+        : prev,
+    );
+    setDirty(true);
+    setMsg(null);
+  }
+
+  function removeLink(idx: number) {
+    setData((prev) => {
+      if (!prev) return prev;
+      const list = [...(prev.other_links ?? [])];
+      list.splice(idx, 1);
+      return { ...prev, other_links: list };
+    });
+    setDirty(true);
+    setMsg(null);
+  }
+
+  async function save() {
+    if (!data) return;
+    setSaving(true);
+    setErr(null);
+    try {
+      const body: ResumeProfile = { ...data };
+      delete body.id;
+      // Drop empty link rows so we don't spam invalid entries.
+      body.other_links = (body.other_links ?? []).filter(
+        (l) => (l.label || "").trim() && (l.url || "").trim(),
+      );
+      if (body.other_links.length === 0) body.other_links = null;
+      const out = await api.put<ResumeProfile>(
+        "/api/v1/preferences/resume-profile",
+        body,
+      );
+      setData(out);
+      setDirty(false);
+      setMsg("Saved.");
+      setTimeout(() => setMsg(null), 2500);
+    } catch (e) {
+      setErr(e instanceof ApiError ? `Save failed (HTTP ${e.status}).` : "Save failed.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (!loaded || !data) {
+    return <p className="text-sm text-corp-muted">Loading...</p>;
+  }
+
+  const links = data.other_links ?? [];
+
+  return (
+    <div className="jsp-card p-5 space-y-5">
+      <p className="text-[11px] text-corp-muted bg-corp-surface2 p-2 rounded border border-corp-border">
+        This is what ends up at the top of your tailored resumes, cover
+        letters, and outreach emails. Leave anything blank to omit it — the
+        Companion won&apos;t invent a value.
+      </p>
+
+      <section className="grid grid-cols-2 gap-3">
+        <div>
+          <label className="jsp-label">Full name (as it should appear)</label>
+          <input
+            className="jsp-input"
+            value={data.full_name ?? ""}
+            onChange={(e) => set("full_name", e.target.value || null)}
+            placeholder="Alex Morgan"
+          />
+        </div>
+        <div>
+          <label className="jsp-label">Headline / title (optional)</label>
+          <input
+            className="jsp-input"
+            value={data.headline ?? ""}
+            onChange={(e) => set("headline", e.target.value || null)}
+            placeholder="Senior Platform Engineer"
+          />
+        </div>
+        <div>
+          <label className="jsp-label">Email</label>
+          <input
+            type="email"
+            className="jsp-input"
+            value={data.email ?? ""}
+            onChange={(e) => set("email", e.target.value || null)}
+            placeholder="you@example.com"
+          />
+        </div>
+        <div>
+          <label className="jsp-label">Phone</label>
+          <input
+            className="jsp-input"
+            value={data.phone ?? ""}
+            onChange={(e) => set("phone", e.target.value || null)}
+            placeholder="+1 555 123 4567"
+          />
+        </div>
+        <div className="col-span-2">
+          <label className="jsp-label">Location (city, region)</label>
+          <input
+            className="jsp-input"
+            value={data.location ?? ""}
+            onChange={(e) => set("location", e.target.value || null)}
+            placeholder="Seattle, WA"
+          />
+        </div>
+      </section>
+
+      <section>
+        <h3 className="text-sm uppercase tracking-wider text-corp-muted mb-2">
+          Profiles & links
+        </h3>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="jsp-label">LinkedIn URL</label>
+            <input
+              className="jsp-input"
+              value={data.linkedin_url ?? ""}
+              onChange={(e) => set("linkedin_url", e.target.value || null)}
+              placeholder="https://linkedin.com/in/..."
+            />
+          </div>
+          <div>
+            <label className="jsp-label">GitHub URL</label>
+            <input
+              className="jsp-input"
+              value={data.github_url ?? ""}
+              onChange={(e) => set("github_url", e.target.value || null)}
+              placeholder="https://github.com/..."
+            />
+          </div>
+          <div>
+            <label className="jsp-label">Portfolio / personal site</label>
+            <input
+              className="jsp-input"
+              value={data.portfolio_url ?? ""}
+              onChange={(e) => set("portfolio_url", e.target.value || null)}
+              placeholder="https://alexmorgan.dev"
+            />
+          </div>
+          <div>
+            <label className="jsp-label">Other website</label>
+            <input
+              className="jsp-input"
+              value={data.website_url ?? ""}
+              onChange={(e) => set("website_url", e.target.value || null)}
+              placeholder="https://..."
+            />
+          </div>
+        </div>
+
+        <div className="mt-4">
+          <div className="flex items-center justify-between mb-1">
+            <label className="jsp-label mb-0">Additional links</label>
+            <button
+              type="button"
+              className="jsp-btn-ghost text-xs"
+              onClick={addLink}
+            >
+              + Add link
+            </button>
+          </div>
+          {links.length === 0 ? (
+            <p className="text-xs text-corp-muted">
+              Stack Overflow, Google Scholar, speaker reel, blog, etc.
+            </p>
+          ) : (
+            <div className="space-y-2">
+              {links.map((l, i) => (
+                <div key={i} className="grid grid-cols-[180px,1fr,auto] gap-2">
+                  <input
+                    className="jsp-input"
+                    value={l.label}
+                    onChange={(e) => setLink(i, "label", e.target.value)}
+                    placeholder="Label (e.g. Blog)"
+                  />
+                  <input
+                    className="jsp-input"
+                    value={l.url}
+                    onChange={(e) => setLink(i, "url", e.target.value)}
+                    placeholder="https://..."
+                  />
+                  <button
+                    type="button"
+                    className="jsp-btn-ghost text-xs"
+                    onClick={() => removeLink(i)}
+                  >
+                    Remove
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </section>
+
+      <section>
+        <h3 className="text-sm uppercase tracking-wider text-corp-muted mb-2">
+          Default professional summary (optional)
+        </h3>
+        <p className="text-xs text-corp-muted mb-1">
+          A reusable 2–4 sentence summary. The Companion will rephrase it to
+          fit each specific JD, but this gives it a seed to work from.
+        </p>
+        <textarea
+          className="jsp-input min-h-[120px]"
+          value={data.professional_summary ?? ""}
+          onChange={(e) =>
+            set("professional_summary", e.target.value || null)
+          }
+          placeholder="Senior software engineer with 10 years shipping high-reliability backend systems…"
+        />
+      </section>
+
+      <SaveBar dirty={dirty} saving={saving} err={err} msg={msg} onSave={save} />
     </div>
   );
 }

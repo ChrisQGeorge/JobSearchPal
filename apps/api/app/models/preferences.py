@@ -148,6 +148,36 @@ class Demographics(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     first_generation_college_student: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
 
 
+class ResumeProfile(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
+    """Contact/header info the user wants on generated resumes, cover letters,
+    and other tailored documents. Kept separate from the login User row
+    (which holds display_name + email) and from Demographics (voluntary
+    self-id) so that document personas can be edited independently.
+    """
+
+    __tablename__ = "resume_profile"
+    __table_args__ = (UniqueConstraint("user_id", name="uq_resume_profile_user"),)
+
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    full_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    headline: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    phone: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    location: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    linkedin_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    github_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    portfolio_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    website_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    # Free-form list of { "label": str, "url": str } for anything else
+    # (Stack Overflow, Medium, personal blog, speaker reel, etc.).
+    other_links: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    # Optional reusable summary paragraph. Tailor prompts will rephrase per
+    # job, but this gives them a seed to work from if the user prefers.
+    professional_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
 class DemographicSharePolicy(Base, IdMixin, TimestampMixin):
     __tablename__ = "demographic_share_policies"
     __table_args__ = (
