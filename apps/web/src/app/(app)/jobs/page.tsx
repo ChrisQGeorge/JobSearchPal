@@ -828,23 +828,35 @@ function ScoreAllButton({ onDone }: { onDone: () => void }) {
         analyzed: number;
         skipped_no_description: number;
         skipped_already_scored: number;
+        rate_limited?: boolean;
+        rate_limit_message?: string | null;
+        remaining_unprocessed?: number;
         errors: { job_id: number; error: string }[];
       }>("/api/v1/jobs/batch-analyze-jd");
-      setMsg(
-        `Analyzed ${r.analyzed}${
-          r.skipped_already_scored ? ` · ${r.skipped_already_scored} already scored` : ""
-        }${r.skipped_no_description ? ` · ${r.skipped_no_description} no JD` : ""}${
-          r.errors.length ? ` · ${r.errors.length} errors` : ""
-        }`,
-      );
+      let msg = `Analyzed ${r.analyzed}`;
+      if (r.rate_limited) {
+        msg = `Rate-limited after ${r.analyzed}. ${r.remaining_unprocessed ?? 0} left — rerun Score all when your tokens refresh.`;
+      } else {
+        if (r.skipped_already_scored)
+          msg += ` · ${r.skipped_already_scored} already scored`;
+        if (r.skipped_no_description)
+          msg += ` · ${r.skipped_no_description} no JD`;
+        if (r.errors.length) msg += ` · ${r.errors.length} errors`;
+      }
+      setMsg(msg);
       onDone();
     } catch (e) {
       setMsg(
-        e instanceof ApiError ? `Batch failed (HTTP ${e.status}).` : "Batch failed.",
+        e instanceof ApiError
+          ? e.status === 429
+            ? "Rate-limited — try again when your tokens refresh."
+            : `Batch failed (HTTP ${e.status}).`
+          : "Batch failed.",
       );
     } finally {
       setRunning(false);
-      setTimeout(() => setMsg(null), 5000);
+      // Keep rate-limit messages visible longer — they're actionable.
+      setTimeout(() => setMsg(null), 12000);
     }
   }
 

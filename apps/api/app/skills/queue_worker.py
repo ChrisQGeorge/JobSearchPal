@@ -19,9 +19,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import SessionLocal
@@ -32,6 +33,54 @@ log = logging.getLogger(__name__)
 POLL_INTERVAL_SECONDS = 5
 STUCK_RESET_MINUTES = 20
 MAX_ATTEMPTS = 3
+
+# Substrings that indicate the CLI hit an Anthropic rate-limit / usage-cap
+# rather than a regular failure. We treat these as "try again later" and
+# don't burn retry attempts on them.
+_RATE_LIMIT_PATTERNS = (
+    "usage limit",
+    "usage_limit_error",
+    "rate limit",
+    "rate_limit_error",
+    "rate-limit",
+    "too many requests",
+    "overloaded_error",
+    "overloaded",
+    " 429",
+    "retry after",
+    "quota exceeded",
+    "limit reached",
+)
+
+# Cooldown schedule for repeated rate-limit hits on a single row. Starts at
+# 10 minutes and doubles per consecutive hit, capped at 2 hours. Resets once
+# the row successfully processes.
+_COOLDOWN_MINUTES = (10, 20, 40, 80, 120)
+
+
+def _is_rate_limited(msg: str) -> bool:
+    low = (msg or "").lower()
+    return any(pat in low for pat in _RATE_LIMIT_PATTERNS)
+
+
+def _rate_limit_retry_seconds(msg: str) -> int | None:
+    """Extract an explicit retry-after delay if the error message carries
+    one (seconds or minutes). Used to respect server-suggested backoffs
+    instead of our default cooldown schedule."""
+    if not msg:
+        return None
+    low = msg.lower()
+    # "retry after 600 seconds" / "try again in 15 minutes"
+    m = re.search(r"(\d{1,6})\s*(seconds?|secs?|s)\b", low)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(\d{1,4})\s*(minutes?|mins?|m)\b", low)
+    if m:
+        return int(m.group(1)) * 60
+    m = re.search(r"(\d{1,3})\s*(hours?|hrs?|h)\b", low)
+    if m:
+        return int(m.group(1)) * 3600
+    return None
 
 
 async def _reset_stuck_rows() -> None:
@@ -58,10 +107,21 @@ async def _reset_stuck_rows() -> None:
 
 
 async def _claim_next(db: AsyncSession) -> JobFetchQueue | None:
-    """Pick the oldest queued row and mark it processing atomically."""
+    """Pick the oldest queued row and mark it processing atomically.
+
+    Rows with a future `resume_after` are skipped — that's our rate-limit
+    cooldown. They get picked up automatically once the timestamp passes.
+    """
+    now = datetime.now(tz=timezone.utc)
     stmt = (
         select(JobFetchQueue)
-        .where(JobFetchQueue.state == "queued")
+        .where(
+            JobFetchQueue.state == "queued",
+            or_(
+                JobFetchQueue.resume_after.is_(None),
+                JobFetchQueue.resume_after <= now,
+            ),
+        )
         .order_by(JobFetchQueue.id.asc())
         .limit(1)
     )
@@ -99,10 +159,41 @@ async def _process(item: JobFetchQueue) -> None:
         try:
             fetched = await perform_fetch(db, row.url)
         except ClaudeCodeError as exc:
+            err = str(exc)
+            if _is_rate_limited(err):
+                # Don't burn an attempt on rate limits — back off and retry.
+                # Prefer the server-provided retry-after if one was surfaced,
+                # otherwise step through our cooldown schedule.
+                hinted = _rate_limit_retry_seconds(err)
+                if hinted and hinted > 0:
+                    cooldown_s = min(hinted + 30, 3 * 3600)  # +30s safety, cap 3h
+                else:
+                    # Count cooldowns separately from attempts. We piggyback on
+                    # last_attempt_at not incrementing attempts to track this:
+                    # actually just compute from how many times resume_after
+                    # has been set by counting past cooldowns encoded in error.
+                    idx = min(row.attempts, len(_COOLDOWN_MINUTES) - 1)
+                    cooldown_s = _COOLDOWN_MINUTES[idx] * 60
+                resume_at = datetime.now(tz=timezone.utc) + timedelta(seconds=cooldown_s)
+                # Undo the attempt increment we applied on claim — rate limits
+                # aren't the row's fault.
+                row.attempts = max(0, (row.attempts or 0) - 1)
+                row.state = "queued"
+                row.resume_after = resume_at
+                row.error_message = (
+                    f"Rate-limited — resuming at {resume_at.isoformat(timespec='minutes')}. "
+                    f"({err.strip().splitlines()[0][:160]})"
+                )
+                await db.commit()
+                log.info(
+                    "Queue item %d rate-limited; cooldown %ds, resume_after=%s",
+                    row.id, cooldown_s, resume_at.isoformat(),
+                )
+                return
             row.state = (
                 "error" if row.attempts >= MAX_ATTEMPTS else "queued"
             )
-            row.error_message = str(exc)
+            row.error_message = err
             await db.commit()
             log.warning(
                 "Queue item %d failed (attempt %d): %s", row.id, row.attempts, exc

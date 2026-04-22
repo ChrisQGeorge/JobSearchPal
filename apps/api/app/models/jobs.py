@@ -158,6 +158,12 @@ class JobFetchQueue(Base, IdMixin, TimestampMixin):
         DateTime(timezone=True), nullable=True
     )
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # When set, the worker won't claim this row until the given time. Used
+    # for rate-limit / usage-quota cooldowns so a queue full of URLs backs
+    # off and resumes automatically once tokens refresh.
+    resume_after: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_tracked_job_id: Mapped[Optional[int]] = mapped_column(
         BigInteger, ForeignKey("tracked_jobs.id", ondelete="SET NULL"), nullable=True
     )

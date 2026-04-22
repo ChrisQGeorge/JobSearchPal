@@ -213,6 +213,7 @@ class JobFetchQueueOut(JobFetchQueueIn):
     attempts: int
     last_attempt_at: Optional[datetime] = None
     error_message: Optional[str] = None
+    resume_after: Optional[datetime] = None
     created_tracked_job_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime

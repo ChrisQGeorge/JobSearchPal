@@ -300,11 +300,13 @@ export type JobFetchQueueItem = {
   desired_priority: Priority | null;
   desired_date_applied: string | null;
   desired_date_closed: string | null;
+  desired_date_posted?: string | null;
   desired_notes: string | null;
   state: JobFetchQueueState;
   attempts: number;
   last_attempt_at: string | null;
   error_message: string | null;
+  resume_after: string | null;
   created_tracked_job_id: number | null;
   created_at: string;
   updated_at: string;

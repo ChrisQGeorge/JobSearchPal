@@ -202,9 +202,15 @@ export function FetchQueuePanel({ onJobCreated }: Props) {
                   className="flex items-start gap-3 py-2 border-t border-corp-border/40 first:border-t-0"
                 >
                   <span
-                    className={`inline-block px-2 py-0.5 rounded text-[10px] uppercase tracking-wider border shrink-0 mt-0.5 ${STATE_STYLES[it.state]}`}
+                    className={`inline-block px-2 py-0.5 rounded text-[10px] uppercase tracking-wider border shrink-0 mt-0.5 ${
+                      it.resume_after && new Date(it.resume_after) > new Date()
+                        ? "bg-corp-accent2/20 text-corp-accent2 border-corp-accent2/40"
+                        : STATE_STYLES[it.state]
+                    }`}
                   >
-                    {it.state}
+                    {it.resume_after && new Date(it.resume_after) > new Date()
+                      ? "waiting"
+                      : it.state}
                   </span>
                   <div className="flex-1 min-w-0">
                     <div className="text-sm truncate">
@@ -227,7 +233,12 @@ export function FetchQueuePanel({ onJobCreated }: Props) {
                         .filter(Boolean)
                         .join(" · ")}
                     </div>
-                    {it.error_message ? (
+                    {it.resume_after && new Date(it.resume_after) > new Date() ? (
+                      <div className="text-xs text-corp-accent2 mt-0.5">
+                        Rate-limited · resumes{" "}
+                        {new Date(it.resume_after).toLocaleTimeString()}
+                      </div>
+                    ) : it.error_message ? (
                       <div className="text-xs text-corp-danger mt-0.5">
                         {it.error_message}
                       </div>

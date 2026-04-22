@@ -1114,6 +1114,17 @@ async def analyze_jd(
             },
         )
     except ClaudeCodeError as exc:
+        from app.skills.queue_worker import _is_rate_limited as _rl
+        msg = str(exc)
+        if _rl(msg):
+            log.info("JD analyze rate-limited for job %s", job_id)
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "Claude is rate-limited right now. Wait for your tokens "
+                    "to refresh and try again, or switch to API-key billing."
+                ),
+            )
         log.warning("JD analyze failed for job %s: %s", job_id, exc)
         raise HTTPException(status_code=502, detail=f"Claude Code error: {exc}")
 
@@ -1133,6 +1144,12 @@ class BatchAnalyzeOut(BaseModel):
     analyzed: int
     skipped_no_description: int
     skipped_already_scored: int
+    # Populated when the batch halted early because Claude reported a rate
+    # limit / usage cap. Tells the UI how many jobs still need scoring so
+    # the user can rerun later without manually tracking state.
+    rate_limited: bool = False
+    rate_limit_message: Optional[str] = None
+    remaining_unprocessed: int = 0
     errors: list[dict] = []
 
 
@@ -1173,7 +1190,24 @@ async def batch_analyze_jd(
         ).all()
         org_names = {r[0]: r[1] for r in rows}
 
-    for j in jobs:
+    from app.skills.queue_worker import _is_rate_limited as _rl  # reuse detector
+    rate_limited = False
+    rate_limit_msg: Optional[str] = None
+    remaining = 0
+
+    for idx, j in enumerate(jobs):
+        if rate_limited:
+            # Count every would-have-been-analyzed row still ahead of us.
+            if not (j.job_description and j.job_description.strip()):
+                continue
+            already = (
+                isinstance(j.fit_summary, dict) and j.fit_summary.get("score") is not None
+            )
+            if already and not force:
+                continue
+            remaining += 1
+            continue
+
         if not (j.job_description and j.job_description.strip()):
             skipped_no_desc += 1
             continue
@@ -1218,7 +1252,13 @@ async def batch_analyze_jd(
                 },
             )
         except ClaudeCodeError as exc:
-            errors.append({"job_id": j.id, "error": str(exc)[:200]})
+            msg = str(exc)
+            if _rl(msg):
+                rate_limited = True
+                rate_limit_msg = msg.strip().splitlines()[0][:240]
+                remaining += 1  # count current row as still needing work
+                continue
+            errors.append({"job_id": j.id, "error": msg[:200]})
             continue
 
         data = _extract_json_object(result.result) or {}
@@ -1239,6 +1279,9 @@ async def batch_analyze_jd(
         analyzed=analyzed,
         skipped_no_description=skipped_no_desc,
         skipped_already_scored=skipped_scored,
+        rate_limited=rate_limited,
+        rate_limit_message=rate_limit_msg,
+        remaining_unprocessed=remaining,
         errors=errors,
     )
 

@@ -10,6 +10,7 @@ const NAV = [
   { href: "/history", label: "History Editor" },
   { href: "/organizations", label: "Organizations" },
   { href: "/jobs", label: "Job Tracker" },
+  { href: "/queue", label: "Fetch Queue" },
   { href: "/studio", label: "Document Studio" },
   { href: "/samples", label: "Writing Samples" },
   { href: "/companion", label: "Companion" },
