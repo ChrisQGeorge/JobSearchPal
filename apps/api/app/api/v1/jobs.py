@@ -1102,16 +1102,21 @@ async def analyze_jd(
         subject=str(user.id), extra={"purpose": "jd_analyzer"}
     )
 
+    from app.skills.queue_bus import run_claude_to_bus as _run_to_bus
+
     try:
-        result = await run_claude_prompt(
+        final_text = await _run_to_bus(
             prompt=prompt,
-            output_format="json",
+            source="jd_analyze",
+            item_id=f"jd:{job_id}",
+            label=f"Score: {job.title}"
+            + (f" · {org_name}" if org_name else ""),
             allowed_tools=["Bash"],
-            timeout_seconds=180,
             extra_env={
                 "JSP_API_BASE_URL": "http://localhost:8000",
                 "JSP_API_TOKEN": api_token,
             },
+            timeout_seconds=180,
         )
     except ClaudeCodeError as exc:
         from app.skills.queue_worker import _is_rate_limited as _rl
@@ -1128,7 +1133,7 @@ async def analyze_jd(
         log.warning("JD analyze failed for job %s: %s", job_id, exc)
         raise HTTPException(status_code=502, detail=f"Claude Code error: {exc}")
 
-    data = _extract_json_object(result.result) or {}
+    data = _extract_json_object(final_text) or {}
     # Normalize through our schema to drop unknown / malformed fields.
     analysis = JdAnalysis(**{k: v for k, v in data.items() if k in JdAnalysis.model_fields})
     job.jd_analysis = analysis.model_dump()
@@ -1240,16 +1245,24 @@ async def batch_analyze_jd(
         api_token = create_access_token(
             subject=str(user.id), extra={"purpose": "jd_analyzer_batch"}
         )
+        from app.skills.queue_bus import run_claude_to_bus as _run_to_bus
         try:
-            result = await run_claude_prompt(
+            final_text = await _run_to_bus(
                 prompt=prompt,
-                output_format="json",
+                source="jd_analyze_batch",
+                item_id=f"jd:{j.id}",
+                label=f"Score {idx + 1}/{len(jobs)}: {j.title}"
+                + (
+                    f" · {org_names.get(j.organization_id)}"
+                    if j.organization_id and org_names.get(j.organization_id)
+                    else ""
+                ),
                 allowed_tools=["Bash"],
-                timeout_seconds=180,
                 extra_env={
                     "JSP_API_BASE_URL": "http://localhost:8000",
                     "JSP_API_TOKEN": api_token,
                 },
+                timeout_seconds=180,
             )
         except ClaudeCodeError as exc:
             msg = str(exc)
@@ -1261,7 +1274,7 @@ async def batch_analyze_jd(
             errors.append({"job_id": j.id, "error": msg[:200]})
             continue
 
-        data = _extract_json_object(result.result) or {}
+        data = _extract_json_object(final_text) or {}
         analysis = JdAnalysis(
             **{k: v for k, v in data.items() if k in JdAnalysis.model_fields}
         )

@@ -164,12 +164,20 @@ async def _process(item: JobFetchQueue) -> None:
 
         def _on_event(ev: dict) -> None:
             payload = dict(ev)
-            payload.setdefault("item_id", item_id)
+            payload.setdefault("item_id", f"fetch:{item_id}")
+            payload.setdefault("source", "fetch")
+            payload.setdefault("label", item_url)
             payload.setdefault("url", item_url)
             queue_bus.publish(payload)
 
         queue_bus.publish(
-            {"item_id": item_id, "url": item_url, "kind": "start"}
+            {
+                "item_id": f"fetch:{item_id}",
+                "source": "fetch",
+                "label": item_url,
+                "url": item_url,
+                "kind": "start",
+            }
         )
 
         try:
@@ -268,7 +276,9 @@ async def _process(item: JobFetchQueue) -> None:
         await db.commit()
         queue_bus.publish(
             {
-                "item_id": item_id,
+                "item_id": f"fetch:{item_id}",
+                "source": "fetch",
+                "label": item_url,
                 "url": item_url,
                 "kind": "done",
                 "created_tracked_job_id": job.id,

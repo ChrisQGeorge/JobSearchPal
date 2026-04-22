@@ -157,8 +157,8 @@ export default function QueuePage() {
 
   return (
     <PageShell
-      title="Fetch Queue"
-      subtitle="URLs waiting for the Companion to turn into TrackedJobs. Rate-limited items back off and resume automatically."
+      title="Companion Activity"
+      subtitle="URLs waiting to become TrackedJobs, plus a live feed of every Claude task the app fires. Rate-limited items back off and resume automatically."
     >
       <section className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4">
         <Kpi
@@ -511,7 +511,9 @@ type StreamEvent = {
     | "result"
     | "done"
     | "error";
-  item_id?: number;
+  source?: string;             // "fetch" / "jd_analyze" / "jd_analyze_batch" / ...
+  item_id?: number | string;
+  label?: string;              // human-readable task description
   url?: string;
   text?: string;
   tool?: string;
@@ -521,6 +523,17 @@ type StreamEvent = {
   num_turns?: number | null;
   created_tracked_job_id?: number | null;
   t?: string;
+};
+
+const SOURCE_LABEL: Record<string, string> = {
+  fetch: "FETCH",
+  jd_analyze: "SCORE",
+  jd_analyze_batch: "SCORE",
+};
+const SOURCE_COLOR: Record<string, string> = {
+  fetch: "bg-sky-500/25 text-sky-300 border-sky-500/40",
+  jd_analyze: "bg-corp-accent2/25 text-corp-accent2 border-corp-accent2/40",
+  jd_analyze_batch: "bg-corp-accent2/25 text-corp-accent2 border-corp-accent2/40",
 };
 
 function LiveStreamPanel() {
@@ -647,34 +660,46 @@ function LiveStreamPanel() {
 
 function StreamLine({ ev }: { ev: StreamEvent }) {
   const ts = ev.t ? new Date(ev.t).toLocaleTimeString() : "";
-  const itemTag = ev.item_id ? `#${ev.item_id}` : "";
-  const prefix = `[${ts}${itemTag ? ` ${itemTag}` : ""}]`;
+  const srcLabel = ev.source ? SOURCE_LABEL[ev.source] ?? ev.source.toUpperCase() : null;
+  const srcColor = ev.source ? SOURCE_COLOR[ev.source] ?? "bg-corp-surface2 text-corp-muted border-corp-border" : "";
+
+  const header = (
+    <span className="inline-flex items-center gap-1 mr-1">
+      <span className="text-corp-muted">[{ts}]</span>
+      {srcLabel ? (
+        <span className={`px-1 rounded border text-[10px] ${srcColor}`}>{srcLabel}</span>
+      ) : null}
+      {ev.item_id ? (
+        <span className="text-corp-muted">{String(ev.item_id)}</span>
+      ) : null}
+    </span>
+  );
 
   if (ev.kind === "start") {
     return (
       <div className="text-corp-accent">
-        {prefix} ▶ start · {ev.url}
+        {header}▶ start · {ev.label ?? ev.url}
       </div>
     );
   }
   if (ev.kind === "system") {
     return (
       <div className="text-corp-muted">
-        {prefix} · {ev.text}
+        {header}· {ev.text}
       </div>
     );
   }
   if (ev.kind === "subscribed") {
     return (
       <div className="text-corp-muted italic">
-        {prefix} — stream connected
+        [{ts}] — stream connected
       </div>
     );
   }
   if (ev.kind === "text") {
     return (
       <div className="text-corp-text">
-        {prefix} {ev.text}
+        {header}{ev.text}
       </div>
     );
   }
@@ -685,7 +710,7 @@ function StreamLine({ ev }: { ev: StreamEvent }) {
         : "";
     return (
       <div className="text-sky-300">
-        {prefix} ● {ev.tool}
+        {header}● {ev.tool}
         {inp}
       </div>
     );
@@ -700,27 +725,28 @@ function StreamLine({ ev }: { ev: StreamEvent }) {
     if (ev.cost_usd && ev.cost_usd > 0) bits.push(`$${ev.cost_usd.toFixed(3)}`);
     return (
       <div className="text-corp-muted italic">
-        {prefix} ✓ result · {bits.join(" · ") || "ok"}
+        {header}✓ result · {bits.join(" · ") || "ok"}
       </div>
     );
   }
   if (ev.kind === "done") {
     return (
       <div className="text-emerald-300">
-        {prefix} ✓ done — tracked job #{ev.created_tracked_job_id}
+        {header}✓ done
+        {ev.created_tracked_job_id ? ` — tracked job #${ev.created_tracked_job_id}` : ""}
       </div>
     );
   }
   if (ev.kind === "error") {
     return (
       <div className="text-corp-danger">
-        {prefix} ✗ {ev.text}
+        {header}✗ {ev.text}
       </div>
     );
   }
   return (
     <div className="text-corp-muted">
-      {prefix} {JSON.stringify(ev)}
+      {header}{JSON.stringify(ev)}
     </div>
   );
 }
