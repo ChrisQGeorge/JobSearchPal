@@ -3,6 +3,8 @@
 import Link from "next/link";
 import { use as usePromise, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { PageShell } from "@/components/PageShell";
 import { api, apiUrl, ApiError } from "@/lib/api";
 import {
@@ -10,6 +12,19 @@ import {
   type DocType,
   type GeneratedDocument,
 } from "@/lib/types";
+
+type ViewMode = "edit" | "preview";
+
+const PREVIEWABLE_DOC_TYPES: ReadonlySet<string> = new Set([
+  "resume",
+  "cover_letter",
+  "outreach_email",
+  "thank_you",
+  "followup",
+  "portfolio",
+  "reference",
+  "other",
+]);
 
 type SelectionEditMode = "rewrite" | "answer" | "new_document";
 
@@ -51,6 +66,7 @@ export default function DocumentEditorPage({
   const [popup, setPopup] = useState<PopupState | null>(null);
   const [showDiff, setShowDiff] = useState(false);
   const [parentDoc, setParentDoc] = useState<GeneratedDocument | null>(null);
+  const [viewMode, setViewMode] = useState<ViewMode>("preview");
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   // Load the parent doc lazily when the user wants the diff view.
@@ -193,13 +209,16 @@ export default function DocumentEditorPage({
   const extractedFrom = structured?.extracted_from ?? null;
   const isExtracted =
     isUpload && extractedFrom && extractedFrom !== "text";
+  const canPreview =
+    !isUpload && !!body && PREVIEWABLE_DOC_TYPES.has(doc.doc_type);
+  const effectiveMode: ViewMode = canPreview ? viewMode : "edit";
 
   return (
     <PageShell
       title={doc.title}
       subtitle={`${doc.doc_type.replace(/_/g, " ")} · v${doc.version}`}
       actions={
-        <div className="flex gap-2 items-center flex-wrap">
+        <div className="flex gap-2 items-center flex-wrap jsp-no-print">
           {doc.tracked_job_id ? (
             <Link
               href={`/jobs/${doc.tracked_job_id}`}
@@ -217,6 +236,50 @@ export default function DocumentEditorPage({
             >
               Open file
             </a>
+          ) : null}
+          {canPreview ? (
+            <div
+              className="inline-flex rounded-md border border-corp-border overflow-hidden text-xs"
+              role="tablist"
+              aria-label="View mode"
+            >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={effectiveMode === "preview"}
+                className={`px-2.5 py-1 ${
+                  effectiveMode === "preview"
+                    ? "bg-corp-accent text-corp-bg"
+                    : "bg-corp-surface text-corp-text hover:bg-corp-surface2"
+                }`}
+                onClick={() => setViewMode("preview")}
+              >
+                Preview
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={effectiveMode === "edit"}
+                className={`px-2.5 py-1 border-l border-corp-border ${
+                  effectiveMode === "edit"
+                    ? "bg-corp-accent text-corp-bg"
+                    : "bg-corp-surface text-corp-text hover:bg-corp-surface2"
+                }`}
+                onClick={() => setViewMode("edit")}
+              >
+                Edit
+              </button>
+            </div>
+          ) : null}
+          {canPreview ? (
+            <button
+              type="button"
+              className="jsp-btn-ghost text-xs"
+              onClick={() => window.print()}
+              title="Open the browser print dialog — use 'Save as PDF' there"
+            >
+              Print / PDF
+            </button>
           ) : null}
           {doc.content_md && !isUpload ? (
             <HumanizeButton
@@ -249,7 +312,10 @@ export default function DocumentEditorPage({
         </div>
       }
     >
-      <Link href="/studio" className="text-sm text-corp-muted hover:text-corp-accent">
+      <Link
+        href="/studio"
+        className="text-sm text-corp-muted hover:text-corp-accent jsp-no-print"
+      >
         ← Document Studio
       </Link>
 
@@ -269,11 +335,18 @@ export default function DocumentEditorPage({
         </div>
       ) : (
         <>
-          <div className="jsp-card p-3 mt-3 text-[11px] text-corp-muted flex flex-wrap gap-2 items-center">
-            <span>
-              Select any span of text to ask the Companion to rewrite it,
-              answer a question about it, or spin off a new document.
-            </span>
+          <div className="jsp-card p-3 mt-3 text-[11px] text-corp-muted flex flex-wrap gap-2 items-center jsp-no-print">
+            {effectiveMode === "edit" ? (
+              <span>
+                Select any span of text to ask the Companion to rewrite it,
+                answer a question about it, or spin off a new document.
+              </span>
+            ) : (
+              <span>
+                Preview mode — what the document looks like formatted. Use
+                Print / PDF to export, or switch to Edit to tweak the markdown.
+              </span>
+            )}
             {isExtracted ? (
               <span className="text-corp-accent2">
                 · Extracted from {extractedFrom?.toUpperCase()}. Edits save to the
@@ -293,31 +366,40 @@ export default function DocumentEditorPage({
               currentVersion={doc.version}
             />
           ) : null}
-          <div className="jsp-card p-0 mt-2 relative">
-            <textarea
-              ref={textareaRef}
-              className="w-full min-h-[70vh] bg-corp-surface text-sm font-mono p-4 border-0 focus:outline-none resize-y"
-              value={body}
-              onChange={(e) => {
-                setBody(e.target.value);
-                setDirty(true);
-                if (popup) setPopup(null);
-              }}
-              onMouseUp={onSelectionEnd}
-              onKeyUp={(e) => {
-                // Allow keyboard selection (shift+arrows) to trigger popup too.
-                if (
-                  e.key === "Shift" ||
-                  e.key === "ArrowLeft" ||
-                  e.key === "ArrowRight" ||
-                  e.key === "ArrowUp" ||
-                  e.key === "ArrowDown"
-                ) {
-                  onSelectionEnd();
-                }
-              }}
-            />
-          </div>
+          {effectiveMode === "preview" ? (
+            <div className="jsp-print-root mt-3">
+              <article className="jsp-document jsp-markdown">
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                  {body}
+                </ReactMarkdown>
+              </article>
+            </div>
+          ) : (
+            <div className="jsp-card p-0 mt-2 relative">
+              <textarea
+                ref={textareaRef}
+                className="w-full min-h-[70vh] bg-corp-surface text-sm font-mono p-4 border-0 focus:outline-none resize-y"
+                value={body}
+                onChange={(e) => {
+                  setBody(e.target.value);
+                  setDirty(true);
+                  if (popup) setPopup(null);
+                }}
+                onMouseUp={onSelectionEnd}
+                onKeyUp={(e) => {
+                  if (
+                    e.key === "Shift" ||
+                    e.key === "ArrowLeft" ||
+                    e.key === "ArrowRight" ||
+                    e.key === "ArrowUp" ||
+                    e.key === "ArrowDown"
+                  ) {
+                    onSelectionEnd();
+                  }
+                }}
+              />
+            </div>
+          )}
         </>
       )}
 

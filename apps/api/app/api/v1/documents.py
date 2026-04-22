@@ -292,14 +292,17 @@ async def delete_document(
 
 # --- Tailoring --------------------------------------------------------------
 
-_TAILOR_RESUME_PROMPT = """You are tailoring a resume for a specific job. The user
-already has a detailed work/education/skills history saved in this app — pull
-it via the API before writing.
+_TAILOR_RESUME_PROMPT = """You are tailoring a professional resume for a specific
+job. The user already has their full work/education/skills history saved in
+this app — you MUST pull it via the API before writing. Do not invent
+anything; everything in the resume must come from fetched data.
 
 The base URL and bearer token are in environment variables JSP_API_BASE_URL
-and JSP_API_TOKEN. Useful endpoints (all return JSON, auth via
-`Authorization: Bearer $JSP_API_TOKEN`):
+and JSP_API_TOKEN. Endpoints (all JSON, auth via `Authorization: Bearer $JSP_API_TOKEN`):
 
+  GET  $JSP_API_BASE_URL/api/v1/auth/me                       (login identity: email, display_name)
+  GET  $JSP_API_BASE_URL/api/v1/preferences/demographics      (preferred_name, legal names, pronouns)
+  GET  $JSP_API_BASE_URL/api/v1/preferences/authorization     (current_location_city, current_location_region)
   GET  $JSP_API_BASE_URL/api/v1/history/work
   GET  $JSP_API_BASE_URL/api/v1/history/education
   GET  $JSP_API_BASE_URL/api/v1/history/skills
@@ -308,7 +311,7 @@ and JSP_API_TOKEN. Useful endpoints (all return JSON, auth via
   GET  $JSP_API_BASE_URL/api/v1/history/publications
   GET  $JSP_API_BASE_URL/api/v1/history/achievements
 
-Fetch what you need with curl, e.g.:
+Fetch in parallel with curl, e.g.:
 
   curl -sS -H "Authorization: Bearer $JSP_API_TOKEN" \\
        "$JSP_API_BASE_URL/api/v1/history/work"
@@ -328,67 +331,128 @@ Job description (verbatim):
 Required skills: {required_skills}
 Nice to have:    {nice_to_have_skills}
 
-Existing fit analysis (if any) — honour its resume_emphasis list:
+Existing fit analysis (if present, honour its resume_emphasis and prioritized skills):
 
 {jd_analysis_blob}
 
-User-supplied guidance for THIS tailoring run (if any):
+User-supplied guidance for THIS tailoring run (if any — weight these heavily):
 
 {extra_notes}
 
-Your job
---------
-Produce a tailored resume in Markdown. Structure:
+What a polished resume looks like
+---------------------------------
+Follow this structure exactly. Use real content only; omit sections whose
+data you couldn't find. Prefer en-dashes (–) for date ranges, em-dashes (—)
+between header fields, and bullet characters in markdown lists (`- `).
 
-# [Candidate name from user profile]
-[contact line — email, location, links — only what's in the profile]
+# {{Candidate Full Name}}
+{{City, Region}} · {{email}} · {{phone if on file}} · {{linkedin/site if on file}}
 
-## Summary
-[2-3 sentences tying the candidate's background to THIS JD.]
+## Professional Summary
 
-## Experience
-[For each relevant role, use this exact sub-heading format:]
-### [Role title] — [Organization] · [start–end]
-- [Achievement bullet emphasizing alignment with the JD]
-- ...
+Three to four sentences, written in confident third-person-implied style
+(no "I"), tying the candidate's real background to THIS job. Lead with
+years-of-experience framing ("Senior engineer with N years…"), then name
+the two or three most relevant domains/skills, then close with a concrete
+impact claim pulled from their highlights. No fluff, no "passionate about".
 
-## Skills
-[Grouped by category, only skills the user actually has.]
+## Core Skills
+
+Grouped into 3–5 categories (e.g. "Languages", "Cloud & Infra", "Data").
+Each category rendered as a single line:
+
+- **Languages:** Python, TypeScript, Go, SQL
+- **Cloud & Infra:** AWS (ECS, Lambda), Terraform, Docker, Kubernetes
+- **Data:** PostgreSQL, Redis, Kafka, dbt
+
+Only include skills the user actually has on file. Prioritize items also
+mentioned in the JD's required/nice-to-have lists.
+
+## Professional Experience
+
+For each relevant role, render this exact pattern (do NOT drop any lines):
+
+### {{Role title}} — {{Organization}}
+*{{City, Region}} · {{Start Month YYYY}} – {{End Month YYYY or Present}}*
+
+One-sentence role scope (what the team did, what the role owned). Optional
+if highlights are strong enough to stand alone.
+
+- Achievement bullet: start with a strong verb (Led, Shipped, Reduced,
+  Architected, Scaled…). Quantify with real metrics from the user's
+  highlights when available. Name the technology used.
+- Keep 3–5 bullets per role, 6 max for the most recent / most relevant one.
+  Trim less relevant roles to 2 bullets. Never invent metrics.
+- Bullets should be one line each in the source markdown (no line wraps
+  mid-bullet); commas/semicolons are fine for readability.
+
+List roles reverse-chronologically. Include every role the user has on
+file, but scale depth to relevance: the most JD-relevant roles get the
+most bullets; older or off-topic roles can compress to a single summary
+bullet.
 
 ## Education
-### [Degree] — [Institution] · [years]
 
-(Add Projects / Certifications / Publications / Achievements sections ONLY if
-there is material on file that is actually relevant to this JD.)
+### {{Degree, Field}} — {{Institution}}
+*{{City, Region}} · {{Start YYYY}} – {{End YYYY or Expected YYYY}}*
+
+One optional line: concentration, GPA if ≥3.5 and on file, or standout
+coursework if directly relevant to the JD.
+
+## Projects  *(include ONLY if the user has project entries AND at least one is relevant)*
+
+### {{Project name}}
+*{{Technologies}} · {{Year(s)}}*
+
+- 1–3 bullets. Same verb-first, quantified style as Experience.
+
+## Certifications  *(include ONLY if on file)*
+
+- {{Certification}} — {{Issuer}}, {{Year}}
+
+## Publications / Achievements  *(include ONLY if on file and credible)*
+
+- {{Title}} — {{Venue}}, {{Year}}
 
 Rules
 -----
-- NEVER invent experience, skills, companies, dates, metrics, or accomplishments
-  the user has not recorded. Work strictly from the fetched data.
-- Reorder and rephrase to foreground relevance. Trim anything off-topic.
-- Keep to ~1 page worth of density; prefer 3-5 bullets per role.
-- Use the user's stored technologies / highlights verbatim where possible.
-- If the user's stored data is too thin for a credible resume, say so in the
-  first line of `warning` and produce whatever honest subset you can.
+- NEVER invent experience, skills, companies, dates, metrics, accomplishments,
+  phone numbers, or links. If a field is missing on file, omit it rather than
+  make one up. If contact info is thin, use only what's there.
+- Reorder and rephrase to foreground JD relevance. Rephrase stored highlights
+  into tight, verb-led resume bullets — but do not fabricate metrics that
+  aren't present in the source.
+- Target length: one dense page (roughly 450–650 words of markdown body,
+  not counting headers). If the user's data supports more, lean toward
+  1.5 pages for senior candidates; never pad.
+- Use consistent date formatting throughout: `Month YYYY – Month YYYY`,
+  or `YYYY – YYYY` if only year is on file, or `… – Present` for current.
+- Capitalize proper nouns exactly as stored (AWS, PostgreSQL, Kubernetes).
+- Never include demographic data (pronouns, age, ethnicity, veteran status)
+  on the resume. Those endpoints are only useful for name and location.
+- If the user's stored data is too thin for a credible resume, set `warning`
+  explaining what's missing and produce the honest subset you can.
 
-Return ONE JSON object, no prose and no markdown fences around the JSON:
+Return ONE JSON object, no prose, no markdown fences around the JSON:
 
 {{
-  "title": string,          // short title for this doc, e.g. "Resume – Acme Senior Engineer"
-  "content_md": string,     // the full resume markdown
-  "notes": string,          // brief note on what you emphasized / trimmed
-  "warning": string | null  // honest caveats (thin history, missing dates, etc.)
+  "title": string,          // e.g. "Resume – Acme Senior Engineer"
+  "content_md": string,     // the full resume in Markdown, following the structure above
+  "notes": string,          // 1–2 sentences on what you emphasized and trimmed
+  "warning": string | null  // honest caveats (missing phone, no dated roles, etc.)
 }}
 """
 
 
-_TAILOR_COVER_LETTER_PROMPT = """You are writing a tailored cover letter. The
-user's full history is behind the same API described below — pull what you
-need.
+_TAILOR_COVER_LETTER_PROMPT = """You are writing a polished, human-sounding
+cover letter for a specific job. The user's full history is behind the same
+API — pull what you need before writing.
 
-Environment: $JSP_API_BASE_URL and $JSP_API_TOKEN (bearer).
-Useful endpoints:
+Environment: $JSP_API_BASE_URL and $JSP_API_TOKEN (bearer). Endpoints:
 
+  GET  $JSP_API_BASE_URL/api/v1/auth/me                    (email, display_name)
+  GET  $JSP_API_BASE_URL/api/v1/preferences/demographics   (preferred_name, legal names)
+  GET  $JSP_API_BASE_URL/api/v1/preferences/authorization  (current_location_city, _region)
   GET  $JSP_API_BASE_URL/api/v1/history/work
   GET  $JSP_API_BASE_URL/api/v1/history/skills
   GET  $JSP_API_BASE_URL/api/v1/history/projects
@@ -409,31 +473,74 @@ Existing fit analysis (cover_letter_hook is especially useful):
 
 {jd_analysis_blob}
 
-User guidance for THIS letter (optional):
+User guidance for THIS letter (optional but take seriously):
 
 {extra_notes}
 
-Your job
---------
-Write a 3-4 paragraph cover letter. First paragraph: a hook rooted in
-something specific about the posting. Middle paragraphs: 2-3 concrete stories
-from the user's actual history that map to the JD's needs. Final paragraph:
-closing with practical next step.
+What a polished cover letter looks like
+---------------------------------------
+Follow this structure exactly. Render in Markdown using the layout below —
+preview will style it as a formal business letter.
+
+**{{Candidate Full Name}}**
+{{City, Region}} · {{email}}
+{{Today's date, spelled out: e.g. "April 22, 2026"}}
+
+**{{Hiring Manager or "Hiring Team"}}**
+{{Organization}}
+
+---
+
+Dear {{Hiring Manager name if known, otherwise "Hiring Team"}},
+
+Paragraph 1 — The hook (3–5 sentences). Open with something concrete about
+the role, team, product, or a stated value from the posting. State the role
+you're applying to and the single strongest reason you're a fit (drawn from
+real history). Avoid "I am writing to express my interest" and "I am a
+passionate…". Warm, direct, first person.
+
+Paragraph 2 — Proof, act one (4–6 sentences). Pick the single most
+JD-relevant experience from their history and tell a tight mini-story:
+what the challenge was, what they did, what shipped. Name the technology
+and the scale (team size, traffic, scope) when it's in the stored data.
+Tie it back to a specific need in the JD by paraphrasing — don't quote
+the posting verbatim.
+
+Paragraph 3 — Proof, act two (3–5 sentences). A second story or a tight
+cluster of 2–3 related credentials covering a different dimension of the
+role (e.g. if paragraph 2 was technical depth, this one shows leadership
+or cross-functional collaboration). Again, only real content.
+
+Paragraph 4 — Close (2–3 sentences). Forward-looking: what excites them
+about this specific company/product/team, and a concrete next step
+("Happy to walk through any of this in an interview"). No clichés like
+"Thank you for considering my application".
+
+Sincerely,
+{{Candidate Full Name}}
 
 Rules
 -----
-- NEVER invent stories, roles, numbers, or companies not in the fetched data.
-- Reference the company name. Reference at least one specific detail from the
-  JD (a product area, a responsibility phrase, a stated value).
-- Keep the tone natural and specific. No "I am writing to express interest"
-  boilerplate, no "I am a passionate...". First person, active voice.
+- NEVER invent employers, dates, metrics, products, or stories the user
+  hasn't recorded. Everything concrete must come from fetched data.
+- Reference the company name at least twice and at least one specific
+  detail from the JD (product area, responsibility phrase, named value,
+  team). Show you actually read the posting.
+- Length: 300–450 words of body (paragraphs only, not counting header
+  block and signature). Don't pad.
+- Tone: natural, specific, confident. Active voice. No "synergy",
+  "passionate", "dynamic self-starter", "wear many hats".
+- If the user's stored history is too thin to support two proof paragraphs,
+  collapse to a tighter 3-paragraph structure and flag it in `warning`.
+- Use the candidate's preferred_name if available, otherwise legal first
+  + last name, otherwise display_name from /auth/me.
 
 Return ONE JSON object, no prose and no markdown fences:
 
 {{
   "title": string,          // e.g. "Cover letter – Acme Senior Engineer"
-  "content_md": string,     // the full letter
-  "warning": string | null
+  "content_md": string,     // the full letter in Markdown, following the layout above
+  "warning": string | null  // missing contact info, thin history, etc.
 }}
 """
 
