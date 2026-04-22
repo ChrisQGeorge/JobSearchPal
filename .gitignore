@@ -2,6 +2,7 @@
 .env
 .env.local
 .env.*.local
+feature-requests.md
 
 # Node
 node_modules/
