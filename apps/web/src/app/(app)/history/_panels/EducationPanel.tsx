@@ -348,6 +348,24 @@ function CourseForm({
           />
         </div>
         <div>
+          <label className="jsp-label">Start date</label>
+          <input
+            type="date"
+            className="jsp-input"
+            value={form.start_date ?? ""}
+            onChange={(e) => setForm({ ...form, start_date: e.target.value || null })}
+          />
+        </div>
+        <div>
+          <label className="jsp-label">End date</label>
+          <input
+            type="date"
+            className="jsp-input"
+            value={form.end_date ?? ""}
+            onChange={(e) => setForm({ ...form, end_date: e.target.value || null })}
+          />
+        </div>
+        <div>
           <label className="jsp-label">Grade</label>
           <input
             className="jsp-input"
@@ -460,6 +478,17 @@ function EducationForm({
             onChange={(e) =>
               setForm({ ...form, field_of_study: e.target.value || null })
             }
+          />
+        </div>
+        <div>
+          <label className="jsp-label">Concentration</label>
+          <input
+            className="jsp-input"
+            value={form.concentration ?? ""}
+            onChange={(e) =>
+              setForm({ ...form, concentration: e.target.value || null })
+            }
+            placeholder="Machine learning / Security / …"
           />
         </div>
         <div>

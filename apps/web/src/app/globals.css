@@ -33,3 +33,19 @@ a { color: inherit; text-decoration: none; }
 .jsp-label {
   @apply block text-xs uppercase tracking-wide text-corp-muted mb-1;
 }
+.jsp-markdown p { @apply my-1.5; }
+.jsp-markdown p:first-child { @apply mt-0; }
+.jsp-markdown p:last-child { @apply mb-0; }
+.jsp-markdown ul { @apply list-disc list-inside my-1.5 space-y-0.5; }
+.jsp-markdown ol { @apply list-decimal list-inside my-1.5 space-y-0.5; }
+.jsp-markdown li > p { @apply inline; }
+.jsp-markdown h1 { @apply text-base font-semibold mt-3 mb-1; }
+.jsp-markdown h2 { @apply text-sm font-semibold mt-2 mb-1; }
+.jsp-markdown h3 { @apply text-sm font-semibold mt-2 mb-0.5; }
+.jsp-markdown code { @apply bg-corp-surface2 border border-corp-border rounded px-1 py-0.5 text-[12px] font-mono; }
+.jsp-markdown pre { @apply bg-corp-surface2 border border-corp-border rounded p-2 my-2 overflow-x-auto; }
+.jsp-markdown pre code { @apply border-0 p-0 bg-transparent; }
+.jsp-markdown blockquote { @apply border-l-2 border-corp-border pl-2 my-2 text-corp-muted italic; }
+.jsp-markdown table { @apply border-collapse my-2 text-xs; }
+.jsp-markdown th, .jsp-markdown td { @apply border border-corp-border px-2 py-1; }
+.jsp-markdown hr { @apply border-corp-border my-3; }

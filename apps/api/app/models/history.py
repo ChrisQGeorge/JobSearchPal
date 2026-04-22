@@ -35,6 +35,7 @@ class WorkExperience(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     end_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     location: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     employment_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    remote_policy: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
     summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     highlights: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     technologies_used: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
@@ -71,6 +72,7 @@ class Education(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     )
     degree: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     field_of_study: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    concentration: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     minor: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     start_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     end_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
@@ -107,6 +109,8 @@ class Course(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     term: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    start_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    end_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     credits: Mapped[Optional[float]] = mapped_column(Numeric(4, 1), nullable=True)
     grade: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -259,6 +263,9 @@ class Contact(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     other_links: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     relationship_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    can_use_as_reference: Mapped[Optional[str]] = mapped_column(
+        String(16), nullable=True,
+    )  # yes / no / unknown
     last_contacted_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
 
 

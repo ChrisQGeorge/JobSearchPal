@@ -163,6 +163,7 @@ function WorkForm({
   const [endDate, setEndDate] = useState(initial?.end_date ?? "");
   const [location, setLocation] = useState(initial?.location ?? "");
   const [employmentType, setEmploymentType] = useState(initial?.employment_type ?? "");
+  const [remotePolicy, setRemotePolicy] = useState(initial?.remote_policy ?? "");
   const [summary, setSummary] = useState(initial?.summary ?? "");
   const [saving, setSaving] = useState(false);
 
@@ -177,6 +178,7 @@ function WorkForm({
         end_date: endDate || null,
         location: location || null,
         employment_type: employmentType || null,
+        remote_policy: remotePolicy || null,
         summary: summary || null,
       };
       let id = initial?.id;
@@ -240,12 +242,32 @@ function WorkForm({
         </div>
         <div>
           <label className="jsp-label">Employment type</label>
-          <input
+          <select
             className="jsp-input"
-            placeholder="full_time / contract / ..."
             value={employmentType ?? ""}
             onChange={(e) => setEmploymentType(e.target.value)}
-          />
+          >
+            <option value="">—</option>
+            <option value="full_time">full time</option>
+            <option value="part_time">part time</option>
+            <option value="contract">contract</option>
+            <option value="c2h">contract-to-hire</option>
+            <option value="internship">internship</option>
+            <option value="freelance">freelance</option>
+          </select>
+        </div>
+        <div>
+          <label className="jsp-label">Remote policy</label>
+          <select
+            className="jsp-input"
+            value={remotePolicy ?? ""}
+            onChange={(e) => setRemotePolicy(e.target.value)}
+          >
+            <option value="">—</option>
+            <option value="onsite">onsite</option>
+            <option value="hybrid">hybrid</option>
+            <option value="remote">remote</option>
+          </select>
         </div>
         <div className="col-span-2">
           <label className="jsp-label">Summary</label>

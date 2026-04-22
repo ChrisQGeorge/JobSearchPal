@@ -124,20 +124,46 @@ function positionEvent(ev: TimelineEvent, nowMs: number): PositionedEvent | null
 }
 
 function assignLanes(events: PositionedEvent[]): PositionedEvent[][] {
-  // Sort by start ascending, then by length descending (longer events claim lanes first).
+  // Sort by start ascending, then by length descending (longer events claim
+  // lanes first). Then pack with two passes:
+  //   1. Prefer lanes whose last event shares the same subtitle (org) —
+  //      promotions / back-to-school-after-same-school inline naturally.
+  //   2. Otherwise fall back to the first lane that can fit.
+  //
+  // Gap tolerance: events with up to 60 days of gap are allowed to share a
+  // lane. Covers "intern ends June, full-time starts August" without also
+  // smashing unrelated years-apart events together.
   const sorted = [...events].sort(
     (a, b) => a.startMs - b.startMs || b.endMs - b.startMs - (a.endMs - a.startMs),
   );
   const lanes: PositionedEvent[][] = [];
+  const GAP_DAYS = 60;
+  const GAP_MS = GAP_DAYS * 24 * 3600 * 1000;
   for (const ev of sorted) {
     let placed = false;
-    for (const lane of lanes) {
-      const last = lane[lane.length - 1];
-      // Allow point markers to share a lane if they're not at the exact same instant.
-      if (ev.startMs > last.endMs + 24 * 3600 * 1000) {
-        lane.push(ev);
-        placed = true;
-        break;
+    // First pass: same-subtitle preference.
+    if (ev.subtitle) {
+      for (const lane of lanes) {
+        const last = lane[lane.length - 1];
+        if (
+          last.subtitle === ev.subtitle &&
+          ev.startMs > last.endMs - GAP_MS  // allow slight overlap / tight adjacency
+        ) {
+          lane.push(ev);
+          placed = true;
+          break;
+        }
+      }
+    }
+    // Second pass: any lane with a strictly non-overlapping tail.
+    if (!placed) {
+      for (const lane of lanes) {
+        const last = lane[lane.length - 1];
+        if (ev.startMs > last.endMs + 24 * 3600 * 1000) {
+          lane.push(ev);
+          placed = true;
+          break;
+        }
       }
     }
     if (!placed) lanes.push([ev]);
@@ -260,7 +286,12 @@ export default function TimelinePage() {
     for (const list of Object.values(byKind)) {
       if (!list) continue;
       for (const ev of list) {
-        const key = ev.subtitle?.trim() || "Unaffiliated";
+        // Prefer an explicit effective_org set by the backend (e.g. a
+        // project's linked job org) so cross-kind links gather properly.
+        const effective =
+          (ev.metadata as { effective_org?: string | null } | null | undefined)
+            ?.effective_org ?? null;
+        const key = (effective || ev.subtitle)?.trim() || "Unaffiliated";
         const arr = groups.get(key);
         if (arr) arr.push(ev);
         else groups.set(key, [ev]);

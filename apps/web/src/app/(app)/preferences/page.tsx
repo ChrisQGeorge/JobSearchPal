@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { PageShell } from "@/components/PageShell";
 import { api, ApiError } from "@/lib/api";
 
@@ -54,6 +54,57 @@ function csvToList(v: string | undefined | null): string[] | null {
 
 function listToCsv(v: string[] | null | undefined): string {
   return (v ?? []).join(", ");
+}
+
+/**
+ * Input that accepts a comma-separated list. Holds its own raw text so
+ * typing spaces / commas / trailing separators doesn't get stripped by the
+ * parent's array round-trip. Parent receives a normalized `string[] | null`
+ * on blur (and on every keystroke, in case the parent needs live updates).
+ */
+function CsvInput({
+  value,
+  onChange,
+  placeholder,
+  disabled,
+  className = "jsp-input",
+}: {
+  value: string[] | null | undefined;
+  onChange: (next: string[] | null) => void;
+  placeholder?: string;
+  disabled?: boolean;
+  className?: string;
+}) {
+  const [text, setText] = useState<string>(() => listToCsv(value));
+  // Re-sync from parent only when the external value genuinely changes
+  // (e.g. a successful save returning a normalized list). Compare by
+  // stringified content so we don't fight the user mid-keystroke.
+  const externalRef = useRef<string>(listToCsv(value));
+  useEffect(() => {
+    const ext = listToCsv(value);
+    if (ext !== externalRef.current) {
+      externalRef.current = ext;
+      setText(ext);
+    }
+  }, [value]);
+  return (
+    <input
+      className={className}
+      value={text}
+      onChange={(e) => {
+        const next = e.target.value;
+        setText(next);
+        onChange(csvToList(next));
+      }}
+      onBlur={() => {
+        // Normalize display on blur so "foo ,, bar" collapses to "foo, bar".
+        const normalized = listToCsv(csvToList(text));
+        if (normalized !== text) setText(normalized);
+      }}
+      placeholder={placeholder}
+      disabled={disabled}
+    />
+  );
 }
 
 function numOrNull(s: string): number | null {
@@ -282,19 +333,17 @@ function JobPreferencesPanel() {
           </div>
           <div>
             <label className="jsp-label">Acceptable levels</label>
-            <input
-              className="jsp-input"
-              value={listToCsv(data.experience_levels_acceptable)}
-              onChange={(e) => set("experience_levels_acceptable", csvToList(e.target.value))}
+            <CsvInput
+              value={data.experience_levels_acceptable}
+              onChange={(next) => set("experience_levels_acceptable", next)}
               placeholder="mid, senior, staff"
             />
           </div>
           <div>
             <label className="jsp-label">Unacceptable levels</label>
-            <input
-              className="jsp-input"
-              value={listToCsv(data.experience_levels_unacceptable)}
-              onChange={(e) => set("experience_levels_unacceptable", csvToList(e.target.value))}
+            <CsvInput
+              value={data.experience_levels_unacceptable}
+              onChange={(next) => set("experience_levels_unacceptable", next)}
               placeholder="junior"
             />
           </div>
@@ -309,45 +358,40 @@ function JobPreferencesPanel() {
           </div>
           <div>
             <label className="jsp-label">Acceptable remote</label>
-            <input
-              className="jsp-input"
-              value={listToCsv(data.remote_policies_acceptable)}
-              onChange={(e) => set("remote_policies_acceptable", csvToList(e.target.value))}
+            <CsvInput
+              value={data.remote_policies_acceptable}
+              onChange={(next) => set("remote_policies_acceptable", next)}
               placeholder="remote, hybrid"
             />
           </div>
           <div>
             <label className="jsp-label">Unacceptable remote</label>
-            <input
-              className="jsp-input"
-              value={listToCsv(data.remote_policies_unacceptable)}
-              onChange={(e) => set("remote_policies_unacceptable", csvToList(e.target.value))}
+            <CsvInput
+              value={data.remote_policies_unacceptable}
+              onChange={(next) => set("remote_policies_unacceptable", next)}
               placeholder="onsite"
             />
           </div>
           <div>
             <label className="jsp-label">Employment types preferred</label>
-            <input
-              className="jsp-input"
-              value={listToCsv(data.employment_types_preferred)}
-              onChange={(e) => set("employment_types_preferred", csvToList(e.target.value))}
+            <CsvInput
+              value={data.employment_types_preferred}
+              onChange={(next) => set("employment_types_preferred", next)}
               placeholder="full_time"
             />
           </div>
           <div>
             <label className="jsp-label">Employment acceptable</label>
-            <input
-              className="jsp-input"
-              value={listToCsv(data.employment_types_acceptable)}
-              onChange={(e) => set("employment_types_acceptable", csvToList(e.target.value))}
+            <CsvInput
+              value={data.employment_types_acceptable}
+              onChange={(next) => set("employment_types_acceptable", next)}
             />
           </div>
           <div>
             <label className="jsp-label">Employment unacceptable</label>
-            <input
-              className="jsp-input"
-              value={listToCsv(data.employment_types_unacceptable)}
-              onChange={(e) => set("employment_types_unacceptable", csvToList(e.target.value))}
+            <CsvInput
+              value={data.employment_types_unacceptable}
+              onChange={(next) => set("employment_types_unacceptable", next)}
               placeholder="contract"
             />
           </div>
@@ -488,19 +532,17 @@ function JobPreferencesPanel() {
           </div>
           <div className="col-span-3">
             <label className="jsp-label">Required benefits (comma-separated)</label>
-            <input
-              className="jsp-input"
-              value={listToCsv(data.benefits_required)}
-              onChange={(e) => set("benefits_required", csvToList(e.target.value))}
+            <CsvInput
+              value={data.benefits_required}
+              onChange={(next) => set("benefits_required", next)}
               placeholder="health insurance, 401k match, 20 days PTO"
             />
           </div>
           <div className="col-span-3">
             <label className="jsp-label">Nice-to-have benefits</label>
-            <input
-              className="jsp-input"
-              value={listToCsv(data.benefits_preferred)}
-              onChange={(e) => set("benefits_preferred", csvToList(e.target.value))}
+            <CsvInput
+              value={data.benefits_preferred}
+              onChange={(next) => set("benefits_preferred", next)}
               placeholder="learning stipend, home office, sabbatical"
             />
           </div>
@@ -654,10 +696,9 @@ function WorkAuthorizationPanel() {
         <div className="grid grid-cols-3 gap-3">
           <div>
             <label className="jsp-label">Citizenship(s)</label>
-            <input
-              className="jsp-input"
-              value={listToCsv(data.citizenship_countries)}
-              onChange={(e) => set("citizenship_countries", csvToList(e.target.value))}
+            <CsvInput
+              value={data.citizenship_countries}
+              onChange={(next) => set("citizenship_countries", next)}
               placeholder="US, CA"
             />
           </div>
@@ -717,10 +758,9 @@ function WorkAuthorizationPanel() {
           </div>
           <div className="col-span-3">
             <label className="jsp-label">Relocation countries (comma-separated)</label>
-            <input
-              className="jsp-input"
-              value={listToCsv(data.relocation_countries_acceptable)}
-              onChange={(e) => set("relocation_countries_acceptable", csvToList(e.target.value))}
+            <CsvInput
+              value={data.relocation_countries_acceptable}
+              onChange={(next) => set("relocation_countries_acceptable", next)}
               placeholder="US, CA, UK, DE"
             />
           </div>
@@ -1197,10 +1237,9 @@ function DemographicsPanel() {
           </div>
           <div className="col-span-2">
             <label className="jsp-label">Race / ethnicity (comma-separated)</label>
-            <input
-              className="jsp-input"
-              value={listToCsv(data.race_ethnicity)}
-              onChange={(e) => set("race_ethnicity", csvToList(e.target.value))}
+            <CsvInput
+              value={data.race_ethnicity}
+              onChange={(next) => set("race_ethnicity", next)}
             />
           </div>
           <div>

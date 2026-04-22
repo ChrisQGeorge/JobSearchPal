@@ -1,6 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { PageShell } from "@/components/PageShell";
 import { api, ApiError, apiUrl } from "@/lib/api";
 import type {
@@ -1012,21 +1014,44 @@ function MessageBubble({ message }: { message: ConversationMessage }) {
         ? `${(meta.duration_ms / 1000).toFixed(1)}s`
         : `${meta.duration_ms}ms`,
     );
-  if (meta?.cost_usd != null) metaBits.push(`$${meta.cost_usd.toFixed(3)}`);
+  // OAuth/subscription turns report cost_usd = 0 (no per-turn charge). Only
+  // surface cost when it's actually nonzero — i.e. API-key billing mode.
+  if (meta?.cost_usd != null && meta.cost_usd > 0)
+    metaBits.push(`$${meta.cost_usd.toFixed(3)}`);
 
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
       <div className={`max-w-[80%] flex flex-col gap-1 ${isUser ? "items-end" : "items-start"}`}>
         <div
-          className={`px-3 py-2 rounded-lg whitespace-pre-wrap text-sm ${
+          className={`px-3 py-2 rounded-lg text-sm ${
             isUser
-              ? "bg-corp-accent text-corp-bg"
+              ? "bg-corp-accent text-corp-bg whitespace-pre-wrap"
               : isSystem
-                ? "border border-corp-danger/40 text-corp-danger bg-corp-danger/10"
-                : "jsp-card"
+                ? "border border-corp-danger/40 text-corp-danger bg-corp-danger/10 whitespace-pre-wrap"
+                : "jsp-card jsp-markdown"
           }`}
         >
-          {message.content_md ?? ""}
+          {isUser || isSystem ? (
+            message.content_md ?? ""
+          ) : (
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              components={{
+                a: ({ href, children }) => (
+                  <a
+                    href={href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-corp-accent hover:underline"
+                  >
+                    {children}
+                  </a>
+                ),
+              }}
+            >
+              {message.content_md ?? ""}
+            </ReactMarkdown>
+          )}
         </div>
         {!isUser && !isSystem && (skillsInferred?.length || metaBits.length) ? (
           <div className="flex flex-wrap gap-1 items-center text-[10px] text-corp-muted">

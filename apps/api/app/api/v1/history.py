@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -75,8 +75,46 @@ router = APIRouter(prefix="/history", tags=["history"])
 # ----- generic CRUD helpers ---------------------------------------------------
 
 async def _list_for_user(db: AsyncSession, model, user_id: int):
+    """Return all rows for a user, sorted with most-recent end_date first.
+
+    Null `end_date` means "current" so those rows sort to the top. Rows
+    sharing a rank fall back to alphabetical on their primary label
+    (title / name / degree — whichever the model has).
+    """
     stmt = select(model).where(model.user_id == user_id, model.deleted_at.is_(None))
-    return (await db.execute(stmt)).scalars().all()
+    rows = list((await db.execute(stmt)).scalars().all())
+
+    # Figure out a label attr for alphabetical tiebreak.
+    label_attr: Optional[str] = None
+    for candidate in ("title", "name", "degree", "field_of_study"):
+        if hasattr(model, candidate):
+            label_attr = candidate
+            break
+
+    has_end = hasattr(model, "end_date")
+
+    def sort_key(r):
+        # Tuple: (0 if current/no-end else 1, negated timestamp so newer first,
+        # lowercased label for alpha tiebreak).
+        end = getattr(r, "end_date", None) if has_end else None
+        if end is None:
+            bucket = 0
+            sortable = 0
+        else:
+            bucket = 1
+            # Convert to ordinal so we can negate.
+            try:
+                sortable = -end.toordinal()
+            except Exception:
+                sortable = 0
+        label = ""
+        if label_attr:
+            v = getattr(r, label_attr, None)
+            label = str(v).lower() if v else ""
+        return (bucket, sortable, label)
+
+    rows.sort(key=sort_key)
+    return rows
 
 
 async def _get_owned(db: AsyncSession, model, entity_id: int, user_id: int):
@@ -224,8 +262,121 @@ async def delete_education(
 async def list_skills(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
-) -> list[Skill]:
-    return await _list_for_user(db, Skill, user.id)
+) -> list[SkillOut]:
+    rows = await _list_for_user(db, Skill, user.id)
+    if not rows:
+        return []
+    ids = [r.id for r in rows]
+
+    # Count attachments from all three sources.
+    from app.models.history import WorkExperienceSkill as _WES, CourseSkill as _CS
+    from app.models.links import EntityLink as _EL
+
+    wes_counts = dict(
+        (await db.execute(
+            select(_WES.skill_id, func.count()).where(_WES.skill_id.in_(ids)).group_by(_WES.skill_id)
+        )).all()
+    )
+    cs_counts = dict(
+        (await db.execute(
+            select(_CS.skill_id, func.count()).where(_CS.skill_id.in_(ids)).group_by(_CS.skill_id)
+        )).all()
+    )
+    # EntityLink: skill can be on either end. Count anything pointing to a skill.
+    el_to_counts = dict(
+        (await db.execute(
+            select(_EL.to_entity_id, func.count()).where(
+                _EL.user_id == user.id,
+                _EL.to_entity_type == "skill",
+                _EL.to_entity_id.in_(ids),
+            ).group_by(_EL.to_entity_id)
+        )).all()
+    )
+    el_from_counts = dict(
+        (await db.execute(
+            select(_EL.from_entity_id, func.count()).where(
+                _EL.user_id == user.id,
+                _EL.from_entity_type == "skill",
+                _EL.from_entity_id.in_(ids),
+            ).group_by(_EL.from_entity_id)
+        )).all()
+    )
+    out: list[SkillOut] = []
+    for r in rows:
+        count = (
+            wes_counts.get(r.id, 0)
+            + cs_counts.get(r.id, 0)
+            + el_to_counts.get(r.id, 0)
+            + el_from_counts.get(r.id, 0)
+        )
+        row = SkillOut.model_validate(r)
+        row.attachment_count = int(count)
+        out.append(row)
+    return out
+
+
+@router.get("/skills/{skill_id:int}/attachments")
+async def skill_attachments(
+    skill_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """List every entity this skill is attached to, so the skills page can
+    show where it's used and offer fast navigation."""
+    from app.models.history import (
+        Course as _Course,
+        Education as _Education,
+        WorkExperience as _WE,
+        WorkExperienceSkill as _WES,
+        CourseSkill as _CS,
+    )
+    from app.models.links import EntityLink as _EL
+
+    # Verify ownership.
+    await _get_owned(db, Skill, skill_id, user.id)
+
+    work_rows = list(
+        (
+            await db.execute(
+                select(_WE.id, _WE.title).join(
+                    _WES, _WES.work_experience_id == _WE.id
+                ).where(_WES.skill_id == skill_id, _WE.user_id == user.id)
+            )
+        ).all()
+    )
+    course_rows = list(
+        (
+            await db.execute(
+                select(_Course.id, _Course.name).join(
+                    _CS, _CS.course_id == _Course.id
+                ).join(_Education, _Education.id == _Course.education_id)
+                .where(_CS.skill_id == skill_id, _Education.user_id == user.id)
+            )
+        ).all()
+    )
+    link_rows = list(
+        (
+            await db.execute(
+                select(_EL).where(
+                    _EL.user_id == user.id,
+                    ((_EL.from_entity_type == "skill") & (_EL.from_entity_id == skill_id))
+                    | ((_EL.to_entity_type == "skill") & (_EL.to_entity_id == skill_id)),
+                )
+            )
+        ).scalars().all()
+    )
+    return {
+        "work_experiences": [{"id": r[0], "title": r[1]} for r in work_rows],
+        "courses": [{"id": r[0], "name": r[1]} for r in course_rows],
+        "other_links": [
+            {
+                "other_type": l.from_entity_type if l.to_entity_id == skill_id else l.to_entity_type,
+                "other_id": l.from_entity_id if l.to_entity_id == skill_id else l.to_entity_id,
+                "relation": l.relation,
+            }
+            for l in link_rows
+        ],
+    }
 
 
 @router.post("/skills", response_model=SkillOut, status_code=status.HTTP_201_CREATED)
@@ -234,6 +385,26 @@ async def create_skill(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> Skill:
+    """Create a skill, case-insensitively deduplicated per-user.
+
+    If a skill with the same name (case-insensitive) already exists for this
+    user, return the existing row instead of creating a new one. Preserves
+    the original capitalization the user typed first.
+    """
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="name is required")
+    existing = (
+        await db.execute(
+            select(Skill).where(
+                Skill.user_id == user.id,
+                Skill.deleted_at.is_(None),
+                func.lower(Skill.name) == name.lower(),
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
     obj = Skill(user_id=user.id, **payload.model_dump(exclude_unset=True))
     db.add(obj)
     await db.commit()
@@ -592,8 +763,7 @@ async def timeline(
             # No end_date AND no signal that the role is ongoing → probably stale.
             # (Work doesn't have an is_ongoing flag — we infer from end_date absence.)
             pass  # intentional: absence of end_date is the ongoing signal
-        if not (w.highlights or []):
-            gaps.append("no highlights")
+        # "no highlights" alone is too noisy — summary is the anchor signal.
         if not w.summary:
             gaps.append("no summary")
         events.append(
@@ -662,10 +832,77 @@ async def timeline(
             )
         )
 
-    for p in await _list_for_user(db, Project, user.id):
+    # Resolve project → linked work/education → org, so By Org grouping can
+    # place a project under the same company or school it's associated with
+    # via entity_links rather than dumping it in "Unaffiliated".
+    all_projects = await _list_for_user(db, Project, user.id)
+    project_effective_org: dict[int, str] = {}
+    if all_projects:
+        project_ids = [p.id for p in all_projects]
+        links_out = list(
+            (
+                await db.execute(
+                    select(EntityLink).where(
+                        EntityLink.user_id == user.id,
+                        EntityLink.from_entity_type == "project",
+                        EntityLink.from_entity_id.in_(project_ids),
+                        EntityLink.to_entity_type.in_(["work", "education"]),
+                    )
+                )
+            ).scalars().all()
+        )
+        links_in = list(
+            (
+                await db.execute(
+                    select(EntityLink).where(
+                        EntityLink.user_id == user.id,
+                        EntityLink.to_entity_type == "project",
+                        EntityLink.to_entity_id.in_(project_ids),
+                        EntityLink.from_entity_type.in_(["work", "education"]),
+                    )
+                )
+            ).scalars().all()
+        )
+        # Build project_id → (target_type, target_id) map (first link wins).
+        refs: dict[int, tuple[str, int]] = {}
+        for l in links_out:
+            refs.setdefault(l.from_entity_id, (l.to_entity_type, l.to_entity_id))
+        for l in links_in:
+            refs.setdefault(l.to_entity_id, (l.from_entity_type, l.from_entity_id))
+        # Resolve the org for each referenced work/education in one pass.
+        work_ids = [v[1] for v in refs.values() if v[0] == "work"]
+        edu_ids = [v[1] for v in refs.values() if v[0] == "education"]
+        work_org: dict[int, Optional[int]] = {}
+        if work_ids:
+            work_org = {
+                r[0]: r[1]
+                for r in (
+                    await db.execute(
+                        select(WorkExperience.id, WorkExperience.organization_id).where(
+                            WorkExperience.id.in_(work_ids)
+                        )
+                    )
+                ).all()
+            }
+        edu_org: dict[int, Optional[int]] = {}
+        if edu_ids:
+            edu_org = {
+                r[0]: r[1]
+                for r in (
+                    await db.execute(
+                        select(Education.id, Education.organization_id).where(
+                            Education.id.in_(edu_ids)
+                        )
+                    )
+                ).all()
+            }
+        for pid, (t, tid) in refs.items():
+            org_id = work_org.get(tid) if t == "work" else edu_org.get(tid)
+            if org_id and org_id in org_names:
+                project_effective_org[pid] = org_names[org_id]
+
+    for p in all_projects:
         p_gaps: list[str] = []
-        if not (p.highlights or []):
-            p_gaps.append("no highlights")
         if not p.summary and not p.description_md:
             p_gaps.append("no summary")
         events.append(
@@ -680,6 +917,9 @@ async def timeline(
                     "is_ongoing": p.is_ongoing,
                     "visibility": p.visibility,
                     "gaps": p_gaps,
+                    # Used by the frontend when grouping By Org. Frontend falls
+                    # back to subtitle when this isn't present.
+                    "effective_org": project_effective_org.get(p.id),
                 },
             )
         )

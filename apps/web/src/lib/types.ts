@@ -61,6 +61,7 @@ export type WorkExperience = {
   end_date?: string | null;
   location?: string | null;
   employment_type?: string | null;
+  remote_policy?: string | null;
   summary?: string | null;
   highlights?: string[] | null;
   technologies_used?: string[] | null;
@@ -75,6 +76,7 @@ export type Education = {
   organization_name?: string | null;
   degree?: string | null;
   field_of_study?: string | null;
+  concentration?: string | null;
   minor?: string | null;
   start_date?: string | null;
   end_date?: string | null;
@@ -93,6 +95,7 @@ export type Skill = {
   years_experience?: number | null;
   last_used_date?: string | null;
   evidence_notes?: string | null;
+  attachment_count?: number | null;
 };
 
 export type Achievement = {
@@ -486,6 +489,8 @@ export type Course = {
   code?: string | null;
   name: string;
   term?: string | null;
+  start_date?: string | null;
+  end_date?: string | null;
   credits?: number | null;
   grade?: string | null;
   description?: string | null;
@@ -580,6 +585,7 @@ export type Contact = {
   other_links?: unknown[] | null;
   notes?: string | null;
   relationship_type?: string | null;
+  can_use_as_reference?: string | null;
   last_contacted_date?: string | null;
 };
 

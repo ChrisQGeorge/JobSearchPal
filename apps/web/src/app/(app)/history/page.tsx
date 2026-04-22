@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { PageShell } from "@/components/PageShell";
+import { api, ApiError } from "@/lib/api";
 import { EducationPanel } from "./_panels/EducationPanel";
 import { WorkPanel } from "./_panels/WorkPanel";
 import { GenericEntityPanel } from "./_panels/shared";
@@ -49,10 +50,20 @@ const TABS: { key: Tab; label: string }[] = [
 
 export default function HistoryEditorPage() {
   const [tab, setTab] = useState<Tab>("work");
+  const [ingestOpen, setIngestOpen] = useState(false);
   return (
     <PageShell
       title="History Editor"
       subtitle="Your canonical career record. Every AI skill draws from what is recorded here — and nothing else."
+      actions={
+        <button
+          className="jsp-btn-primary"
+          onClick={() => setIngestOpen(true)}
+          title="Upload an old resume and let the Companion propose entries"
+        >
+          Import from resume
+        </button>
+      }
     >
       <div className="flex gap-1 mb-4 border-b border-corp-border overflow-x-auto whitespace-nowrap">
         {TABS.map((t) => (
@@ -78,11 +89,19 @@ export default function HistoryEditorPage() {
           title="Skills Catalog"
           entityType="skill"
           labelOf={(s) => s.name}
-          subtitleOf={(s) =>
-            [s.category, s.proficiency, s.years_experience && `${s.years_experience} yrs`]
-              .filter(Boolean)
-              .join(" · ") || null
-          }
+          subtitleOf={(s) => {
+            const bits: string[] = [];
+            if (s.category) bits.push(s.category);
+            if (s.proficiency) bits.push(s.proficiency);
+            if (s.years_experience) bits.push(`${s.years_experience} yrs`);
+            const count = s.attachment_count ?? 0;
+            bits.push(
+              count === 0
+                ? "⚠ unattached"
+                : `${count} attachment${count === 1 ? "" : "s"}`,
+            );
+            return bits.join(" · ") || null;
+          }}
           emptyHint="Skills you add to Work or Courses also appear here. This is the canonical catalog."
           fields={[
             { key: "name", label: "Name", kind: "text", required: true },
@@ -176,7 +195,6 @@ export default function HistoryEditorPage() {
               kind: "csv",
               fullWidth: true,
             },
-            { key: "description_md", label: "Description", kind: "textarea", fullWidth: true },
           ]}
         />
       )}
@@ -304,7 +322,23 @@ export default function HistoryEditorPage() {
               key: "relationship_type",
               label: "Relationship",
               kind: "select",
-              options: ["recruiter", "referral", "hiring_manager", "peer", "mentor", "other"],
+              options: [
+                // Work
+                "manager", "co_worker", "direct_report", "skip_level",
+                "recruiter", "hiring_manager", "peer",
+                // School
+                "professor", "advisor", "classmate", "teaching_assistant",
+                // Projects
+                "project_partner", "collaborator", "open_source_maintainer",
+                // Generic
+                "referral", "mentor", "mentee", "friend", "family", "other",
+              ],
+            },
+            {
+              key: "can_use_as_reference",
+              label: "Can use as reference",
+              kind: "select",
+              options: ["yes", "no", "unknown"],
             },
             { key: "email", label: "Email", kind: "text" },
             { key: "phone", label: "Phone", kind: "text" },
@@ -333,7 +367,281 @@ export default function HistoryEditorPage() {
           ]}
         />
       )}
+      {ingestOpen ? (
+        <ResumeIngestModal onClose={() => setIngestOpen(false)} />
+      ) : null}
     </PageShell>
+  );
+}
+
+// ---------- Resume ingest modal ---------------------------------------------
+
+type IngestResult = {
+  proposals: {
+    work_experiences: Array<Record<string, unknown>>;
+    educations: Array<Record<string, unknown>>;
+    skills: string[];
+    projects: Array<Record<string, unknown>>;
+  };
+  warning?: string | null;
+  created?: {
+    work_experiences: number;
+    educations: number;
+    skills: number;
+    projects: number;
+  } | null;
+};
+
+function ResumeIngestModal({ onClose }: { onClose: () => void }) {
+  const [file, setFile] = useState<File | null>(null);
+  const [docId, setDocId] = useState<number | null>(null);
+  const [status, setStatus] = useState<
+    "pick" | "uploading" | "analyzing" | "review" | "committing" | "done"
+  >("pick");
+  const [result, setResult] = useState<IngestResult | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function upload(f: File) {
+    setFile(f);
+    setErr(null);
+    setStatus("uploading");
+    try {
+      const fd = new FormData();
+      fd.append("file", f);
+      fd.append("doc_type", "resume");
+      const res = await fetch("/api/v1/documents/upload", {
+        method: "POST",
+        credentials: "include",
+        body: fd,
+      });
+      if (!res.ok) throw new Error(`Upload HTTP ${res.status}`);
+      const doc = (await res.json()) as { id: number };
+      setDocId(doc.id);
+      setStatus("analyzing");
+      const analyzed = await api.post<IngestResult>(
+        "/api/v1/history/resume-ingest",
+        { document_id: doc.id, dry_run: true },
+      );
+      setResult(analyzed);
+      setStatus("review");
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Ingest failed.");
+      setStatus("pick");
+    }
+  }
+
+  async function commit() {
+    if (!docId) return;
+    setStatus("committing");
+    setErr(null);
+    try {
+      const r = await api.post<IngestResult>("/api/v1/history/resume-ingest", {
+        document_id: docId,
+        dry_run: false,
+      });
+      setResult(r);
+      setStatus("done");
+    } catch (e) {
+      setErr(e instanceof ApiError ? `HTTP ${e.status}` : "Commit failed.");
+      setStatus("review");
+    }
+  }
+
+  const counts = result
+    ? {
+        w: result.proposals.work_experiences.length,
+        e: result.proposals.educations.length,
+        s: result.proposals.skills.length,
+        p: result.proposals.projects.length,
+      }
+    : null;
+
+  return (
+    <>
+      <button
+        type="button"
+        aria-label="close"
+        className="fixed inset-0 z-30 bg-black/60"
+        onClick={onClose}
+      />
+      <div className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-40 jsp-card shadow-2xl p-5 w-[min(720px,92vw)] max-h-[85vh] overflow-auto space-y-3">
+        <div className="flex items-start justify-between gap-2">
+          <div>
+            <h3 className="text-sm uppercase tracking-wider text-corp-muted">
+              Import from resume
+            </h3>
+            <p className="text-[11px] text-corp-muted mt-1">
+              Upload an old resume — PDF, DOCX, or text — and the Companion
+              will propose work experiences, education, skills, and projects.
+              Nothing is written until you confirm.
+            </p>
+          </div>
+          <button className="jsp-btn-ghost text-xs" onClick={onClose}>
+            Close
+          </button>
+        </div>
+
+        {status === "pick" ? (
+          <label className="jsp-btn-primary inline-flex cursor-pointer">
+            Choose resume file…
+            <input
+              type="file"
+              className="hidden"
+              accept=".pdf,.docx,.txt,.md,.html,.htm,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/*"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) upload(f);
+              }}
+            />
+          </label>
+        ) : null}
+
+        {status === "uploading" ? (
+          <p className="text-sm text-corp-muted">Uploading {file?.name}…</p>
+        ) : null}
+
+        {status === "analyzing" ? (
+          <p className="text-sm text-corp-muted animate-pulse">
+            Companion is reading {file?.name}… this can take up to a minute.
+          </p>
+        ) : null}
+
+        {err ? <div className="text-xs text-corp-danger">{err}</div> : null}
+
+        {status === "review" && result && counts ? (
+          <>
+            {result.warning ? (
+              <div className="text-xs text-corp-accent2 bg-corp-accent2/10 border border-corp-accent2/40 p-2 rounded">
+                ⚠ {result.warning}
+              </div>
+            ) : null}
+            <div className="text-sm">
+              Found <strong>{counts.w}</strong> work, <strong>{counts.e}</strong>{" "}
+              education, <strong>{counts.s}</strong> skills, <strong>{counts.p}</strong>{" "}
+              projects.
+            </div>
+            <IngestPreview proposals={result.proposals} />
+            <div className="flex justify-end gap-2">
+              <button className="jsp-btn-ghost" onClick={onClose} type="button">
+                Cancel
+              </button>
+              <button className="jsp-btn-primary" onClick={commit} type="button">
+                Create all
+              </button>
+            </div>
+          </>
+        ) : null}
+
+        {status === "committing" ? (
+          <p className="text-sm text-corp-muted animate-pulse">Writing entities…</p>
+        ) : null}
+
+        {status === "done" && result?.created ? (
+          <div className="space-y-2">
+            <p className="text-sm text-corp-accent">
+              Imported: {result.created.work_experiences} work,{" "}
+              {result.created.educations} education, {result.created.skills} skills,{" "}
+              {result.created.projects} projects.
+            </p>
+            <div className="flex justify-end">
+              <button className="jsp-btn-primary" onClick={onClose} type="button">
+                Done — reload to see them
+              </button>
+            </div>
+          </div>
+        ) : null}
+      </div>
+    </>
+  );
+}
+
+function IngestPreview({
+  proposals,
+}: {
+  proposals: IngestResult["proposals"];
+}) {
+  return (
+    <div className="space-y-2 max-h-[45vh] overflow-auto">
+      {proposals.work_experiences.length > 0 ? (
+        <div>
+          <div className="text-[10px] uppercase tracking-wider text-corp-muted mb-1">
+            Work
+          </div>
+          <ul className="text-xs space-y-1">
+            {proposals.work_experiences.map((w, i) => (
+              <li key={i} className="jsp-card p-2">
+                <div>
+                  <strong>{String(w.title ?? "")}</strong>
+                  {w.organization_name ? ` · ${String(w.organization_name)}` : ""}
+                </div>
+                <div className="text-corp-muted">
+                  {String(w.start_date ?? "?")} — {String(w.end_date ?? "present")}
+                  {w.location ? ` · ${String(w.location)}` : ""}
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      {proposals.educations.length > 0 ? (
+        <div>
+          <div className="text-[10px] uppercase tracking-wider text-corp-muted mb-1">
+            Education
+          </div>
+          <ul className="text-xs space-y-1">
+            {proposals.educations.map((e, i) => (
+              <li key={i} className="jsp-card p-2">
+                <div>
+                  <strong>{String(e.degree ?? "")}</strong>
+                  {e.field_of_study ? ` · ${String(e.field_of_study)}` : ""}
+                </div>
+                <div className="text-corp-muted">
+                  {String(e.organization_name ?? "")} ·{" "}
+                  {String(e.start_date ?? "?")} — {String(e.end_date ?? "?")}
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      {proposals.skills.length > 0 ? (
+        <div>
+          <div className="text-[10px] uppercase tracking-wider text-corp-muted mb-1">
+            Skills
+          </div>
+          <div className="flex flex-wrap gap-1">
+            {proposals.skills.map((s, i) => (
+              <span
+                key={i}
+                className="text-[11px] px-1.5 py-0.5 rounded bg-corp-surface2 border border-corp-border"
+              >
+                {s}
+              </span>
+            ))}
+          </div>
+        </div>
+      ) : null}
+      {proposals.projects.length > 0 ? (
+        <div>
+          <div className="text-[10px] uppercase tracking-wider text-corp-muted mb-1">
+            Projects
+          </div>
+          <ul className="text-xs space-y-1">
+            {proposals.projects.map((p, i) => (
+              <li key={i} className="jsp-card p-2">
+                <div>
+                  <strong>{String(p.name ?? "")}</strong>
+                  {p.role ? ` · ${String(p.role)}` : ""}
+                </div>
+                {p.summary ? (
+                  <div className="text-corp-muted">{String(p.summary)}</div>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </div>
   );
 }
 

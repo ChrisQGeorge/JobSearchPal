@@ -13,6 +13,7 @@ class WorkExperienceIn(BaseModel):
     end_date: Optional[date] = None
     location: Optional[str] = None
     employment_type: Optional[str] = None
+    remote_policy: Optional[str] = None
     summary: Optional[str] = None
     highlights: Optional[list[str]] = None
     technologies_used: Optional[list[str]] = None
@@ -31,6 +32,7 @@ class EducationIn(BaseModel):
     organization_id: Optional[int] = None
     degree: Optional[str] = None
     field_of_study: Optional[str] = None
+    concentration: Optional[str] = None
     minor: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
@@ -59,6 +61,10 @@ class SkillIn(BaseModel):
 class SkillOut(SkillIn):
     model_config = ConfigDict(from_attributes=True)
     id: int
+    # Populated by the list endpoint — number of entities this skill is linked
+    # to across work_experience_skills + course_skills + entity_links. Zero
+    # means the skill is orphaned.
+    attachment_count: int = 0
 
 
 class AchievementIn(BaseModel):
@@ -94,6 +100,8 @@ class CourseIn(BaseModel):
     code: Optional[str] = None
     name: str = Field(min_length=1, max_length=255)
     term: Optional[str] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
     credits: Optional[float] = None
     grade: Optional[str] = None
     description: Optional[str] = None
@@ -215,6 +223,7 @@ class ContactIn(BaseModel):
     other_links: Optional[list[Any]] = None
     notes: Optional[str] = None
     relationship_type: Optional[str] = None
+    can_use_as_reference: Optional[str] = None  # yes / no / unknown
     last_contacted_date: Optional[date] = None
 
 

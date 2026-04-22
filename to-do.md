@@ -95,16 +95,40 @@ Project skill definitions already exist at `/skills/<name>/SKILL.md`. Wire them 
 - ✅ **File attach in Companion** — paperclip button on both the full `/companion` composer and the `CompanionDock` widget. Uploads go through `POST /documents/upload` (so the file is preserved in the user's Documents), and the resulting id is passed via `attached_document_ids` on the next message. Backend prefixes the user's prompt with an "USER ATTACHMENTS" block containing each file's extracted `content_md` (PDF/DOCX/HTML text extracted automatically, binary-only files noted with a URL to /file).
 - ✅ **New document creation in Studio** — "+ New document" button on `/studio` opens a form with doc-type selector, optional tracked-job attachment, and optional starter content. Creates the document via `POST /documents` and routes straight into the editor.
 
+### R6 — UX polish from real use
+- ✅ **Preferences CSV typing bug** — new `CsvInput` component owns its own raw text state; commas and spaces no longer get stripped mid-keystroke.
+- ✅ **Work panel dropdowns** — `employment_type` is a dropdown, and a new `remote_policy` dropdown (onsite / hybrid / remote) sits next to it.
+- ✅ **Education `concentration`** field (migration 0008).
+- ✅ **Courses start_date + end_date** fields (migration 0008).
+- ✅ **Project panel** — `description` field removed. Skills / related items already flow through `RelatedItemsPanel` in edit mode.
+- ✅ **Contact** — `can_use_as_reference` select (yes / no / unknown) + `relationship_type` expanded with school / project / work categories (manager, co-worker, classmate, project_partner, etc.).
+- ✅ **History editor sort** — `_list_for_user` returns rows with null end_date (current) pinned top, then most-recent-end-date, alpha tiebreak on title/name/degree.
+- ✅ **Timeline: drop "no highlights" gap warning** — only "no summary" flags now.
+- ✅ **Companion markdown rendering** — assistant bubbles go through `react-markdown` + `remark-gfm` with styled lists, headings, code blocks, and tables.
+- ✅ **Cost display on OAuth** — meta bar only shows `$cost` when `cost_usd > 0`; OAuth sessions (which report 0) no longer show `$0.000`.
+- ✅ **Skills: case-insensitive dedupe on create** — `POST /skills` returns the existing row (same name, any case) instead of creating a duplicate.
+- ✅ **Skills: attachment_count + unattached alert** — `SkillOut` exposes `attachment_count`; Skills tab flags `⚠ unattached` when zero. `GET /history/skills/{id}/attachments` returns the full list.
+- ✅ **Timeline: same-org inline** — `assignLanes` now prefers lanes whose tail matches the event's subtitle, with a 60-day gap tolerance. Intern → full-time at the same company packs onto one lane.
+- ✅ **Timeline: linked-org grouping** — projects linked to a Work or Education via `entity_links` now carry that entity's org as `metadata.effective_org`. By Org mode groups them under the linked job's org instead of "Unaffiliated".
+- ✅ **resume-ingest skill** — `POST /history/resume-ingest` (dry_run) analyzes an uploaded resume and returns proposed WorkExperience / Education / Skill / Project entries. Committing (dry_run=false) persists them with case-insensitive skill dedupe and auto-creates Organization rows as needed. "Import from resume" button on the History Editor header opens an upload → review → commit flow.
+
+**Deferred (low priority / requires more scope):**
+- [ ] Project panel: dedicated skills-link field with `usage_notes` (parity with Work/Courses). Today skills attach via `entity_links`/RelatedItemsPanel which is functionally equivalent but doesn't persist usage notes.
+- [ ] History editor: add a `contact_links` picker on Work / Education / Project / TrackedJob rows (backend already supports it via EntityLink).
+- [ ] Achievement / Certification / Publication / VolunteerWork issuer+venue: upgrade to `OrganizationCombobox` (schema change + migration).
+- [ ] Skills catalog page: full attachment-detail side view (backend at `/history/skills/{id}/attachments` is ready).
+- [ ] Spend cap (SRS REQ-COST-002) — enforce per-month LLM ceiling **only when using an API key**. OAuth sessions have no per-turn cost.
+
 ## Known minor issues
 
-- [ ] **UTF-8 mojibake** in Companion responses (e.g., `résumé` → `rÃ©sumÃ©`). ASCII is fine. Suspect double-encoding somewhere between subprocess stdout → FastAPI → JSON.
+- [ ] **UTF-8 mojibake** in Companion responses (e.g., `résumé` → `rÃ©sumÃ©`). ASCII is fine. Suspect double-encoding between subprocess stdout → FastAPI → JSON.
 - [ ] **Organization soft-delete references**: the timeline/history still show the stale name when an org is soft-deleted (by design), but there's no "reassign or hard-delete" workflow yet.
-- ✅ **Settings stubs**: AI Persona now has full CRUD + activate/deactivate. Data Export / Reset still Coming Soon.
-- [ ] **Spend cap** (SRS REQ-COST-002): enforce a per-month LLM spend ceiling.
+- ✅ **Settings stubs**: AI Persona has full CRUD + activate/deactivate. Data Export / Import is wired up via `/api/v1/admin/export` + `/api/v1/admin/import`.
+- ✅ **Sidebar collapse / mobile layout**: drawer-style sidebar on viewports below `md`.
+- ✅ **Streaming output** in the Companion — text deltas arrive live via SSE on `/messages-stream`.
+- ✅ **CORS / port flexibility** — `next.config.mjs` proxies `/api/*` and `/health/*` through the web origin, so changing `.env` ports no longer requires a frontend rebuild and CORS is moot.
 - [ ] **Observability** (SRS §3.3.5): `/metrics` Prometheus endpoint, structured JSON logs with PII scrubbing.
-- ✅ **Sidebar collapse / mobile layout**: drawer-style sidebar on viewports below `md`, with a fixed hamburger top bar. Desktop layout unchanged.
-- [ ] **Accessibility pass** (WCAG 2.1 AA per SRS §3.1.1): keyboard traversal audit, ARIA labels on charts (once charts exist), focus indicators in the combobox.
-- ✅ **Streaming output** in the Companion — text deltas arrive live via SSE on `/messages-stream`; bubble fills as the model writes.
+- [ ] **Accessibility pass** (WCAG 2.1 AA per SRS §3.1.1): keyboard traversal audit, ARIA labels on charts, focus indicators in the combobox.
 - [ ] **Circular link cleanup**: no UI for "linked from" — if A links to B there's no reverse view on B.
 - [ ] `/tmp/jsp-login-debug/*.bin` files inside the container's `claude_config` volume accumulate from OAuth runs; add a cleanup task.
 
