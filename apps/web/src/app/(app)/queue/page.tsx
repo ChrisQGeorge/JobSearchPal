@@ -529,11 +529,13 @@ const SOURCE_LABEL: Record<string, string> = {
   fetch: "FETCH",
   jd_analyze: "SCORE",
   jd_analyze_batch: "SCORE",
+  companion: "CHAT",
 };
 const SOURCE_COLOR: Record<string, string> = {
   fetch: "bg-sky-500/25 text-sky-300 border-sky-500/40",
   jd_analyze: "bg-corp-accent2/25 text-corp-accent2 border-corp-accent2/40",
   jd_analyze_batch: "bg-corp-accent2/25 text-corp-accent2 border-corp-accent2/40",
+  companion: "bg-corp-accent/25 text-corp-accent border-corp-accent/40",
 };
 
 function LiveStreamPanel() {

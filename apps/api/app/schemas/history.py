@@ -56,6 +56,7 @@ class SkillIn(BaseModel):
     years_experience: float | None = None
     last_used_date: date | None = None
     evidence_notes: str | None = None
+    aliases: list[str] | None = None
 
 
 class SkillOut(SkillIn):

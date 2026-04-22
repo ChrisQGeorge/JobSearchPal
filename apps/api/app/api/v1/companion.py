@@ -640,6 +640,26 @@ async def send_message_stream(
 
         yield _sse({"type": "user_saved", "message_id": user_msg_id})
 
+        # Mirror key events onto the Companion Activity (/queue) live feed so
+        # users can see when chat tasks kick off, which tools the Companion
+        # used, and when they complete. Tool-use + start + result only — the
+        # text deltas stay on the chat page to avoid flooding the activity
+        # log with whole essays.
+        from app.skills import queue_bus as _bus
+        from datetime import datetime as _dt_bus, timezone as _tz_bus
+
+        def _bus_emit(payload: dict) -> None:
+            payload = {
+                **payload,
+                "source": "companion",
+                "item_id": f"chat:{conv_id_local}:{user_msg_id}",
+                "label": f"Chat: {user_content.strip().splitlines()[0][:80]}" if user_content else "Chat",
+                "t": _dt_bus.now(tz=_tz_bus.utc).isoformat(timespec="seconds"),
+            }
+            _bus.publish(payload)
+
+        _bus_emit({"kind": "start"})
+
         try:
             async for ev in stream_claude_prompt(
                 prompt=user_content,
@@ -686,6 +706,23 @@ async def send_message_stream(
                                 }
                                 tool_calls_log.append(tu)
                                 yield _sse({"type": "tool_use", **tu})
+                                # Also send a compact version to the activity bus.
+                                inp = tu.get("input") or {}
+                                compact = {
+                                    k: (
+                                        (str(v)[:300] + "…")
+                                        if isinstance(v, str) and len(str(v)) > 300
+                                        else v
+                                    )
+                                    for k, v in (inp.items() if isinstance(inp, dict) else [])
+                                }
+                                _bus_emit(
+                                    {
+                                        "kind": "tool_use",
+                                        "tool": tu.get("name"),
+                                        "input": compact,
+                                    }
+                                )
                     continue
 
                 if ev_type == "stream_event":
@@ -714,11 +751,26 @@ async def send_message_stream(
                         txt = str(ev["result"])
                         collected_text.append(txt)
                         yield _sse({"type": "text_delta", "text": txt})
+                    _bus_emit(
+                        {
+                            "kind": "result",
+                            "cost_usd": cost_usd,
+                            "duration_ms": duration_ms,
+                            "num_turns": num_turns,
+                        }
+                    )
                     continue
         except Exception as exc:  # pragma: no cover
             had_error = True
             error_message = f"Streaming failed: {exc}"
             yield _sse({"type": "error", "message": error_message})
+            _bus_emit({"kind": "error", "text": error_message})
+
+        # Publish a terminal "done" to the activity feed so users on /queue
+        # see chat tasks reach completion even when they don't have the chat
+        # open.
+        if not had_error:
+            _bus_emit({"kind": "done"})
 
         # Persist the assistant turn.
         final_text = "".join(collected_text)

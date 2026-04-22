@@ -95,6 +95,7 @@ export type Skill = {
   years_experience?: number | null;
   last_used_date?: string | null;
   evidence_notes?: string | null;
+  aliases?: string[] | null;
   attachment_count?: number | null;
 };
 

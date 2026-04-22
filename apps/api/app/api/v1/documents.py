@@ -585,18 +585,27 @@ async def _run_tailor(
         json.dumps(job.jd_analysis, indent=2) if job.jd_analysis else "(no analysis yet)"
     )
 
+    # User-supplied values may contain literal `{` / `}` (code blocks,
+    # `{foo}` template placeholders, JSON examples inside the JD, etc.).
+    # `format_map` interprets those as format-spec syntax and raises on
+    # things like `{foo.bar}` or `{0}`. Escape every user value first so the
+    # format engine treats their braces as literals.
+    def _esc(v: object) -> str:
+        return str(v).replace("{", "{{").replace("}", "}}")
+
     format_kwargs = {
-        "title": job.title or "(untitled)",
-        "organization": org_name or "(unknown)",
-        "location": job.location or "(unspecified)",
-        "job_description": job.job_description,
-        "required_skills": ", ".join(job.required_skills or []) or "(none)",
-        "nice_to_have_skills": ", ".join(job.nice_to_have_skills or []) or "(none)",
-        "jd_analysis_blob": jd_analysis_blob,
-        "extra_notes": extra_notes or "(none)",
+        "title": _esc(job.title or "(untitled)"),
+        "organization": _esc(org_name or "(unknown)"),
+        "location": _esc(job.location or "(unspecified)"),
+        "job_description": _esc(job.job_description),
+        "required_skills": _esc(", ".join(job.required_skills or []) or "(none)"),
+        "nice_to_have_skills": _esc(", ".join(job.nice_to_have_skills or []) or "(none)"),
+        "jd_analysis_blob": _esc(jd_analysis_blob),
+        "extra_notes": _esc(extra_notes or "(none)"),
     }
     if extra_format_args:
-        format_kwargs.update(extra_format_args)
+        for k, v in extra_format_args.items():
+            format_kwargs[k] = _esc(v)
     # str.format leaves any unknown placeholders alone-by-raising; since our
     # prompt templates only reference a subset, we use a defaultdict-like dance
     # to tolerate missing keys for the per-template optional placeholders.
@@ -1282,14 +1291,19 @@ async def selection_edit(
         def __missing__(self, key):
             return "(n/a)"
 
+    # Escape user values so `{...}` inside a document body doesn't break
+    # format_map parsing.
+    def _esc(v: object) -> str:
+        return str(v).replace("{", "{{").replace("}", "}}")
+
     prompt = prompt_template.format_map(
         _SafeDict(
-            doc_type=doc.doc_type,
-            title=doc.title,
-            instruction=payload.instruction.strip(),
-            full_body=full_body,
-            selection=payload.selection_text,
-            new_doc_type=payload.new_doc_type or "",
+            doc_type=_esc(doc.doc_type),
+            title=_esc(doc.title),
+            instruction=_esc(payload.instruction.strip()),
+            full_body=_esc(full_body),
+            selection=_esc(payload.selection_text),
+            new_doc_type=_esc(payload.new_doc_type or ""),
         )
     )
 
@@ -1521,9 +1535,14 @@ async def humanize_document(
         )
     samples_block = "\n\n".join(samples_block_parts)
 
+    # Escape user content so `{...}` embedded in a document body / writing
+    # sample doesn't break format-string parsing.
+    def _esc_h(v: object) -> str:
+        return str(v).replace("{", "{{").replace("}", "}}")
+
     prompt = _HUMANIZE_PROMPT.format(
-        source_body=source.content_md,
-        samples_block=samples_block,
+        source_body=_esc_h(source.content_md),
+        samples_block=_esc_h(samples_block),
     )
 
     try:

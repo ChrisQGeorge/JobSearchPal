@@ -4,6 +4,7 @@ import { useState } from "react";
 import { PageShell } from "@/components/PageShell";
 import { api, ApiError } from "@/lib/api";
 import { EducationPanel } from "./_panels/EducationPanel";
+import { SkillsPanel } from "./_panels/SkillsPanel";
 import { WorkPanel } from "./_panels/WorkPanel";
 import { GenericEntityPanel } from "./_panels/shared";
 import type {
@@ -83,46 +84,7 @@ export default function HistoryEditorPage() {
 
       {tab === "work" && <WorkPanel />}
       {tab === "education" && <EducationPanel />}
-      {tab === "skills" && (
-        <GenericEntityPanel<Skill>
-          endpoint="/api/v1/history/skills"
-          title="Skills Catalog"
-          entityType="skill"
-          labelOf={(s) => s.name}
-          subtitleOf={(s) => {
-            const bits: string[] = [];
-            if (s.category) bits.push(s.category);
-            if (s.proficiency) bits.push(s.proficiency);
-            if (s.years_experience) bits.push(`${s.years_experience} yrs`);
-            const count = s.attachment_count ?? 0;
-            bits.push(
-              count === 0
-                ? "⚠ unattached"
-                : `${count} attachment${count === 1 ? "" : "s"}`,
-            );
-            return bits.join(" · ") || null;
-          }}
-          emptyHint="Skills you add to Work or Courses also appear here. This is the canonical catalog."
-          fields={[
-            { key: "name", label: "Name", kind: "text", required: true },
-            {
-              key: "category",
-              label: "Category",
-              kind: "select",
-              options: ["technical", "soft", "domain", "tool", "language"],
-            },
-            {
-              key: "proficiency",
-              label: "Proficiency",
-              kind: "select",
-              options: ["novice", "intermediate", "advanced", "expert"],
-            },
-            { key: "years_experience", label: "Years experience", kind: "number" },
-            { key: "last_used_date", label: "Last used", kind: "date" },
-            { key: "evidence_notes", label: "Evidence notes", kind: "textarea", fullWidth: true },
-          ]}
-        />
-      )}
+      {tab === "skills" && <SkillsPanel />}
       {tab === "achievements" && (
         <GenericEntityPanel<Achievement>
           endpoint="/api/v1/history/achievements"

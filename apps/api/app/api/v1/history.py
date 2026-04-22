@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -379,6 +380,138 @@ async def skill_attachments(
     }
 
 
+class SkillMergeIn(BaseModel):
+    keep_id: int
+    merge_ids: list[int]
+
+
+@router.post("/skills/merge", response_model=SkillOut)
+async def merge_skills(
+    payload: SkillMergeIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Skill:
+    """Merge one or more skills into a single canonical row.
+
+    Every reference in `work_experience_skills`, `course_skills`, and
+    polymorphic `entity_links` pointing at a merged skill gets re-pointed
+    at `keep_id`. The merged skills' names (and any of their existing
+    aliases) are appended to the keeper's `aliases` list, then the merged
+    rows are soft-deleted. Idempotent against re-merge — unique-constraint
+    collisions on the junction tables are collapsed automatically.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+
+    from app.models.history import (
+        CourseSkill as _CS,
+        WorkExperienceSkill as _WES,
+    )
+    from app.models.links import EntityLink as _EL
+
+    if not payload.merge_ids:
+        raise HTTPException(status_code=422, detail="merge_ids is required")
+    if payload.keep_id in payload.merge_ids:
+        raise HTTPException(
+            status_code=422, detail="keep_id must not also appear in merge_ids"
+        )
+
+    keeper = await _get_owned(db, Skill, payload.keep_id, user.id)
+    losers: list[Skill] = []
+    for mid in payload.merge_ids:
+        losers.append(await _get_owned(db, Skill, mid, user.id))
+
+    def _lower(s: str | None) -> str:
+        return (s or "").lower()
+
+    aliases = list(keeper.aliases or [])
+    alias_set = {_lower(a) for a in aliases if isinstance(a, str)}
+    alias_set.add(_lower(keeper.name))  # don't re-add the canonical name
+
+    for loser in losers:
+        if loser.name and _lower(loser.name) not in alias_set:
+            aliases.append(loser.name)
+            alias_set.add(_lower(loser.name))
+        for a in loser.aliases or []:
+            if isinstance(a, str) and _lower(a) not in alias_set:
+                aliases.append(a)
+                alias_set.add(_lower(a))
+
+    keeper.aliases = aliases or None
+
+    loser_ids = [l.id for l in losers]
+
+    # Re-point WorkExperienceSkill rows. The unique constraint on
+    # (work_experience_id, skill_id) means some targets may already have the
+    # keeper linked; delete the would-be-duplicate rows first, then update.
+    existing_wes_work_ids = {
+        r[0]
+        for r in (
+            await db.execute(
+                select(_WES.work_experience_id).where(
+                    _WES.skill_id == keeper.id
+                )
+            )
+        ).all()
+    }
+    for row in (
+        await db.execute(
+            select(_WES).where(_WES.skill_id.in_(loser_ids))
+        )
+    ).scalars().all():
+        if row.work_experience_id in existing_wes_work_ids:
+            await db.delete(row)
+        else:
+            row.skill_id = keeper.id
+            existing_wes_work_ids.add(row.work_experience_id)
+
+    # Same treatment for CourseSkill.
+    existing_cs_course_ids = {
+        r[0]
+        for r in (
+            await db.execute(
+                select(_CS.course_id).where(_CS.skill_id == keeper.id)
+            )
+        ).all()
+    }
+    for row in (
+        await db.execute(select(_CS).where(_CS.skill_id.in_(loser_ids)))
+    ).scalars().all():
+        if row.course_id in existing_cs_course_ids:
+            await db.delete(row)
+        else:
+            row.skill_id = keeper.id
+            existing_cs_course_ids.add(row.course_id)
+
+    # Re-point polymorphic EntityLinks on either end.
+    for row in (
+        await db.execute(
+            select(_EL).where(
+                _EL.user_id == user.id,
+                (
+                    (_EL.to_entity_type == "skill") & (_EL.to_entity_id.in_(loser_ids))
+                )
+                | (
+                    (_EL.from_entity_type == "skill")
+                    & (_EL.from_entity_id.in_(loser_ids))
+                ),
+            )
+        )
+    ).scalars().all():
+        if row.to_entity_type == "skill" and row.to_entity_id in loser_ids:
+            row.to_entity_id = keeper.id
+        if row.from_entity_type == "skill" and row.from_entity_id in loser_ids:
+            row.from_entity_id = keeper.id
+
+    # Soft-delete the merged skills.
+    now = _dt.now(tz=_tz.utc)
+    for loser in losers:
+        loser.deleted_at = now
+
+    await db.commit()
+    await db.refresh(keeper)
+    return keeper
+
+
 @router.post("/skills", response_model=SkillOut, status_code=status.HTTP_201_CREATED)
 async def create_skill(
     payload: SkillIn,
@@ -394,17 +527,22 @@ async def create_skill(
     name = (payload.name or "").strip()
     if not name:
         raise HTTPException(status_code=422, detail="name is required")
-    existing = (
+    lname = name.lower()
+    # Check both primary name AND aliases for an existing match.
+    all_rows = (
         await db.execute(
             select(Skill).where(
                 Skill.user_id == user.id,
                 Skill.deleted_at.is_(None),
-                func.lower(Skill.name) == name.lower(),
             )
         )
-    ).scalar_one_or_none()
-    if existing is not None:
-        return existing
+    ).scalars().all()
+    for r in all_rows:
+        if (r.name or "").lower() == lname:
+            return r
+        for alias in (r.aliases or []):
+            if isinstance(alias, str) and alias.lower() == lname:
+                return r
     obj = Skill(user_id=user.id, **payload.model_dump(exclude_unset=True))
     db.add(obj)
     await db.commit()

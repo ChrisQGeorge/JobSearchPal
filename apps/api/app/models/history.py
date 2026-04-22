@@ -146,6 +146,10 @@ class Skill(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     years_experience: Mapped[Optional[float]] = mapped_column(Numeric(4, 1), nullable=True)
     last_used_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     evidence_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Alternate names that resolve to this same skill (e.g. "NextJS", "next",
+    # "Next.js"). The dedupe check on create / merge uses this so adding a
+    # new name collapses into the existing row instead of spawning doubles.
+    aliases: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
 
 
 class Language(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
