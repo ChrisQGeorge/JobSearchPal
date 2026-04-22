@@ -713,6 +713,7 @@ function ClaudeLoginPanel({ onAuthed }: { onAuthed: () => void }) {
   const [status, setStatus] = useState<"idle" | "starting" | "streaming" | "submitting">("idle");
   const [error, setError] = useState<string | null>(null);
   const [logLines, setLogLines] = useState<string[]>([]);
+  const [liveStatus, setLiveStatus] = useState<string>("Starting CLI…");
   const [pasteToken, setPasteToken] = useState("");
   const [savingToken, setSavingToken] = useState(false);
 
@@ -777,6 +778,8 @@ function ClaudeLoginPanel({ onAuthed }: { onAuthed: () => void }) {
         };
         if (data.event === "url" && data.url) setAuthUrl(data.url);
         else if (data.event === "prompt") setPromptReady(true);
+        else if (data.event === "spawned") setLiveStatus("CLI subprocess spawned — waiting for Claude to print the auth URL…");
+        else if (data.event === "opened") setLiveStatus("SSE stream connected. Waiting for subprocess…");
         else if (data.event === "exit") {
           setFinished(true);
           setExitCode(data.code ?? null);
@@ -873,7 +876,21 @@ function ClaudeLoginPanel({ onAuthed }: { onAuthed: () => void }) {
               </div>
             </div>
           ) : (
-            <div className="text-sm text-corp-muted">Starting CLI...</div>
+            <div className="text-sm text-corp-muted space-y-1">
+              <div>{liveStatus}</div>
+              {logLines.length > 0 ? (
+                <pre className="text-[10px] text-corp-muted/80 bg-corp-surface2 border border-corp-border rounded p-2 whitespace-pre-wrap max-h-40 overflow-auto">
+                  {logLines.join("\n")}
+                </pre>
+              ) : (
+                <div className="text-[11px] text-corp-muted italic">
+                  No output from the CLI yet. If this stays blank for a while,
+                  run <code>docker compose exec -it api claude setup-token</code> on
+                  the server to test the CLI directly, or paste a token manually
+                  below.
+                </div>
+              )}
+            </div>
           )}
 
           {promptReady ? (

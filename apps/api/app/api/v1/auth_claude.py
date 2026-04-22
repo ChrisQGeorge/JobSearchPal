@@ -275,6 +275,10 @@ async def stream_login(
     async def generator():
         # Re-emit already-known state so a reconnecting client doesn't miss it.
         yield f'data: {json.dumps({"event": "opened"})}\n\n'
+        # Emit a visible breadcrumb immediately so the UI can confirm that
+        # the SSE stream is live even before Claude prints anything.
+        pid = getattr(sess.proc, "pid", None)
+        yield f'data: {json.dumps({"event": "spawned", "pid": pid})}\n\n'
         if sess.url:
             yield f'data: {json.dumps({"event": "url", "url": sess.url})}\n\n'
         if sess.prompt_seen:
