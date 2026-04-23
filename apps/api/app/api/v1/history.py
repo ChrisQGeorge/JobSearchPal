@@ -322,8 +322,9 @@ async def skill_attachments(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    """List every entity this skill is attached to, so the skills page can
-    show where it's used and offer fast navigation."""
+    """List every entity this skill is attached to, with enough context
+    (org names, date ranges, usage notes, relation labels) to render a
+    rich "where is this skill used?" panel on the Skills Catalog page."""
     from app.models.history import (
         Course as _Course,
         Education as _Education,
@@ -332,29 +333,64 @@ async def skill_attachments(
         CourseSkill as _CS,
     )
     from app.models.links import EntityLink as _EL
+    from app.models.jobs import Organization as _Org
 
     # Verify ownership.
     await _get_owned(db, Skill, skill_id, user.id)
 
+    # --- Work experiences (with org name, date range, usage notes) --------
     work_rows = list(
         (
             await db.execute(
-                select(_WE.id, _WE.title).join(
-                    _WES, _WES.work_experience_id == _WE.id
-                ).where(_WES.skill_id == skill_id, _WE.user_id == user.id)
+                select(
+                    _WE.id,
+                    _WE.title,
+                    _WE.organization_id,
+                    _WE.start_date,
+                    _WE.end_date,
+                    _WES.usage_notes,
+                ).join(_WES, _WES.work_experience_id == _WE.id)
+                .where(_WES.skill_id == skill_id, _WE.user_id == user.id)
+                .order_by(_WE.end_date.desc().nulls_first())
             )
         ).all()
     )
+
+    # --- Courses (with parent education's org name + course dates) --------
     course_rows = list(
         (
             await db.execute(
-                select(_Course.id, _Course.name).join(
-                    _CS, _CS.course_id == _Course.id
-                ).join(_Education, _Education.id == _Course.education_id)
+                select(
+                    _Course.id,
+                    _Course.code,
+                    _Course.name,
+                    _Course.term,
+                    _Course.start_date,
+                    _Course.end_date,
+                    _Education.id,
+                    _Education.organization_id,
+                    _Education.degree,
+                    _CS.usage_notes,
+                ).join(_CS, _CS.course_id == _Course.id)
+                .join(_Education, _Education.id == _Course.education_id)
                 .where(_CS.skill_id == skill_id, _Education.user_id == user.id)
+                .order_by(_Course.end_date.desc().nulls_first())
             )
         ).all()
     )
+
+    # --- Resolve org names in one shot -----------------------------------
+    org_ids = {r[2] for r in work_rows if r[2]} | {r[7] for r in course_rows if r[7]}
+    org_names: dict[int, str] = {}
+    if org_ids:
+        rows = (
+            await db.execute(
+                select(_Org.id, _Org.name).where(_Org.id.in_(org_ids))
+            )
+        ).all()
+        org_names = {row[0]: row[1] for row in rows}
+
+    # --- Polymorphic entity links ----------------------------------------
     link_rows = list(
         (
             await db.execute(
@@ -366,17 +402,63 @@ async def skill_attachments(
             )
         ).scalars().all()
     )
-    return {
-        "work_experiences": [{"id": r[0], "title": r[1]} for r in work_rows],
-        "courses": [{"id": r[0], "name": r[1]} for r in course_rows],
-        "other_links": [
+    other_links: list[dict] = []
+    for l in link_rows:
+        if l.to_entity_id == skill_id and l.to_entity_type == "skill":
+            other_type = l.from_entity_type
+            other_id = l.from_entity_id
+        else:
+            other_type = l.to_entity_type
+            other_id = l.to_entity_id
+        label = None
+        try:
+            label = await _label_for(db, other_type, other_id)
+        except Exception:
+            pass
+        other_links.append(
             {
-                "other_type": l.from_entity_type if l.to_entity_id == skill_id else l.to_entity_type,
-                "other_id": l.from_entity_id if l.to_entity_id == skill_id else l.to_entity_id,
+                "link_id": l.id,
+                "other_type": other_type,
+                "other_id": other_id,
+                "other_label": label or f"{other_type} #{other_id}",
                 "relation": l.relation,
+                "note": l.note,
             }
-            for l in link_rows
+        )
+
+    def _iso(d):
+        return d.isoformat() if d else None
+
+    return {
+        "work_experiences": [
+            {
+                "id": r[0],
+                "title": r[1],
+                "organization_id": r[2],
+                "organization_name": org_names.get(r[2]) if r[2] else None,
+                "start_date": _iso(r[3]),
+                "end_date": _iso(r[4]),
+                "usage_notes": r[5],
+            }
+            for r in work_rows
         ],
+        "courses": [
+            {
+                "id": r[0],
+                "code": r[1],
+                "name": r[2],
+                "term": r[3],
+                "start_date": _iso(r[4]),
+                "end_date": _iso(r[5]),
+                "education_id": r[6],
+                "education_degree": r[8],
+                "organization_id": r[7],
+                "organization_name": org_names.get(r[7]) if r[7] else None,
+                "usage_notes": r[9],
+            }
+            for r in course_rows
+        ],
+        "other_links": other_links,
     }
 
 
@@ -1120,10 +1202,18 @@ async def timeline(
     ed_dates = {
         e.id: (e.start_date, e.end_date) for e in educations
     }
+    # Parent Education's organization name is the right bucket for the
+    # timeline's "By org" grouping — the course's own `subtitle` is the term
+    # or instructor, which would otherwise produce per-term rows.
+    ed_org_id = {e.id: e.organization_id for e in educations}
     for c in course_rows:
         parent_start, parent_end = ed_dates.get(c.education_id, (None, None))
         start = c.start_date or parent_start
         end = c.end_date or parent_end
+        parent_org_id = ed_org_id.get(c.education_id)
+        effective_org = (
+            org_names.get(parent_org_id) if parent_org_id is not None else None
+        )
         events.append(
             TimelineEvent(
                 kind="course",
@@ -1132,7 +1222,11 @@ async def timeline(
                 subtitle=c.term or (c.instructor or None),
                 start_date=start,
                 end_date=end,
-                metadata={"credits": float(c.credits) if c.credits is not None else None, "grade": c.grade},
+                metadata={
+                    "credits": float(c.credits) if c.credits is not None else None,
+                    "grade": c.grade,
+                    "effective_org": effective_org,
+                },
             )
         )
 

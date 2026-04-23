@@ -1055,39 +1055,11 @@ class JdAnalysis(BaseModel):
     cover_letter_hook: Optional[str] = None
 
 
-@router.post("/{job_id:int}/analyze-jd", response_model=TrackedJobOut)
-async def analyze_jd(
-    job_id: int,
-    db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
-) -> TrackedJob:
-    """Run Claude against the saved job_description and populate
-    tracked_jobs.jd_analysis with a structured fit/red-flags breakdown.
-
-    Idempotent: re-running overwrites the previous analysis. The user can
-    always delete the object from the UI if they want to reset.
-    """
-    from app.core.security import create_access_token
-
-    job = await _get_owned_job(db, job_id, user.id)
-    if not (job.job_description and job.job_description.strip()):
-        raise HTTPException(
-            status_code=422,
-            detail="No job description stored. Paste one in before analyzing.",
-        )
-
-    # Resolve organization name for the prompt context.
-    org_name = None
-    if job.organization_id:
-        org_row = (
-            await db.execute(
-                select(Organization.name).where(Organization.id == job.organization_id)
-            )
-        ).first()
-        org_name = org_row[0] if org_row else None
-
-    prompt = _JD_ANALYZE_PROMPT.format(
-        job_description=job.job_description,
+def _build_jd_analyze_prompt(job: TrackedJob, org_name: Optional[str] = None) -> str:
+    """Assemble the JD-analyzer prompt from a TrackedJob. Shared by the
+    foreground request-time call and the queue worker's score handler."""
+    return _JD_ANALYZE_PROMPT.format(
+        job_description=job.job_description or "",
         title=job.title or "(untitled)",
         organization=org_name or "(unknown)",
         location=job.location or "(unspecified)",
@@ -1105,6 +1077,50 @@ async def analyze_jd(
         required_skills=", ".join(job.required_skills or []) or "(none)",
         nice_to_have_skills=", ".join(job.nice_to_have_skills or []) or "(none)",
     )
+
+
+def _apply_jd_analysis_to_job(job: TrackedJob, data: dict) -> None:
+    """Normalize Claude's response and persist it onto the TrackedJob. Shared
+    between the single-job endpoint and the batch queue handler."""
+    analysis = JdAnalysis(**{k: v for k, v in data.items() if k in JdAnalysis.model_fields})
+    job.jd_analysis = analysis.model_dump()
+    if analysis.fit_summary:
+        job.fit_summary = {"summary": analysis.fit_summary, "score": analysis.fit_score}
+
+
+async def _resolve_org_name(db: AsyncSession, org_id: Optional[int]) -> Optional[str]:
+    if not org_id:
+        return None
+    row = (
+        await db.execute(select(Organization.name).where(Organization.id == org_id))
+    ).first()
+    return row[0] if row else None
+
+
+@router.post("/{job_id:int}/analyze-jd", response_model=TrackedJobOut)
+async def analyze_jd(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> TrackedJob:
+    """Run Claude against the saved job_description and populate
+    tracked_jobs.jd_analysis. Foreground call — finishes in under 3 minutes
+    for a single job. Use /batch-analyze-jd to score many at once through
+    the task queue.
+
+    Idempotent: re-running overwrites the previous analysis.
+    """
+    from app.core.security import create_access_token
+
+    job = await _get_owned_job(db, job_id, user.id)
+    if not (job.job_description and job.job_description.strip()):
+        raise HTTPException(
+            status_code=422,
+            detail="No job description stored. Paste one in before analyzing.",
+        )
+
+    org_name = await _resolve_org_name(db, job.organization_id)
+    prompt = _build_jd_analyze_prompt(job, org_name)
 
     api_token = create_access_token(
         subject=str(user.id), extra={"purpose": "jd_analyzer"}
@@ -1142,24 +1158,23 @@ async def analyze_jd(
         raise HTTPException(status_code=502, detail=f"Claude Code error: {exc}")
 
     data = _extract_json_object(final_text) or {}
-    # Normalize through our schema to drop unknown / malformed fields.
-    analysis = JdAnalysis(**{k: v for k, v in data.items() if k in JdAnalysis.model_fields})
-    job.jd_analysis = analysis.model_dump()
-    if analysis.fit_summary:
-        # Keep the short human-readable summary separately for list views.
-        job.fit_summary = {"summary": analysis.fit_summary, "score": analysis.fit_score}
+    _apply_jd_analysis_to_job(job, data)
     await db.commit()
     await db.refresh(job)
     return job
 
 
 class BatchAnalyzeOut(BaseModel):
-    analyzed: int
+    """Shape returned by the new queue-backed batch scorer. Every un-scored
+    job gets its own row on the Companion Activity page; the worker drains
+    them serially with automatic rate-limit backoff."""
+
+    enqueued: int
     skipped_no_description: int
     skipped_already_scored: int
-    # Populated when the batch halted early because Claude reported a rate
-    # limit / usage cap. Tells the UI how many jobs still need scoring so
-    # the user can rerun later without manually tracking state.
+    # Kept for frontend back-compat — these are always zero under the queue
+    # model because we no longer process jobs in the request thread.
+    analyzed: int = 0
     rate_limited: bool = False
     rate_limit_message: Optional[str] = None
     remaining_unprocessed: int = 0
@@ -1172,25 +1187,20 @@ async def batch_analyze_jd(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> BatchAnalyzeOut:
-    """Run the JD analyzer on every TrackedJob that has a job_description.
+    """Enqueue a JD-analysis task for every TrackedJob that has a description.
 
     Default: only scores jobs without a fit_score yet. `?force=1` rescores
-    everything. Slow — serial calls to Claude, one per job.
+    everything. Returns immediately with counts — the queue worker drains
+    the tasks serially (to respect Claude's rate limits) and each task
+    appears live on the Companion Activity page.
     """
-    from app.core.security import create_access_token
-
     stmt = select(TrackedJob).where(
         TrackedJob.user_id == user.id,
         TrackedJob.deleted_at.is_(None),
     )
     jobs = list((await db.execute(stmt)).scalars().all())
 
-    skipped_no_desc = 0
-    skipped_scored = 0
-    errors: list[dict] = []
-    analyzed = 0
-
-    # Resolve org names once.
+    # Resolve org names once so labels read nicely.
     org_ids = [j.organization_id for j in jobs if j.organization_id]
     org_names: dict[int, str] = {}
     if org_ids:
@@ -1203,24 +1213,30 @@ async def batch_analyze_jd(
         ).all()
         org_names = {r[0]: r[1] for r in rows}
 
-    from app.skills.queue_worker import _is_rate_limited as _rl  # reuse detector
-    rate_limited = False
-    rate_limit_msg: Optional[str] = None
-    remaining = 0
-
-    for idx, j in enumerate(jobs):
-        if rate_limited:
-            # Count every would-have-been-analyzed row still ahead of us.
-            if not (j.job_description and j.job_description.strip()):
-                continue
-            already = (
-                isinstance(j.fit_summary, dict) and j.fit_summary.get("score") is not None
+    # Don't enqueue duplicate score tasks for a job that already has one
+    # pending or running — if the user spam-clicks "Score all" we shouldn't
+    # stack up identical work.
+    pending_rows = (
+        await db.execute(
+            select(JobFetchQueue.payload).where(
+                JobFetchQueue.user_id == user.id,
+                JobFetchQueue.kind == "score",
+                JobFetchQueue.state.in_(("queued", "processing")),
             )
-            if already and not force:
-                continue
-            remaining += 1
-            continue
+        )
+    ).all()
+    already_enqueued: set[int] = set()
+    for (payload,) in pending_rows:
+        if isinstance(payload, dict):
+            tj = payload.get("tracked_job_id")
+            if isinstance(tj, int):
+                already_enqueued.add(tj)
 
+    skipped_no_desc = 0
+    skipped_scored = 0
+    enqueued = 0
+
+    for j in jobs:
         if not (j.job_description and j.job_description.strip()):
             skipped_no_desc += 1
             continue
@@ -1230,80 +1246,30 @@ async def batch_analyze_jd(
         if already_scored and not force:
             skipped_scored += 1
             continue
-
-        prompt = _JD_ANALYZE_PROMPT.format(
-            job_description=j.job_description,
-            title=j.title or "(untitled)",
-            organization=org_names.get(j.organization_id) if j.organization_id else "(unknown)",
-            location=j.location or "(unspecified)",
-            remote_policy=j.remote_policy or "(unspecified)",
-            salary_min=j.salary_min if j.salary_min is not None else "null",
-            salary_max=j.salary_max if j.salary_max is not None else "null",
-            experience_years_min=j.experience_years_min
-            if j.experience_years_min is not None
-            else "null",
-            experience_years_max=j.experience_years_max
-            if j.experience_years_max is not None
-            else "null",
-            experience_level=j.experience_level or "null",
-            employment_type=j.employment_type or "null",
-            required_skills=", ".join(j.required_skills or []) or "(none)",
-            nice_to_have_skills=", ".join(j.nice_to_have_skills or []) or "(none)",
-        )
-        api_token = create_access_token(
-            subject=str(user.id), extra={"purpose": "jd_analyzer_batch"}
-        )
-        from app.skills.queue_bus import run_claude_to_bus as _run_to_bus
-        try:
-            final_text = await _run_to_bus(
-                prompt=prompt,
-                source="jd_analyze_batch",
-                item_id=f"jd:{j.id}",
-                label=f"Score {idx + 1}/{len(jobs)}: {j.title}"
-                + (
-                    f" · {org_names.get(j.organization_id)}"
-                    if j.organization_id and org_names.get(j.organization_id)
-                    else ""
-                ),
-                allowed_tools=["Bash"],
-                extra_env={
-                    "JSP_API_BASE_URL": "http://localhost:8000",
-                    "JSP_API_TOKEN": api_token,
-                },
-                timeout_seconds=180,
-            )
-        except ClaudeCodeError as exc:
-            msg = str(exc)
-            if _rl(msg):
-                rate_limited = True
-                rate_limit_msg = msg.strip().splitlines()[0][:240]
-                remaining += 1  # count current row as still needing work
-                continue
-            errors.append({"job_id": j.id, "error": msg[:200]})
+        if j.id in already_enqueued:
+            # Row already has a pending score task — don't stack duplicates.
             continue
 
-        data = _extract_json_object(final_text) or {}
-        analysis = JdAnalysis(
-            **{k: v for k, v in data.items() if k in JdAnalysis.model_fields}
+        org_name = org_names.get(j.organization_id) if j.organization_id else None
+        label = f"Score: {j.title}" + (f" · {org_name}" if org_name else "")
+        db.add(
+            JobFetchQueue(
+                user_id=user.id,
+                kind="score",
+                label=label[:512],
+                url="",  # legacy NOT-NULL column; empty for non-fetch kinds
+                payload={"tracked_job_id": j.id},
+                state="queued",
+            )
         )
-        j.jd_analysis = analysis.model_dump()
-        if analysis.fit_summary:
-            j.fit_summary = {
-                "summary": analysis.fit_summary,
-                "score": analysis.fit_score,
-            }
-        # Commit per-job so a long run doesn't lose progress if interrupted.
-        await db.commit()
-        analyzed += 1
+        enqueued += 1
+
+    await db.commit()
 
     return BatchAnalyzeOut(
-        analyzed=analyzed,
+        enqueued=enqueued,
         skipped_no_description=skipped_no_desc,
         skipped_already_scored=skipped_scored,
-        rate_limited=rate_limited,
-        rate_limit_message=rate_limit_msg,
-        remaining_unprocessed=remaining,
-        errors=errors,
     )
 
 
@@ -1770,24 +1736,65 @@ def _companion_task_to_row(task: dict) -> ActivityRowOut:
 
 
 def _fetch_queue_to_row(item: JobFetchQueue) -> ActivityRowOut:
-    # JobFetchQueue has no `started_at`; use last_attempt_at as proxy.
+    # Post-migration-0012, `kind` discriminates between fetch / score /
+    # tailor / humanize / ... — older rows carry NULL and mean fetch.
+    kind = item.kind or "fetch"
+    # Human label per kind, defaulting to whatever was stored on the row
+    # (the enqueuer sets `label` most of the time).
+    if item.label:
+        label = item.label
+    elif kind == "fetch":
+        label = item.url or "(no url)"
+    elif isinstance(item.payload, dict) and item.payload.get("tracked_job_id"):
+        label = f"{kind}: job #{item.payload['tracked_job_id']}"
+    else:
+        label = f"{kind} #{item.id}"
+    # For non-fetch kinds, surface the tracked_job_id from the payload so
+    # the UI can still deep-link the row. Fetch rows already expose it via
+    # `created_tracked_job_id`.
+    related_tracked_job_id = item.created_tracked_job_id
+    if related_tracked_job_id is None and isinstance(item.payload, dict):
+        tj = item.payload.get("tracked_job_id")
+        if isinstance(tj, int):
+            related_tracked_job_id = tj
+
+    # Merge live progress from the in-memory bus registry, if any. Worker
+    # handlers publish with item_id=f"queue:{row.id}", so a single lookup
+    # covers every kind. Source names differ per kind (e.g. kind="score"
+    # publishes as source="jd_analyze"), so try a few candidates.
+    from app.skills import queue_bus as _bus
+    _SOURCE_FOR_KIND = {
+        "fetch": "fetch",
+        "score": "jd_analyze",
+    }
+    bus_source = _SOURCE_FOR_KIND.get(kind, kind)
+    task = _bus.get_task(bus_source, f"queue:{item.id}")
+    last_text = task.get("last_text") if task else None
+    last_tool = task.get("last_tool") if task else None
+    cost_usd = task.get("cost_usd") if task else None
+    duration_ms = task.get("duration_ms") if task else None
+    num_turns = task.get("num_turns") if task else None
+
     return ActivityRowOut(
-        id=f"fetch:{item.id}",
-        kind="fetch",
-        source="fetch",
-        label=item.url or "(no url)",
+        id=f"fetch:{item.id}",  # stable id across kinds — table is shared
+        kind="fetch" if kind == "fetch" else "companion",
+        source=kind,
+        label=label,
         status=item.state or "queued",
         started_at=item.last_attempt_at,
         updated_at=item.last_attempt_at or item.created_at,
         finished_at=None,
-        last_text=None,
-        last_tool=None,
+        last_text=last_text,
+        last_tool=last_tool,
         error=item.error_message,
         fetch_queue_id=item.id,
-        url=item.url,
+        url=item.url if kind == "fetch" else None,
         attempts=item.attempts,
         resume_after=item.resume_after,
-        tracked_job_id=item.created_tracked_job_id,
+        tracked_job_id=related_tracked_job_id,
+        cost_usd=cost_usd,
+        duration_ms=duration_ms,
+        num_turns=num_turns,
     )
 
 
@@ -1812,13 +1819,30 @@ async def list_activity(
         _fetch_queue_to_row(i)
         for i in (await db.execute(fetch_stmt)).scalars().all()
     ]
-    task_rows = [_companion_task_to_row(t) for t in _bus.list_tasks(limit=200)]
+
+    # Non-fetch DB rows are also in the bus task registry (the worker
+    # publishes while running). Skip any bus entry whose item_id points at
+    # a DB row — the DB row is the canonical representation and already
+    # carries progress data (merged in `_fetch_queue_to_row`).
+    task_rows: list[ActivityRowOut] = []
+    for t in _bus.list_tasks(limit=200):
+        item_id = str(t.get("item_id") or "")
+        if item_id.startswith("queue:"):
+            continue
+        task_rows.append(_companion_task_to_row(t))
 
     merged = fetch_rows + task_rows
-    merged.sort(
-        key=lambda r: r.updated_at or r.started_at or datetime.min.replace(tzinfo=timezone.utc),
-        reverse=True,
-    )
+    # JobFetchQueue datetimes come back naive from MySQL; companion-task rows
+    # are tz-aware ISO strings. Normalize both so we can mix them in a sort.
+    _min = datetime.min.replace(tzinfo=timezone.utc)
+
+    def _sort_key(r: ActivityRowOut) -> datetime:
+        d = r.updated_at or r.started_at
+        if d is None:
+            return _min
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+    merged.sort(key=_sort_key, reverse=True)
     return merged
 
 
@@ -1887,6 +1911,8 @@ async def enqueue_url(
     item = JobFetchQueue(
         user_id=user.id,
         url=url,
+        kind="fetch",
+        label=url[:512],
         desired_status=payload.desired_status,
         desired_priority=payload.desired_priority,
         desired_date_applied=payload.desired_date_applied,

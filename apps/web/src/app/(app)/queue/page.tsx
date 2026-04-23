@@ -516,6 +516,13 @@ function QueueRow({
   const resumeIn = item.resume_after
     ? Math.max(0, Math.floor((new Date(item.resume_after).getTime() - Date.now()) / 60000))
     : null;
+  // Pretty-format multi-hour waits — "4h 58m" instead of "298 min".
+  const resumeInPretty =
+    resumeIn == null
+      ? null
+      : resumeIn >= 60
+        ? `${Math.floor(resumeIn / 60)}h ${resumeIn % 60}m`
+        : `${resumeIn}m`;
 
   const srcLabel = SOURCE_LABEL[item.source] ?? item.source.toUpperCase();
   const srcColor =
@@ -590,7 +597,7 @@ function QueueRow({
         {waiting && item.resume_after ? (
           <div className="text-xs text-corp-accent2 mt-1">
             Resumes {new Date(item.resume_after).toLocaleString()}{" "}
-            {resumeIn !== null ? `(≈${resumeIn} min)` : ""}
+            {resumeInPretty ? `(in ${resumeInPretty})` : ""}
             {item.error ? ` · ${item.error}` : ""}
           </div>
         ) : item.status === "error" && item.error ? (
@@ -662,6 +669,7 @@ type StreamEvent = {
 
 const SOURCE_LABEL: Record<string, string> = {
   fetch: "FETCH",
+  score: "SCORE",
   jd_analyze: "SCORE",
   jd_analyze_batch: "SCORE",
   companion: "CHAT",

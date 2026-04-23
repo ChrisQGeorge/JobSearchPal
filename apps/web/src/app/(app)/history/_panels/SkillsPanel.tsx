@@ -1,8 +1,49 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { api, ApiError } from "@/lib/api";
 import type { Skill } from "@/lib/types";
+
+type SkillAttachments = {
+  work_experiences: {
+    id: number;
+    title: string;
+    organization_id: number | null;
+    organization_name: string | null;
+    start_date: string | null;
+    end_date: string | null;
+    usage_notes: string | null;
+  }[];
+  courses: {
+    id: number;
+    code: string | null;
+    name: string;
+    term: string | null;
+    start_date: string | null;
+    end_date: string | null;
+    education_id: number;
+    education_degree: string | null;
+    organization_id: number | null;
+    organization_name: string | null;
+    usage_notes: string | null;
+  }[];
+  other_links: {
+    link_id: number;
+    other_type: string;
+    other_id: number;
+    other_label: string;
+    relation: string | null;
+    note: string | null;
+  }[];
+};
+
+// Map polymorphic entity_link type → in-app detail page route, when one exists.
+// Types not listed here render as plain text (no deep link).
+const LINK_ROUTES: Record<string, (id: number) => string> = {
+  tracked_job: (id) => `/jobs/${id}`,
+  generated_document: (id) => `/studio/${id}`,
+};
 
 export function SkillsPanel() {
   const [items, setItems] = useState<Skill[]>([]);
@@ -13,6 +54,7 @@ export function SkillsPanel() {
   const [mergeOpen, setMergeOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<Skill | null>(null);
+  const [detailId, setDetailId] = useState<number | null>(null);
 
   async function refresh() {
     setLoading(true);
@@ -150,18 +192,36 @@ export function SkillsPanel() {
           {items.length === 0 ? "No skills yet." : "No skills match that search."}
         </div>
       ) : (
-        <ul className="jsp-card divide-y divide-corp-border overflow-hidden">
-          {filtered.map((s) => (
-            <SkillRow
-              key={s.id}
-              skill={s}
-              selected={selected.has(s.id)}
-              onToggle={() => toggle(s.id)}
-              onEdit={() => setEditing(s)}
-              onDelete={() => remove(s.id)}
+        <div
+          className={
+            detailId != null
+              ? "grid grid-cols-1 lg:grid-cols-[1fr,minmax(320px,420px)] gap-3 items-start"
+              : ""
+          }
+        >
+          <ul className="jsp-card divide-y divide-corp-border overflow-hidden">
+            {filtered.map((s) => (
+              <SkillRow
+                key={s.id}
+                skill={s}
+                selected={selected.has(s.id)}
+                active={detailId === s.id}
+                onToggle={() => toggle(s.id)}
+                onSelect={() =>
+                  setDetailId((prev) => (prev === s.id ? null : s.id))
+                }
+                onEdit={() => setEditing(s)}
+                onDelete={() => remove(s.id)}
+              />
+            ))}
+          </ul>
+          {detailId != null ? (
+            <SkillDetailPanel
+              skill={items.find((s) => s.id === detailId) ?? null}
+              onClose={() => setDetailId(null)}
             />
-          ))}
-        </ul>
+          ) : null}
+        </div>
       )}
 
       {mergeOpen ? (
@@ -182,13 +242,17 @@ export function SkillsPanel() {
 function SkillRow({
   skill,
   selected,
+  active,
   onToggle,
+  onSelect,
   onEdit,
   onDelete,
 }: {
   skill: Skill;
   selected: boolean;
+  active: boolean;
   onToggle: () => void;
+  onSelect: () => void;
   onEdit: () => void;
   onDelete: () => void;
 }) {
@@ -204,7 +268,11 @@ function SkillRow({
   return (
     <li
       className={`flex items-center gap-3 py-1.5 px-3 hover:bg-corp-surface2 ${
-        selected ? "bg-corp-accent/10" : ""
+        active
+          ? "bg-corp-accent/15 ring-1 ring-inset ring-corp-accent/40"
+          : selected
+            ? "bg-corp-accent/10"
+            : ""
       }`}
     >
       <input
@@ -214,7 +282,13 @@ function SkillRow({
         onChange={onToggle}
         aria-label={`Select ${skill.name}`}
       />
-      <div className="min-w-0 flex-1 flex items-baseline gap-2 flex-wrap">
+      <button
+        type="button"
+        onClick={onSelect}
+        className="min-w-0 flex-1 flex items-baseline gap-2 flex-wrap text-left hover:text-corp-accent"
+        aria-pressed={active}
+        title="View attachments"
+      >
         <span className="text-sm truncate">{skill.name}</span>
         {skill.aliases && skill.aliases.length > 0 ? (
           <span
@@ -226,7 +300,7 @@ function SkillRow({
           </span>
         ) : null}
         <span className="text-xs text-corp-muted">· {sub}</span>
-      </div>
+      </button>
       <div className="flex gap-1 shrink-0">
         <button className="jsp-btn-ghost text-xs" onClick={onEdit}>
           Edit
@@ -239,6 +313,246 @@ function SkillRow({
         </button>
       </div>
     </li>
+  );
+}
+
+function SkillDetailPanel({
+  skill,
+  onClose,
+}: {
+  skill: Skill | null;
+  onClose: () => void;
+}) {
+  const [data, setData] = useState<SkillAttachments | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!skill) return;
+    let cancelled = false;
+    setLoading(true);
+    setErr(null);
+    setData(null);
+    api
+      .get<SkillAttachments>(`/api/v1/history/skills/${skill.id}/attachments`)
+      .then((d) => {
+        if (!cancelled) setData(d);
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          setErr(e instanceof ApiError ? `HTTP ${e.status}` : "Load failed.");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [skill?.id]);
+
+  if (!skill) return null;
+
+  const total =
+    (data?.work_experiences.length ?? 0) +
+    (data?.courses.length ?? 0) +
+    (data?.other_links.length ?? 0);
+
+  const evidence = (skill.evidence_notes ?? "").trim();
+
+  return (
+    <aside className="jsp-card p-4 space-y-4 sticky top-4 max-h-[calc(100vh-120px)] overflow-auto">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="text-[10px] uppercase tracking-wider text-corp-muted">
+            Skill detail
+          </div>
+          <h4 className="text-base font-semibold truncate">{skill.name}</h4>
+          {skill.aliases && skill.aliases.length > 0 ? (
+            <div className="text-[11px] text-corp-muted mt-0.5">
+              aka {skill.aliases.join(", ")}
+            </div>
+          ) : null}
+        </div>
+        <button
+          type="button"
+          className="jsp-btn-ghost text-xs"
+          onClick={onClose}
+          title="Close detail panel"
+        >
+          ×
+        </button>
+      </div>
+
+      <dl className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs">
+        {skill.category ? (
+          <div>
+            <dt className="text-corp-muted">Category</dt>
+            <dd>{skill.category}</dd>
+          </div>
+        ) : null}
+        {skill.proficiency ? (
+          <div>
+            <dt className="text-corp-muted">Proficiency</dt>
+            <dd>{skill.proficiency}</dd>
+          </div>
+        ) : null}
+        {skill.years_experience != null ? (
+          <div>
+            <dt className="text-corp-muted">Years</dt>
+            <dd>{skill.years_experience}</dd>
+          </div>
+        ) : null}
+        {skill.last_used_date ? (
+          <div>
+            <dt className="text-corp-muted">Last used</dt>
+            <dd>{skill.last_used_date}</dd>
+          </div>
+        ) : null}
+      </dl>
+
+      {evidence ? (
+        <div>
+          <div className="text-[10px] uppercase tracking-wider text-corp-muted mb-1">
+            Evidence notes
+          </div>
+          <div className="text-xs whitespace-pre-wrap bg-corp-surface2 border border-corp-border rounded p-2">
+            {evidence}
+          </div>
+        </div>
+      ) : null}
+
+      <div>
+        <div className="flex items-baseline justify-between mb-1">
+          <div className="text-[10px] uppercase tracking-wider text-corp-muted">
+            Attachments
+          </div>
+          <div className="text-[10px] text-corp-muted">
+            {loading ? "loading…" : total === 0 ? "none" : `${total} total`}
+          </div>
+        </div>
+
+        {err ? <div className="text-xs text-corp-danger">{err}</div> : null}
+
+        {!loading && !err && data ? (
+          total === 0 ? (
+            <div className="text-xs text-corp-muted italic">
+              This skill isn't referenced by any work, course, project, job, or
+              document yet. Consider attaching it, or delete it if it's stale.
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {data.work_experiences.length > 0 ? (
+                <section>
+                  <h5 className="text-[11px] uppercase tracking-wider text-corp-accent mb-1">
+                    Work ({data.work_experiences.length})
+                  </h5>
+                  <ul className="space-y-1.5">
+                    {data.work_experiences.map((w) => (
+                      <li
+                        key={`w-${w.id}`}
+                        className="text-xs bg-corp-surface2 border border-corp-border rounded p-2"
+                      >
+                        <div className="font-medium truncate">{w.title}</div>
+                        <div className="text-corp-muted">
+                          {w.organization_name ?? "—"}
+                          {w.start_date || w.end_date ? (
+                            <>
+                              {" · "}
+                              {w.start_date ?? "?"} → {w.end_date ?? "current"}
+                            </>
+                          ) : null}
+                        </div>
+                        {w.usage_notes ? (
+                          <div className="mt-1 text-corp-text/90 italic">
+                            “{w.usage_notes}”
+                          </div>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              ) : null}
+
+              {data.courses.length > 0 ? (
+                <section>
+                  <h5 className="text-[11px] uppercase tracking-wider text-corp-accent mb-1">
+                    Courses ({data.courses.length})
+                  </h5>
+                  <ul className="space-y-1.5">
+                    {data.courses.map((c) => (
+                      <li
+                        key={`c-${c.id}`}
+                        className="text-xs bg-corp-surface2 border border-corp-border rounded p-2"
+                      >
+                        <div className="font-medium truncate">
+                          {c.code ? `${c.code} · ` : ""}
+                          {c.name}
+                        </div>
+                        <div className="text-corp-muted">
+                          {c.organization_name ?? "—"}
+                          {c.education_degree ? ` · ${c.education_degree}` : ""}
+                          {c.term ? ` · ${c.term}` : ""}
+                        </div>
+                        {c.usage_notes ? (
+                          <div className="mt-1 text-corp-text/90 italic">
+                            “{c.usage_notes}”
+                          </div>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              ) : null}
+
+              {data.other_links.length > 0 ? (
+                <section>
+                  <h5 className="text-[11px] uppercase tracking-wider text-corp-accent mb-1">
+                    Other links ({data.other_links.length})
+                  </h5>
+                  <ul className="space-y-1.5">
+                    {data.other_links.map((l) => {
+                      const route = LINK_ROUTES[l.other_type]?.(l.other_id);
+                      return (
+                        <li
+                          key={`l-${l.link_id}`}
+                          className="text-xs bg-corp-surface2 border border-corp-border rounded p-2"
+                        >
+                          <div className="flex items-baseline gap-2 flex-wrap">
+                            <span className="text-[10px] uppercase text-corp-muted">
+                              {l.other_type.replace(/_/g, " ")}
+                            </span>
+                            {route ? (
+                              <Link
+                                href={route}
+                                className="font-medium text-corp-accent hover:underline truncate"
+                              >
+                                {l.other_label}
+                              </Link>
+                            ) : (
+                              <span className="font-medium truncate">
+                                {l.other_label}
+                              </span>
+                            )}
+                          </div>
+                          {l.relation || l.note ? (
+                            <div className="text-corp-muted mt-0.5">
+                              {l.relation ? `relation: ${l.relation}` : ""}
+                              {l.relation && l.note ? " · " : ""}
+                              {l.note ?? ""}
+                            </div>
+                          ) : null}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </section>
+              ) : null}
+            </div>
+          )
+        ) : null}
+      </div>
+    </aside>
   );
 }
 

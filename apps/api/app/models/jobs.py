@@ -167,6 +167,18 @@ class JobFetchQueue(Base, IdMixin, TimestampMixin):
     created_tracked_job_id: Mapped[Optional[int]] = mapped_column(
         BigInteger, ForeignKey("tracked_jobs.id", ondelete="SET NULL"), nullable=True
     )
+    # --- Generic task-queue fields (migration 0012). ------------------------
+    # The `url`/`desired_*` columns above are fetch-specific; these four make
+    # the same table capable of carrying any Companion task. `kind`
+    # discriminates — "fetch" (existing), "score", "tailor", "humanize",
+    # "strategy", "interview_prep", "interview_retro", "org_research",
+    # "autofill", "resume_ingest". The worker dispatches on this column.
+    # `payload` carries per-kind args (e.g. {"tracked_job_id": 42} for score);
+    # `result` is filled in on success (e.g. {"generated_document_id": 101}).
+    kind: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    label: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    payload: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    result: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
 
 class InterviewArtifact(Base, IdMixin, TimestampMixin, SoftDeleteMixin):

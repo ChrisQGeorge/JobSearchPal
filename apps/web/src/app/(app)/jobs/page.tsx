@@ -825,37 +825,24 @@ function ScoreAllButton({ onDone }: { onDone: () => void }) {
     setMsg(null);
     try {
       const r = await api.post<{
-        analyzed: number;
+        enqueued: number;
         skipped_no_description: number;
         skipped_already_scored: number;
-        rate_limited?: boolean;
-        rate_limit_message?: string | null;
-        remaining_unprocessed?: number;
-        errors: { job_id: number; error: string }[];
+        errors?: { job_id: number; error: string }[];
       }>("/api/v1/jobs/batch-analyze-jd");
-      let msg = `Analyzed ${r.analyzed}`;
-      if (r.rate_limited) {
-        msg = `Rate-limited after ${r.analyzed}. ${r.remaining_unprocessed ?? 0} left — rerun Score all when your tokens refresh.`;
-      } else {
-        if (r.skipped_already_scored)
-          msg += ` · ${r.skipped_already_scored} already scored`;
-        if (r.skipped_no_description)
-          msg += ` · ${r.skipped_no_description} no JD`;
-        if (r.errors.length) msg += ` · ${r.errors.length} errors`;
-      }
-      setMsg(msg);
+      let m = `Queued ${r.enqueued} for scoring`;
+      if (r.skipped_already_scored)
+        m += ` · ${r.skipped_already_scored} already scored`;
+      if (r.skipped_no_description) m += ` · ${r.skipped_no_description} no JD`;
+      if (r.enqueued > 0) m += " · see Companion Activity for progress";
+      setMsg(m);
       onDone();
     } catch (e) {
       setMsg(
-        e instanceof ApiError
-          ? e.status === 429
-            ? "Rate-limited — try again when your tokens refresh."
-            : `Batch failed (HTTP ${e.status}).`
-          : "Batch failed.",
+        e instanceof ApiError ? `Batch failed (HTTP ${e.status}).` : "Batch failed.",
       );
     } finally {
       setRunning(false);
-      // Keep rate-limit messages visible longer — they're actionable.
       setTimeout(() => setMsg(null), 12000);
     }
   }
@@ -867,9 +854,9 @@ function ScoreAllButton({ onDone }: { onDone: () => void }) {
         className="jsp-btn-ghost"
         onClick={run}
         disabled={running}
-        title="Run JD analysis on every unscored job with a description"
+        title="Enqueue JD analysis for every unscored job — each appears on the Companion Activity page"
       >
-        {running ? "Scoring..." : "Score all"}
+        {running ? "Queuing..." : "Score all"}
       </button>
       {msg ? (
         <span className="text-[11px] text-corp-muted">{msg}</span>

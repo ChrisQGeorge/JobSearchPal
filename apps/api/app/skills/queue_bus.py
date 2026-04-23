@@ -173,6 +173,12 @@ def list_tasks(limit: int = 100) -> list[dict[str, Any]]:
     return rows[:limit]
 
 
+def get_task(source: str, item_id: Any) -> dict[str, Any] | None:
+    """Point-lookup of a single task registry entry, or None if absent.
+    Callers supply the same (source, item_id) they'd pass to publish()."""
+    return _TASKS.get(_task_key(source, item_id))
+
+
 def publish(event: dict[str, Any]) -> None:
     """Fan-out to every subscriber + update the task registry.
     Never blocks; drops for slow consumers."""
