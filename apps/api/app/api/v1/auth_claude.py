@@ -55,6 +55,34 @@ _PROMPT_RE = re.compile(r"paste\s*code\s*here", re.IGNORECASE)
 _TOKEN_START_RE = re.compile(r"sk-ant-oat01-[A-Za-z0-9_=-]+")
 
 
+def _prune_old_debug_files(
+    directory: Path, *, keep_recent: int = 10, max_age_days: int = 7
+) -> None:
+    """Delete PTY debug .bin files older than `max_age_days`, keeping the
+    newest `keep_recent` regardless of age so there's always something to
+    inspect if a token extraction just failed. Best-effort — any OSError
+    during cleanup is logged and swallowed so a broken cleanup can't break
+    a login attempt."""
+    try:
+        files = sorted(
+            (p for p in directory.glob("*.bin") if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError as exc:
+        log.warning("auth-claude debug prune skipped: %s", exc)
+        return
+    cutoff = time.time() - max_age_days * 86400
+    for i, p in enumerate(files):
+        if i < keep_recent:
+            continue
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+        except OSError as exc:
+            log.debug("auth-claude debug prune could not remove %s: %s", p, exc)
+
+
 def _extract_token(buf: str) -> Optional[str]:
     """Pull the long-lived OAuth token out of a successful setup-token run.
 
@@ -124,6 +152,12 @@ class LoginSession:
         # token-extraction bugs. Rotated per-session.
         try:
             _DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+            # Best-effort cleanup of old debug files. Kept short because
+            # these can accumulate across many OAuth attempts and bloat the
+            # claude_config volume. One-week retention is plenty for
+            # diagnosing a recent failure, and we only need the latest one
+            # for any in-flight investigation.
+            _prune_old_debug_files(_DEBUG_DIR, keep_recent=10, max_age_days=7)
             self._debug_path: Optional[Path] = _DEBUG_DIR / f"{int(time.time())}.bin"
             self._debug_fh = self._debug_path.open("wb")
         except OSError as exc:

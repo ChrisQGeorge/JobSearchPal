@@ -26,6 +26,83 @@ const PREVIEWABLE_DOC_TYPES: ReadonlySet<string> = new Set([
   "other",
 ]);
 
+// Doc-type → the human-readable token we drop into the filename. Defaults
+// to Title-Case of the raw type with underscores replaced by hyphens.
+const DOC_TYPE_FILENAME: Record<string, string> = {
+  resume: "Resume",
+  cover_letter: "Cover-Letter",
+  outreach_email: "Outreach",
+  thank_you: "Thank-You",
+  followup: "Followup",
+  portfolio: "Portfolio",
+  reference: "Reference",
+  offer_letter: "Offer-Letter",
+  transcript: "Transcript",
+  certificate: "Certificate",
+  other: "Doc",
+};
+
+/** Sanitize any stray token for safe use in a filename. Replaces runs of
+ * whitespace with a single hyphen, drops characters that cause trouble
+ * on Windows / macOS / Linux, and collapses consecutive hyphens. */
+function _fnToken(raw: string | null | undefined): string {
+  if (!raw) return "";
+  return raw
+    .trim()
+    .replace(/[\\/:*?"<>|]+/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function buildFilenameBase(params: {
+  name: string | null;
+  docType: string;
+  orgName: string | null;
+  fallbackTitle: string;
+}): string {
+  const nameTok = _fnToken(params.name);
+  const typeTok = _fnToken(
+    DOC_TYPE_FILENAME[params.docType] ?? params.docType,
+  );
+  const orgTok = _fnToken(params.orgName);
+  const pieces = [nameTok, typeTok, orgTok].filter(Boolean);
+  if (pieces.length >= 2) return pieces.join("_");
+  // Fallback when we're missing the name / org — use the doc's title as a
+  // last resort so the file still gets a sensible name.
+  const fallback = _fnToken(params.fallbackTitle) || "Document";
+  return pieces.length === 0 ? fallback : `${pieces[0]}_${fallback}`;
+}
+
+function downloadMarkdown(filenameBase: string, content: string): void {
+  const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${filenameBase}.md`;
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  // Give the browser a tick to start the download before revoking.
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function printWithFilename(filenameBase: string): void {
+  // Browsers derive the "Save as PDF" filename suggestion from document.title.
+  // Swap it in just around the print dialog so the real app title comes back
+  // after the print spooler finishes (the afterprint event is reliable in
+  // Chrome / Firefox / Safari).
+  const originalTitle = document.title;
+  const onAfter = () => {
+    document.title = originalTitle;
+    window.removeEventListener("afterprint", onAfter);
+  };
+  window.addEventListener("afterprint", onAfter);
+  document.title = filenameBase;
+  window.print();
+}
+
 type SelectionEditMode = "rewrite" | "answer" | "new_document";
 
 type SelectionEditResult = {
@@ -68,6 +145,66 @@ export default function DocumentEditorPage({
   const [parentDoc, setParentDoc] = useState<GeneratedDocument | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("preview");
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  // Data fetched lazily for the download-filename feature. We need:
+  //  - the user's full name (from Resume Profile, auth, or demographics)
+  //  - the owning TrackedJob's organization name, if any
+  // so we can compose a filename like "Christopher-George_Resume_Amazon".
+  const [profileName, setProfileName] = useState<string | null>(null);
+  const [orgName, setOrgName] = useState<string | null>(null);
+
+  // Fetch the user's canonical name + the owning job's org so we can build
+  // a nice download filename (`Firstname-Lastname_Resume_Acme.pdf`). Both
+  // lookups fail silently — we just fall back to the doc title.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .get<{
+        full_name?: string | null;
+      } | null>("/api/v1/preferences/resume-profile")
+      .then((p) => {
+        if (cancelled) return;
+        setProfileName((p?.full_name || "").trim() || null);
+      })
+      .catch(() => {
+        /* non-fatal */
+      });
+    api
+      .get<{ display_name?: string | null; email?: string | null } | null>(
+        "/api/v1/auth/me",
+      )
+      .then((u) => {
+        if (cancelled) return;
+        // Only use auth name if Resume Profile didn't answer first.
+        setProfileName((prev) => prev ?? (u?.display_name || "").trim() || null);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!doc?.tracked_job_id) {
+      setOrgName(null);
+      return;
+    }
+    let cancelled = false;
+    api
+      .get<{ organization_id: number | null }>(
+        `/api/v1/jobs/${doc.tracked_job_id}`,
+      )
+      .then(async (job) => {
+        if (cancelled || !job.organization_id) return;
+        const org = await api.get<{ name: string }>(
+          `/api/v1/organizations/${job.organization_id}`,
+        );
+        if (!cancelled) setOrgName((org?.name || "").trim() || null);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [doc?.tracked_job_id]);
 
   // Load the parent doc lazily when the user wants the diff view.
   useEffect(() => {
@@ -232,6 +369,17 @@ export default function DocumentEditorPage({
   const extractedFrom = structured?.extracted_from ?? null;
   const isExtracted =
     isUpload && extractedFrom && extractedFrom !== "text";
+
+  // Build the download filename: `Firstname-Lastname_Resume_Acme`. Every
+  // component is sanitized (space → hyphen, non-safe chars dropped) and
+  // missing components collapse to a shorter name. Used for both .md
+  // download and the PDF print dialog's proposed filename.
+  const filenameBase = buildFilenameBase({
+    name: profileName,
+    docType: doc.doc_type,
+    orgName,
+    fallbackTitle: doc.title,
+  });
   const canPreview =
     !isUpload && !!body && PREVIEWABLE_DOC_TYPES.has(doc.doc_type);
   const effectiveMode: ViewMode = canPreview ? viewMode : "edit";
@@ -298,10 +446,20 @@ export default function DocumentEditorPage({
             <button
               type="button"
               className="jsp-btn-ghost text-xs"
-              onClick={() => window.print()}
-              title="Open the browser print dialog — use 'Save as PDF' there"
+              onClick={() => printWithFilename(filenameBase)}
+              title={`Open the browser print dialog — proposes "${filenameBase}.pdf"`}
             >
               Print / PDF
+            </button>
+          ) : null}
+          {doc.content_md && !isUpload ? (
+            <button
+              type="button"
+              className="jsp-btn-ghost text-xs"
+              onClick={() => downloadMarkdown(filenameBase, body)}
+              title={`Download "${filenameBase}.md"`}
+            >
+              Download .md
             </button>
           ) : null}
           {doc.content_md && !isUpload ? (

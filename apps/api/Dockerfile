@@ -4,6 +4,13 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    # Force a UTF-8 locale so the Claude Code Node.js CLI (and any curl
+    # subprocesses it spawns) emit non-ASCII characters (é, ñ, …) correctly
+    # through stdout pipes. Without this the slim Python image defaults to
+    # the "C" locale and the bytes come back as mojibake.
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONIOENCODING=utf-8 \
     # Tell Claude Code where to look for its config inside the container.
     # We bind-mount the host's ~/.claude here at runtime.
     CLAUDE_CONFIG_DIR=/root/.claude

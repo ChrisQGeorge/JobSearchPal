@@ -87,6 +87,14 @@ async def run_claude_prompt(
         cmd += ["--allowedTools", ",".join(allowed_tools)]
 
     env = os.environ.copy()
+    # Force a UTF-8 locale in the subprocess. Without this the Node.js CLI
+    # (and any curl calls it makes inside Bash) default to whatever the
+    # inherited POSIX locale is, which on the slim Python base image is
+    # "C" — producing mojibake on non-ASCII characters ("résumé" → "rÃ©sumÃ©")
+    # by the time it round-trips through subprocess.PIPE as bytes.
+    env["LANG"] = "C.UTF-8"
+    env["LC_ALL"] = "C.UTF-8"
+    env["PYTHONIOENCODING"] = "utf-8"
     # Auth precedence: a stored long-lived OAuth token (from the in-UI login
     # flow) wins, otherwise fall back to an ANTHROPIC_API_KEY if configured.
     oauth_token = load_token()
@@ -204,6 +212,9 @@ async def stream_claude_prompt(
         cmd += ["--allowedTools", ",".join(allowed_tools)]
 
     env = os.environ.copy()
+    env["LANG"] = "C.UTF-8"
+    env["LC_ALL"] = "C.UTF-8"
+    env["PYTHONIOENCODING"] = "utf-8"
     oauth_token = load_token()
     if oauth_token:
         env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
@@ -218,12 +229,20 @@ async def stream_claude_prompt(
     )
 
     try:
+        # asyncio.StreamReader's default per-line buffer is 64 KB. Claude's
+        # stream-json emits whole assistant blocks (or large tool_result
+        # payloads from a long curl response) on a single line, and those
+        # routinely blow past 64 KB — raising ValueError "Separator is
+        # found, but chunk is longer than limit" and killing the stream.
+        # 16 MB gives plenty of headroom; worst case it's a few MB of
+        # serialized history JSON from a /history/work curl.
         proc = await _a.create_subprocess_exec(
             *cmd,
             stdout=_a.subprocess.PIPE,
             stderr=_a.subprocess.PIPE,
             cwd=effective_cwd,
             env=env,
+            limit=16 * 1024 * 1024,
         )
     except FileNotFoundError as exc:
         raise ClaudeCodeError(
@@ -241,7 +260,21 @@ async def stream_claude_prompt(
     try:
         async with _a.timeout(timeout_seconds):
             while True:
-                line = await proc.stdout.readline()
+                try:
+                    line = await proc.stdout.readline()
+                except ValueError as exc:
+                    # Shouldn't happen with the 16 MB `limit=` above, but
+                    # fail soft instead of tearing down the whole tailor:
+                    # log, skip to the next newline, and keep going.
+                    log.warning(
+                        "stream-json line exceeded readline buffer: %s. "
+                        "Skipping to next newline.", exc,
+                    )
+                    try:
+                        await proc.stdout.readuntil(b"\n")
+                    except Exception:
+                        break
+                    continue
                 if not line:
                     break
                 try:

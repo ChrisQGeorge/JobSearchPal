@@ -111,17 +111,22 @@ Project skill definitions already exist at `/skills/<name>/SKILL.md`. Wire them 
 - ✅ **Timeline: same-org inline** — `assignLanes` now prefers lanes whose tail matches the event's subtitle, with a 60-day gap tolerance. Intern → full-time at the same company packs onto one lane.
 - ✅ **Timeline: linked-org grouping** — projects linked to a Work or Education via `entity_links` now carry that entity's org as `metadata.effective_org`. By Org mode groups them under the linked job's org instead of "Unaffiliated".
 - ✅ **resume-ingest skill** — `POST /history/resume-ingest` (dry_run) analyzes an uploaded resume and returns proposed WorkExperience / Education / Skill / Project entries. Committing (dry_run=false) persists them with case-insensitive skill dedupe and auto-creates Organization rows as needed. "Import from resume" button on the History Editor header opens an upload → review → commit flow.
+- ✅ **Course relationships** — `RelatedItemsPanel` now renders on every course (editable in edit mode, read-only in the collapsed course list). Supports linking contacts, work experiences, projects, and every other polymorphic entity type.
+- ✅ **Stream-json line-size crash** — bumped `asyncio.StreamReader` buffer from 64 KB to 16 MB when spawning Claude Code. Single assistant/text blocks routinely exceeded 64 KB (big tool_result payloads from history curls) and raised `ValueError: Separator is found, but chunk is longer than limit`, killing the tailor. Also catches the error in a per-line try/except so if we ever hit the new ceiling it logs and continues instead of torching the stream.
+- ✅ **Download filename convention** — Studio now suggests `Firstname-Lastname_Resume_Organization` as the filename for both Print/PDF and a new "Download .md" button. Falls back gracefully if resume profile or org aren't populated. Name resolution: resume_profile.full_name → auth.me.display_name.
+- ✅ **Queue: account-scoped cooldowns + long-window usage limits** — `_handle_rate_limit` now parses "resets at 3:00 PM" / "in 5 hours" patterns for Claude Pro's 5-hour window, caps cooldowns at 12h, tracks consecutive rate-limit hits in `payload.rate_limit_count` (so the escalating schedule survives attempt roll-backs), and propagates the cooldown to every other queued task for the same user. The whole queue parks together and wakes together.
+- ✅ **Generalized task queue** — migration 0012 adds `kind`/`label`/`payload`/`result` to `job_fetch_queue`. Worker is now a dispatcher keyed on `kind` — fetch + score handlers wired today; tailor/humanize/etc. can plug in with just a new handler. Batch scoring enqueues one `score` task per unscored job and returns in <1s.
 
 **Deferred (low priority / requires more scope):**
 - [ ] Project panel: dedicated skills-link field with `usage_notes` (parity with Work/Courses). Today skills attach via `entity_links`/RelatedItemsPanel which is functionally equivalent but doesn't persist usage notes.
-- [ ] History editor: add a `contact_links` picker on Work / Education / Project / TrackedJob rows (backend already supports it via EntityLink).
+- ✅ **Contact-link picker on history rows** — `RelatedItemsPanel` is now on Work, Education, Courses (new this turn), and Project; each can link to contacts (and every other polymorphic type) with relation + note. TrackedJob keeps its dedicated Contacts tab.
 - [ ] Achievement / Certification / Publication / VolunteerWork issuer+venue: upgrade to `OrganizationCombobox` (schema change + migration).
 - ✅ **Skills catalog: full attachment-detail side view** — click a skill row to open a right-side panel showing evidence notes + every attached Work (with org + dates + usage notes), Course (with parent degree + term + usage notes), and polymorphic EntityLink (tracked_jobs deep-link to `/jobs/{id}`, generated_documents to `/studio/{id}`). Backend endpoint now resolves labels, org names, and usage notes in a single call.
 - [ ] Spend cap (SRS REQ-COST-002) — enforce per-month LLM ceiling **only when using an API key**. OAuth sessions have no per-turn cost.
 
 ## Known minor issues
 
-- [ ] **UTF-8 mojibake** in Companion responses (e.g., `résumé` → `rÃ©sumÃ©`). ASCII is fine. Suspect double-encoding between subprocess stdout → FastAPI → JSON.
+- ✅ **UTF-8 mojibake fix** — child subprocess now runs with `LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONIOENCODING=utf-8` (set in the Dockerfile and re-applied in both `run_claude_prompt` and `stream_claude_prompt`). The Node.js CLI and any curls it spawns write non-ASCII bytes as UTF-8, which Python decodes correctly — no more `rÃ©sumÃ©` round-trips.
 - [ ] **Organization soft-delete references**: the timeline/history still show the stale name when an org is soft-deleted (by design), but there's no "reassign or hard-delete" workflow yet.
 - ✅ **Settings stubs**: AI Persona has full CRUD + activate/deactivate. Data Export / Import is wired up via `/api/v1/admin/export` + `/api/v1/admin/import`.
 - ✅ **Sidebar collapse / mobile layout**: drawer-style sidebar on viewports below `md`.
@@ -129,8 +134,8 @@ Project skill definitions already exist at `/skills/<name>/SKILL.md`. Wire them 
 - ✅ **CORS / port flexibility** — `next.config.mjs` proxies `/api/*` and `/health/*` through the web origin, so changing `.env` ports no longer requires a frontend rebuild and CORS is moot.
 - [ ] **Observability** (SRS §3.3.5): `/metrics` Prometheus endpoint, structured JSON logs with PII scrubbing.
 - [ ] **Accessibility pass** (WCAG 2.1 AA per SRS §3.1.1): keyboard traversal audit, ARIA labels on charts, focus indicators in the combobox.
-- [ ] **Circular link cleanup**: no UI for "linked from" — if A links to B there's no reverse view on B.
-- [ ] `/tmp/jsp-login-debug/*.bin` files inside the container's `claude_config` volume accumulate from OAuth runs; add a cleanup task.
+- ✅ **Circular link reverse view** — `GET /history/links?either_type=X&either_id=N` returns links where the entity is on either side, normalized so the queried entity is always the `from_*` side. `RelatedItemsPanel` now uses it so entity B shows inbound links from A without extra bookkeeping.
+- ✅ **OAuth debug-file cleanup** — new `_prune_old_debug_files` helper runs at the start of every `claude setup-token` session; deletes `.bin` files older than 7 days while always keeping the most recent 10 for active investigation. Cleans up the `claude_config` volume automatically.
 
 ## Non-code housekeeping
 

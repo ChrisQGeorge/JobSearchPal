@@ -1580,33 +1580,81 @@ async def _label_for(
 async def list_entity_links(
     from_entity_type: Optional[str] = None,
     from_entity_id: Optional[int] = None,
+    either_type: Optional[str] = None,
+    either_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> list[EntityLinkOut]:
+    """List entity_links owned by the current user.
+
+    * `from_entity_type` + `from_entity_id` — only links that FROM this entity
+      (one-directional, preserves original direction).
+    * `either_type` + `either_id` — links where this entity is on EITHER
+      side. The returned rows are normalized so the queried entity is always
+      the `from_*` side and the counterpart is the `to_*` side, so the UI
+      can render "linked from" context without extra bookkeeping.
+    """
+    from sqlalchemy import and_ as _and, or_ as _or
+
     stmt = select(EntityLink).where(EntityLink.user_id == user.id)
-    if from_entity_type:
-        _assert_linkable_type(from_entity_type)
-        stmt = stmt.where(EntityLink.from_entity_type == from_entity_type)
-    if from_entity_id is not None:
-        stmt = stmt.where(EntityLink.from_entity_id == from_entity_id)
+
+    # Either-direction mode takes precedence when both are supplied.
+    if either_type is not None and either_id is not None:
+        _assert_linkable_type(either_type)
+        stmt = stmt.where(
+            _or(
+                _and(
+                    EntityLink.from_entity_type == either_type,
+                    EntityLink.from_entity_id == either_id,
+                ),
+                _and(
+                    EntityLink.to_entity_type == either_type,
+                    EntityLink.to_entity_id == either_id,
+                ),
+            )
+        )
+    else:
+        if from_entity_type:
+            _assert_linkable_type(from_entity_type)
+            stmt = stmt.where(EntityLink.from_entity_type == from_entity_type)
+        if from_entity_id is not None:
+            stmt = stmt.where(EntityLink.from_entity_id == from_entity_id)
+
     stmt = stmt.order_by(EntityLink.id.desc())
     links = list((await db.execute(stmt)).scalars().all())
 
-    # Hydrate `to_label` for the UI — label of the target entity.
+    # Hydrate `to_label` for the UI. In either-direction mode, also flip
+    # reverse links so the queried entity is always on the `from_*` side.
     out: list[EntityLinkOut] = []
     for link in links:
+        if (
+            either_type is not None
+            and either_id is not None
+            and link.to_entity_type == either_type
+            and link.to_entity_id == either_id
+            and (
+                link.from_entity_type != either_type
+                or link.from_entity_id != either_id
+            )
+        ):
+            # Reverse link — flip the sides so the queried entity is "from".
+            from_type, from_id = link.to_entity_type, link.to_entity_id
+            to_type, to_id = link.from_entity_type, link.from_entity_id
+        else:
+            from_type, from_id = link.from_entity_type, link.from_entity_id
+            to_type, to_id = link.to_entity_type, link.to_entity_id
         label = None
         try:
-            label = await _label_for(db, link.to_entity_type, link.to_entity_id)
+            label = await _label_for(db, to_type, to_id)
         except Exception:
             pass
         out.append(
             EntityLinkOut(
                 id=link.id,
-                from_entity_type=link.from_entity_type,
-                from_entity_id=link.from_entity_id,
-                to_entity_type=link.to_entity_type,
-                to_entity_id=link.to_entity_id,
+                from_entity_type=from_type,
+                from_entity_id=from_id,
+                to_entity_type=to_type,
+                to_entity_id=to_id,
                 relation=link.relation,
                 note=link.note,
                 to_label=label,

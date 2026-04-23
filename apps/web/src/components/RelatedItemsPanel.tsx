@@ -109,8 +109,11 @@ export function RelatedItemsPanel({
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
+      // Bidirectional: if X was linked from A to B, BOTH A and B should see
+      // the link in their Related Items panel. The backend normalizes the
+      // returned rows so the queried entity is always the `from_*` side.
       const ls = await api.get<EntityLink[]>(
-        `/api/v1/history/links?from_entity_type=${fromType}&from_entity_id=${fromId}`,
+        `/api/v1/history/links?either_type=${fromType}&either_id=${fromId}`,
       );
       setLinks(ls);
     } finally {

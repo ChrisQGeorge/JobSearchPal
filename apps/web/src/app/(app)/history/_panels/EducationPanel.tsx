@@ -219,6 +219,7 @@ function CoursesPanel({
                 readOnly
                 emptyLabel=""
               />
+              <RelatedItemsPanel fromType="course" fromId={c.id} readOnly />
             </li>
           ))}
         </ul>
@@ -290,6 +291,9 @@ function CoursesPanel({
                   <SkillMultiSelect
                     endpoint={`/api/v1/history/courses/${c.id}/skills`}
                   />
+                  <div className="mt-3">
+                    <RelatedItemsPanel fromType="course" fromId={c.id} />
+                  </div>
                 </>
               )}
             </li>
