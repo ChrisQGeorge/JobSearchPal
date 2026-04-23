@@ -27,6 +27,7 @@ from app.models.history import (
     Language,
     Presentation,
     Project,
+    ProjectSkill,
     Publication,
     Skill,
     VolunteerWork,
@@ -269,8 +270,12 @@ async def list_skills(
         return []
     ids = [r.id for r in rows]
 
-    # Count attachments from all three sources.
-    from app.models.history import WorkExperienceSkill as _WES, CourseSkill as _CS
+    # Count attachments from all four sources.
+    from app.models.history import (
+        WorkExperienceSkill as _WES,
+        CourseSkill as _CS,
+        ProjectSkill as _PS,
+    )
     from app.models.links import EntityLink as _EL
 
     wes_counts = dict(
@@ -281,6 +286,11 @@ async def list_skills(
     cs_counts = dict(
         (await db.execute(
             select(_CS.skill_id, func.count()).where(_CS.skill_id.in_(ids)).group_by(_CS.skill_id)
+        )).all()
+    )
+    ps_counts = dict(
+        (await db.execute(
+            select(_PS.skill_id, func.count()).where(_PS.skill_id.in_(ids)).group_by(_PS.skill_id)
         )).all()
     )
     # EntityLink: skill can be on either end. Count anything pointing to a skill.
@@ -307,6 +317,7 @@ async def list_skills(
         count = (
             wes_counts.get(r.id, 0)
             + cs_counts.get(r.id, 0)
+            + ps_counts.get(r.id, 0)
             + el_to_counts.get(r.id, 0)
             + el_from_counts.get(r.id, 0)
         )
@@ -328,6 +339,8 @@ async def skill_attachments(
     from app.models.history import (
         Course as _Course,
         Education as _Education,
+        Project as _Project,
+        ProjectSkill as _PS,
         WorkExperience as _WE,
         WorkExperienceSkill as _WES,
         CourseSkill as _CS,
@@ -389,6 +402,25 @@ async def skill_attachments(
             )
         ).all()
         org_names = {row[0]: row[1] for row in rows}
+
+    # --- Projects (via the dedicated project_skills junction) ------------
+    project_rows = list(
+        (
+            await db.execute(
+                select(
+                    _Project.id,
+                    _Project.name,
+                    _Project.role,
+                    _Project.start_date,
+                    _Project.end_date,
+                    _Project.is_ongoing,
+                    _PS.usage_notes,
+                ).join(_PS, _PS.project_id == _Project.id)
+                .where(_PS.skill_id == skill_id, _Project.user_id == user.id)
+                .order_by(_Project.end_date.desc().nulls_first())
+            )
+        ).all()
+    )
 
     # --- Polymorphic entity links ----------------------------------------
     link_rows = list(
@@ -457,6 +489,18 @@ async def skill_attachments(
                 "usage_notes": r[9],
             }
             for r in course_rows
+        ],
+        "projects": [
+            {
+                "id": r[0],
+                "name": r[1],
+                "role": r[2],
+                "start_date": _iso(r[3]),
+                "end_date": _iso(r[4]),
+                "is_ongoing": bool(r[5]),
+                "usage_notes": r[6],
+            }
+            for r in project_rows
         ],
         "other_links": other_links,
     }
@@ -1493,6 +1537,119 @@ async def unlink_course_skill(
             select(CourseSkill).where(
                 CourseSkill.course_id == entity_id,
                 CourseSkill.skill_id == skill_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is not None:
+        await db.delete(row)
+        await db.commit()
+
+
+# --- Project skills (dedicated junction, mirrors Work/Course patterns) ------
+
+
+async def _get_owned_project(
+    db: AsyncSession, project_id: int, user_id: int
+):
+    project = (
+        await db.execute(
+            select(Project).where(
+                Project.id == project_id,
+                Project.user_id == user_id,
+                Project.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+@router.get("/projects/{entity_id}/skills", response_model=list[LinkedSkill])
+async def list_project_skills(
+    entity_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[LinkedSkill]:
+    await _get_owned_project(db, entity_id, user.id)
+    rows = (
+        await db.execute(
+            select(ProjectSkill, Skill)
+            .join(Skill, ProjectSkill.skill_id == Skill.id)
+            .where(
+                ProjectSkill.project_id == entity_id,
+                Skill.deleted_at.is_(None),
+            )
+        )
+    ).all()
+    return [
+        LinkedSkill(
+            skill_id=s.id,
+            name=s.name,
+            category=s.category,
+            proficiency=s.proficiency,
+            usage_notes=link.usage_notes,
+        )
+        for link, s in rows
+    ]
+
+
+@router.post(
+    "/projects/{entity_id}/skills",
+    response_model=LinkedSkill,
+    status_code=status.HTTP_201_CREATED,
+)
+async def link_project_skill(
+    entity_id: int,
+    body: LinkSkillIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> LinkedSkill:
+    await _get_owned_project(db, entity_id, user.id)
+    skill = await _skill_exists_for_user(db, body.skill_id, user.id)
+    existing = (
+        await db.execute(
+            select(ProjectSkill).where(
+                ProjectSkill.project_id == entity_id,
+                ProjectSkill.skill_id == body.skill_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        existing = ProjectSkill(
+            project_id=entity_id,
+            skill_id=body.skill_id,
+            usage_notes=body.usage_notes,
+        )
+        db.add(existing)
+    else:
+        existing.usage_notes = body.usage_notes
+    await db.commit()
+    return LinkedSkill(
+        skill_id=skill.id,
+        name=skill.name,
+        category=skill.category,
+        proficiency=skill.proficiency,
+        usage_notes=existing.usage_notes,
+    )
+
+
+@router.delete(
+    "/projects/{entity_id}/skills/{skill_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def unlink_project_skill(
+    entity_id: int,
+    skill_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> None:
+    await _get_owned_project(db, entity_id, user.id)
+    row = (
+        await db.execute(
+            select(ProjectSkill).where(
+                ProjectSkill.project_id == entity_id,
+                ProjectSkill.skill_id == skill_id,
             )
         )
     ).scalar_one_or_none()

@@ -18,8 +18,8 @@ from app.models.companion import CompanionConversation, ConversationMessage
 from app.models.documents import GeneratedDocument, WritingSample
 from app.models.history import (
     Achievement, Certification, Contact, Course, CustomEvent, Education,
-    Language, Presentation, Project, Publication, Skill, VolunteerWork,
-    WorkExperience, WorkExperienceSkill, CourseSkill,
+    Language, Presentation, Project, ProjectSkill, Publication, Skill,
+    VolunteerWork, WorkExperience, WorkExperienceSkill, CourseSkill,
 )
 from app.models.jobs import (
     ApplicationEvent, InterviewArtifact, InterviewRound, JobFetchQueue,
@@ -39,7 +39,7 @@ USER_MODELS = [
     Persona, JobPreferences, JobCriterion, WorkAuthorization, Demographics,
     Skill, WorkExperience, Education, Course, Certification, Language,
     Project, Publication, Presentation, Achievement, VolunteerWork, Contact,
-    CustomEvent, WorkExperienceSkill, CourseSkill, EntityLink,
+    CustomEvent, WorkExperienceSkill, CourseSkill, ProjectSkill, EntityLink,
     TrackedJob, InterviewRound, ApplicationEvent, InterviewArtifact, JobFetchQueue,
     GeneratedDocument, WritingSample,
     CompanionConversation, ConversationMessage,
@@ -86,6 +86,10 @@ async def _rows_for(db: AsyncSession, model: type, user_id: int) -> list[dict]:
         ).join(Education, Education.id == Course.education_id).where(
             Education.user_id == user_id
         )
+    elif model is ProjectSkill:
+        stmt = select(model).join(
+            Project, Project.id == ProjectSkill.project_id
+        ).where(Project.user_id == user_id)
     else:
         return []
     rows = (await db.execute(stmt)).scalars().all()

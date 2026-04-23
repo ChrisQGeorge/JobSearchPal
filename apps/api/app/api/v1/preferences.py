@@ -33,6 +33,15 @@ router = APIRouter(prefix="/preferences", tags=["preferences"])
 # --- JobPreferences ---------------------------------------------------------
 
 
+class PreferredLocationIn(BaseModel):
+    """One entry on JobPreferences.preferred_locations."""
+
+    name: str = Field(min_length=1, max_length=255)
+    # None = "no cap — anywhere near this place" (the user just wants to
+    # flag that they'd like working from here, open to commute).
+    max_distance_miles: Optional[int] = Field(default=None, ge=0, le=2000)
+
+
 class JobPreferencesIn(BaseModel):
     salary_currency: str = "USD"
     salary_preferred_target: Optional[float] = None
@@ -50,6 +59,10 @@ class JobPreferencesIn(BaseModel):
     max_commute_minutes_acceptable: Optional[int] = None
     willing_to_relocate: bool = False
     relocation_notes: Optional[str] = None
+    # Preferred target locations, each with a miles radius. Validated
+    # loosely — we accept any list of `{name, max_distance_miles}` dicts
+    # (miles may be None for "anywhere in / near this place").
+    preferred_locations: Optional[list[PreferredLocationIn]] = None
     travel_percent_preferred: Optional[int] = None
     travel_percent_acceptable_max: Optional[int] = None
     travel_percent_unacceptable_above: Optional[int] = None

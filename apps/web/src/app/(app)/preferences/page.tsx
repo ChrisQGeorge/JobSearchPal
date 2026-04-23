@@ -115,6 +115,103 @@ function numOrNull(s: string): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+// ---------- Preferred-locations editor ---------------------------------------
+
+/**
+ * Multi-row editor: each row is `{name, max_distance_miles}`. The name input
+ * is a free-text box with a datalist pointing at COMMON_US_METROS plus any
+ * already-used names from the current list (so the user can reuse recent
+ * entries without retyping). Miles slider goes 0–200 with a "no cap" option
+ * when the slider is at the far end.
+ */
+function PreferredLocationsEditor({
+  value,
+  onChange,
+}: {
+  value: PreferredLocation[];
+  onChange: (next: PreferredLocation[]) => void;
+}) {
+  function update(idx: number, patch: Partial<PreferredLocation>) {
+    onChange(value.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
+  }
+  function remove(idx: number) {
+    onChange(value.filter((_, i) => i !== idx));
+  }
+  function addBlank() {
+    onChange([...value, { name: "", max_distance_miles: 30 }]);
+  }
+  const dlId = "jsp-metro-suggestions";
+  return (
+    <div className="space-y-2">
+      <datalist id={dlId}>
+        {COMMON_US_METROS.map((m) => (
+          <option key={m} value={m} />
+        ))}
+      </datalist>
+      {value.length === 0 ? (
+        <p className="text-xs text-corp-muted italic">
+          No locations yet. Add one below.
+        </p>
+      ) : null}
+      {value.map((row, i) => (
+        <div
+          key={i}
+          className="grid grid-cols-[1fr,190px,auto] gap-2 items-end"
+        >
+          <div>
+            <label className="jsp-label">Location</label>
+            <input
+              className="jsp-input"
+              list={dlId}
+              value={row.name}
+              onChange={(e) => update(i, { name: e.target.value })}
+              placeholder="Seattle, WA"
+            />
+          </div>
+          <div>
+            <label className="jsp-label">
+              Radius ·{" "}
+              {row.max_distance_miles == null
+                ? "no cap"
+                : `${row.max_distance_miles} mi`}
+            </label>
+            <input
+              type="range"
+              min={0}
+              max={200}
+              step={5}
+              className="w-full accent-corp-accent"
+              value={row.max_distance_miles ?? 200}
+              onChange={(e) => {
+                const n = Number(e.target.value);
+                // 200 is "no cap" — lets the user flag a preference for the
+                // city without gating on a specific commute distance.
+                update(i, { max_distance_miles: n >= 200 ? null : n });
+              }}
+            />
+          </div>
+          <button
+            type="button"
+            className="jsp-btn-ghost text-xs text-corp-danger border-corp-danger/40"
+            onClick={() => remove(i)}
+            title="Remove this location"
+          >
+            ×
+          </button>
+        </div>
+      ))}
+      <button
+        type="button"
+        className="jsp-btn-ghost text-xs"
+        onClick={addBlank}
+      >
+        + Add location
+      </button>
+    </div>
+  );
+}
+
+
 function SaveBar({
   dirty,
   saving,
@@ -433,6 +530,111 @@ function ResumeProfilePanel() {
 
 // ---------- Job Preferences -------------------------------------------------
 
+type PreferredLocation = {
+  name: string;
+  max_distance_miles: number | null;
+};
+
+// Lightweight autocomplete source for the preferred-locations input. The
+// backend doesn't care what the string is — these are just suggestions to
+// nudge the user toward canonical "City, ST" format. Users can type anything.
+const COMMON_US_METROS = [
+  "Remote (US)",
+  "New York, NY",
+  "Los Angeles, CA",
+  "Chicago, IL",
+  "Houston, TX",
+  "Phoenix, AZ",
+  "Philadelphia, PA",
+  "San Antonio, TX",
+  "San Diego, CA",
+  "Dallas, TX",
+  "Austin, TX",
+  "Fort Worth, TX",
+  "San Jose, CA",
+  "Jacksonville, FL",
+  "Columbus, OH",
+  "Indianapolis, IN",
+  "Charlotte, NC",
+  "San Francisco, CA",
+  "Seattle, WA",
+  "Denver, CO",
+  "Washington, DC",
+  "Boston, MA",
+  "El Paso, TX",
+  "Nashville, TN",
+  "Detroit, MI",
+  "Oklahoma City, OK",
+  "Portland, OR",
+  "Las Vegas, NV",
+  "Memphis, TN",
+  "Louisville, KY",
+  "Baltimore, MD",
+  "Milwaukee, WI",
+  "Albuquerque, NM",
+  "Tucson, AZ",
+  "Fresno, CA",
+  "Sacramento, CA",
+  "Kansas City, MO",
+  "Mesa, AZ",
+  "Atlanta, GA",
+  "Omaha, NE",
+  "Colorado Springs, CO",
+  "Raleigh, NC",
+  "Miami, FL",
+  "Oakland, CA",
+  "Minneapolis, MN",
+  "Tulsa, OK",
+  "Cleveland, OH",
+  "Wichita, KS",
+  "Arlington, VA",
+  "New Orleans, LA",
+  "Bakersfield, CA",
+  "Tampa, FL",
+  "Honolulu, HI",
+  "Anaheim, CA",
+  "Aurora, CO",
+  "Santa Ana, CA",
+  "St. Louis, MO",
+  "Pittsburgh, PA",
+  "Cincinnati, OH",
+  "Anchorage, AK",
+  "Henderson, NV",
+  "Greensboro, NC",
+  "Plano, TX",
+  "Newark, NJ",
+  "Lincoln, NE",
+  "Toledo, OH",
+  "Orlando, FL",
+  "Chula Vista, CA",
+  "Jersey City, NJ",
+  "Chandler, AZ",
+  "Madison, WI",
+  "Laredo, TX",
+  "Norfolk, VA",
+  "Durham, NC",
+  "Lubbock, TX",
+  "Winston-Salem, NC",
+  "Garland, TX",
+  "Glendale, AZ",
+  "Hialeah, FL",
+  "Reno, NV",
+  "Baton Rouge, LA",
+  "Irvine, CA",
+  "Chesapeake, VA",
+  "Irving, TX",
+  "Scottsdale, AZ",
+  "North Las Vegas, NV",
+  "Fremont, CA",
+  "Boise, ID",
+  "Richmond, VA",
+  "San Bernardino, CA",
+  "Birmingham, AL",
+  "Spokane, WA",
+  "Rochester, NY",
+  "Des Moines, IA",
+];
+
 type JobPreferences = {
   id: number;
   salary_currency: string;
@@ -451,6 +653,7 @@ type JobPreferences = {
   max_commute_minutes_acceptable?: number | null;
   willing_to_relocate: boolean;
   relocation_notes?: string | null;
+  preferred_locations?: PreferredLocation[] | null;
   travel_percent_preferred?: number | null;
   travel_percent_acceptable_max?: number | null;
   travel_percent_unacceptable_above?: number | null;
@@ -722,6 +925,20 @@ function JobPreferencesPanel() {
               value={data.relocation_notes ?? ""}
               onChange={(e) => set("relocation_notes", e.target.value || null)}
               placeholder="Open to EU; not TX or FL."
+            />
+          </div>
+          <div className="col-span-3">
+            <label className="jsp-label">Preferred locations</label>
+            <p className="text-[11px] text-corp-muted mb-2">
+              Places you'd like to work, each with a commute radius in miles.
+              Type to search common cities or enter anything. The Companion
+              matches these against tracked jobs' locations when scoring fit.
+            </p>
+            <PreferredLocationsEditor
+              value={data.preferred_locations ?? []}
+              onChange={(next) =>
+                set("preferred_locations", next.length ? next : null)
+              }
             />
           </div>
           <div>

@@ -83,6 +83,28 @@ class Education(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
+class ProjectSkill(Base, IdMixin, TimestampMixin):
+    """Per-project skill attachment with free-text usage_notes, mirroring
+    WorkExperienceSkill / CourseSkill. Prefer this over the generic
+    `entity_links` table when attaching skills to a Project because it
+    lets us capture the `(project, skill) → how it was used` tuple —
+    exactly the context the Companion tailoring prompts need to spin
+    specific resume bullets out of a project's tech stack."""
+
+    __tablename__ = "project_skills"
+    __table_args__ = (
+        UniqueConstraint("project_id", "skill_id", name="uq_project_skill"),
+    )
+
+    project_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    skill_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("skills.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    usage_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
 class CourseSkill(Base, IdMixin, TimestampMixin):
     """Many-to-many: a course teaches / exercised certain skills."""
 

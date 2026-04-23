@@ -996,13 +996,23 @@ environment variables JSP_API_BASE_URL and JSP_API_TOKEN. Useful endpoints:
   GET  $JSP_API_BASE_URL/api/v1/history/skills
   GET  $JSP_API_BASE_URL/api/v1/history/work
   GET  $JSP_API_BASE_URL/api/v1/history/education
+  GET  $JSP_API_BASE_URL/api/v1/preferences/job         ← includes preferred_locations + remote policy
+  GET  $JSP_API_BASE_URL/api/v1/preferences/authorization  ← current_location_city/region + visa
 
 Fetch them with:
 
   curl -sS -H "Authorization: Bearer $JSP_API_TOKEN" \\
        "$JSP_API_BASE_URL/api/v1/history/skills"
 
-Keep the lookups light — one or two calls is enough.
+Keep the lookups light — two or three calls is enough.
+
+When scoring location fit, check the posting's `location` against the user's
+`preferred_locations` list. Each preferred_locations entry is
+`{name, max_distance_miles}` — if the posting is within that radius (or the
+posting is remote-friendly and `remote_policies_acceptable` includes the
+posting's remote_policy), count it as a green flag; if the posting is onsite
+and outside every preferred radius, surface it as a red_flag unless the
+user's `willing_to_relocate` is true.
 
 Here is the job description (verbatim from the posting):
 

@@ -131,6 +131,7 @@ export default function HistoryEditorPage() {
           endpoint="/api/v1/history/projects"
           title="Projects"
           entityType="project"
+          skillsEndpoint={(id) => `/api/v1/history/projects/${id}/skills`}
           labelOf={(p) => p.name}
           subtitleOf={(p) =>
             [p.role, p.start_date, p.end_date ?? (p.is_ongoing ? "present" : "")]

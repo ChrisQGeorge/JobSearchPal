@@ -7,6 +7,7 @@ import {
   RelatedItemsPanel,
   type EntityType,
 } from "@/components/RelatedItemsPanel";
+import { SkillMultiSelect } from "@/components/SkillMultiSelect";
 import type { OrganizationType } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -84,6 +85,11 @@ type Props<T extends GenericEntity> = {
   labelOf: (x: T) => string;
   subtitleOf?: (x: T) => string | null | undefined;
   emptyHint?: string;
+  // When the entity has a dedicated *_skills junction table (Work / Course /
+  // Project), pass a template like `/api/v1/history/projects/{id}/skills`
+  // and the panel will render a SkillMultiSelect under each row in edit
+  // mode plus read-only chips in the collapsed view.
+  skillsEndpoint?: (id: number) => string;
 };
 
 export function GenericEntityPanel<T extends GenericEntity>({
@@ -94,6 +100,7 @@ export function GenericEntityPanel<T extends GenericEntity>({
   labelOf,
   subtitleOf,
   emptyHint,
+  skillsEndpoint,
 }: Props<T>) {
   const [items, setItems] = useState<T[]>([]);
   const [loading, setLoading] = useState(true);
@@ -173,6 +180,14 @@ export function GenericEntityPanel<T extends GenericEntity>({
                     onCancel={() => setEditing(null)}
                     onSubmit={(data) => save(data, it.id)}
                   />
+                  {skillsEndpoint ? (
+                    <div>
+                      <div className="text-xs text-corp-muted mb-1 uppercase tracking-wider">
+                        Skills
+                      </div>
+                      <SkillMultiSelect endpoint={skillsEndpoint(it.id)} />
+                    </div>
+                  ) : null}
                   <RelatedItemsPanel
                     fromType={entityType}
                     fromId={it.id}
@@ -195,7 +210,14 @@ export function GenericEntityPanel<T extends GenericEntity>({
                     </span>
                   ) : null}
                 </div>
-                <div className="min-w-0 max-w-[40%]">
+                <div className="min-w-0 max-w-[40%] flex flex-col gap-0.5 items-end">
+                  {skillsEndpoint ? (
+                    <SkillMultiSelect
+                      endpoint={skillsEndpoint(it.id)}
+                      readOnly
+                      emptyLabel=""
+                    />
+                  ) : null}
                   <RelatedItemsPanel
                     fromType={entityType}
                     fromId={it.id}

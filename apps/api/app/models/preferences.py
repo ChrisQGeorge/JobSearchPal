@@ -49,6 +49,12 @@ class JobPreferences(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     willing_to_relocate: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     relocation_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # Preferred target locations, each with a radius in miles. Stored as a
+    # JSON list of `{name: str, max_distance_miles: int|null}` so the UI
+    # can offer a searchable city combobox + per-row slider without needing
+    # a separate table. Order is user-meaningful (most-preferred first).
+    preferred_locations: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+
     travel_percent_preferred: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     travel_percent_acceptable_max: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     travel_percent_unacceptable_above: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
