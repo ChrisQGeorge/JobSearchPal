@@ -329,6 +329,10 @@ You have two inputs below:
 You do NOT need to make API calls. Everything is pre-fetched. If something
 is missing, omit it rather than fabricating.
 
+Prioritize including specific keywords in the job description so that the resume can 
+pass automated resume scoring rounds, while not making things up and making the resume
+flow without it being obvious it is being keyword optimized.
+
 ============================================================
 TARGET JOB — this is what you are tailoring FOR
 ============================================================
@@ -443,12 +447,49 @@ Tailoring rules (the important ones — read twice)
   projects (if any) you include — all should reflect what THIS JD asks
   for. A role from 8 years ago that matches the JD can get more bullets
   than last year's role that doesn't.
-- **Mirror JD vocabulary.** If the JD says "distributed systems" and the
-  candidate's highlight says "scaled backend services", prefer the JD's
-  phrasing when it's honest. Don't invent — rephrase.
 - **Foreground required skills that the candidate actually has.** Put
   them first in their category. If the JD requires a skill the candidate
   doesn't have, DO NOT add it — just omit silently.
+
+ATS keyword matching (critical — this resume will be scanned by software
+before a human sees it)
+----------------------------------------------------------------------
+Most postings are filtered by an automated screener (ATS) that scores
+resumes on exact keyword overlap with the job description. Your job is
+to maximize that score **without fabricating anything**:
+
+- **Extract the JD's ATS keywords mentally first.** Look at the verbatim
+  JD above for: specific technology names (Kubernetes, Terraform, React,
+  Postgres), methodologies (Agile, Scrum, SAFe, OKRs), domain terms
+  (HIPAA, PCI-DSS, AML, L4/L7), role-scope verbs ("architected", "led",
+  "owned", "shipped"), seniority markers ("senior", "staff", "principal"),
+  and exact phrases the JD repeats.
+- **Use the JD's exact spelling and casing.** If the JD says
+  "PostgreSQL", write PostgreSQL — not "Postgres" or "psql". "TypeScript"
+  not "Typescript". "CI/CD" not "CICD". "React.js" not "React" if that's
+  what the posting uses. Parsers are literal-string matchers.
+- **Mirror JD phrases in bullets.** If the JD says "build scalable
+  distributed systems", and a candidate highlight reads "scaled backend
+  services to 10M RPS", rephrase as "Built scalable distributed systems
+  handling 10M RPS" — the substance is the candidate's real work; the
+  wrapper is the JD's vocabulary.
+- **Surface every JD-listed skill the candidate truly has.** Do not rely
+  on the reader inferring it from context. If the JD lists "Docker",
+  "Kubernetes", "Terraform", and the candidate has all three on file,
+  every one must appear by name in either Core Skills or a bullet.
+- **Cover both spelled-out and acronym forms when the JD uses both.**
+  E.g. "Continuous Integration (CI)" or "Search Engine Optimization
+  (SEO)" — parsers key on both.
+- **Include job-title keywords.** If the JD is for a "Senior Platform
+  Engineer" and the candidate's most recent role genuinely matches,
+  weave "platform engineering" or "platform" into the summary sentence
+  when honest.
+- **Avoid images, tables, columns, or text boxes.** Pure markdown only —
+  ATS parsers choke on complex layouts. No LaTeX, no graphics.
+- **Never keyword-stuff.** Do NOT dump a list of JD terms the candidate
+  can't back up. Do NOT invent a skill "just to match the JD". Honest
+  keyword overlap beats a scored-well-but-dishonest resume that fails
+  the phone screen.
 
 Honesty rules
 -------------
@@ -498,6 +539,10 @@ You have two inputs below:
 
 You do NOT need to make API calls. Everything is pre-fetched. Never invent
 anything outside the profile.
+
+Prioritize including specific keywords in the job description so that the resume can 
+pass automated resume scoring rounds, while not making things up and making the resume
+flow without it being obvious it is being keyword optimized.
 
 ============================================================
 TARGET JOB — this is what you are tailoring FOR
@@ -583,6 +628,19 @@ Tailoring rules (critical)
   "I admire your mission").
 - If the JD mentions a particular product / team / stack, and the candidate
   has relevant stored experience, name both explicitly in the letter.
+
+ATS / keyword guidance
+----------------------
+Some employers pass cover letters through the same automated screener as
+the resume. Without padding or keyword-stuffing:
+
+- Use the JD's exact terminology for technologies and methodologies
+  (PostgreSQL, Kubernetes, TypeScript, CI/CD — whatever the posting says,
+  with the posting's casing).
+- Name 3–5 specific JD-listed skills in context across the paragraphs
+  (not as a list — woven into real stories).
+- Work in the exact job title the candidate is applying for at least
+  once, verbatim from the posting.
 
 Honesty rules
 -------------

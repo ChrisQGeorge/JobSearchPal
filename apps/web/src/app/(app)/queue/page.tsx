@@ -13,8 +13,35 @@ import {
 
 type Filter = "active" | "waiting" | "done" | "error" | "all";
 
-const STATE_STYLES: Record<JobFetchQueueState, string> = {
+// Unified activity row — includes both persistent fetch-queue items and
+// in-memory Companion task rows. See ActivityRowOut in jobs.py.
+type ActivityRow = {
+  id: string;                 // "fetch:<id>" or "task:<source>:<item_id>"
+  kind: "fetch" | "companion";
+  source: string;
+  label: string;
+  status: string;             // queued | processing | running | done | error
+  started_at: string | null;
+  updated_at: string | null;
+  finished_at: string | null;
+  last_text: string | null;
+  last_tool: string | null;
+  error: string | null;
+  // fetch-specific
+  fetch_queue_id: number | null;
+  url: string | null;
+  attempts: number | null;
+  resume_after: string | null;
+  tracked_job_id: number | null;
+  // companion-specific
+  cost_usd: number | null;
+  duration_ms: number | null;
+  num_turns: number | null;
+};
+
+const STATUS_STYLES: Record<string, string> = {
   queued: "bg-corp-surface2 text-corp-muted border-corp-border",
+  running: "bg-sky-500/25 text-sky-300 border-sky-500/40 animate-pulse",
   processing: "bg-sky-500/25 text-sky-300 border-sky-500/40 animate-pulse",
   done: "bg-emerald-500/25 text-emerald-300 border-emerald-500/40",
   error: "bg-corp-danger/20 text-corp-danger border-corp-danger/40",
@@ -23,12 +50,21 @@ const STATE_STYLES: Record<JobFetchQueueState, string> = {
 const WAITING_STYLE =
   "bg-corp-accent2/20 text-corp-accent2 border-corp-accent2/40";
 
-function isWaiting(it: JobFetchQueueItem): boolean {
+function isWaiting(it: ActivityRow): boolean {
   return !!it.resume_after && new Date(it.resume_after) > new Date();
 }
 
+function isActive(it: ActivityRow): boolean {
+  return (
+    !isWaiting(it) &&
+    (it.status === "queued" ||
+      it.status === "processing" ||
+      it.status === "running")
+  );
+}
+
 export default function QueuePage() {
-  const [items, setItems] = useState<JobFetchQueueItem[]>([]);
+  const [items, setItems] = useState<ActivityRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [filter, setFilter] = useState<Filter>("active");
@@ -38,12 +74,12 @@ export default function QueuePage() {
   const [desiredPosted, setDesiredPosted] = useState("");
   const [adding, setAdding] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const taskStreamRef = useRef<EventSource | null>(null);
 
   async function refresh() {
     try {
-      const data = await api.get<JobFetchQueueItem[]>("/api/v1/jobs/queue");
-      // newest-first so the most recent activity is at the top
-      data.sort((a, b) => b.id - a.id);
+      const data = await api.get<ActivityRow[]>("/api/v1/jobs/activity");
+      // Backend already sorts most-recent-first.
       setItems(data);
       setErr(null);
     } catch (e) {
@@ -57,20 +93,73 @@ export default function QueuePage() {
     refresh();
   }, []);
 
+  // Live task-row updates from the server. Merges in-place by id so we
+  // don't need a full refresh between polls.
+  useEffect(() => {
+    const es = new EventSource(apiUrl("/api/v1/jobs/activity/stream"));
+    taskStreamRef.current = es;
+    es.onmessage = (evt) => {
+      try {
+        const raw = JSON.parse(evt.data);
+        if (raw.kind !== "task_update") return;
+        const row: ActivityRow = {
+          id: `task:${raw.key}`,
+          kind: "companion",
+          source: raw.source,
+          label: raw.label || raw.source,
+          status: raw.status || "running",
+          started_at: raw.started_at ?? null,
+          updated_at: raw.updated_at ?? null,
+          finished_at: raw.finished_at ?? null,
+          last_text: raw.last_text ?? null,
+          last_tool: raw.last_tool ?? null,
+          error: raw.error ?? null,
+          fetch_queue_id: null,
+          url: null,
+          attempts: null,
+          resume_after: null,
+          tracked_job_id: null,
+          cost_usd: raw.cost_usd ?? null,
+          duration_ms: raw.duration_ms ?? null,
+          num_turns: raw.num_turns ?? null,
+        };
+        setItems((prev) => {
+          const without = prev.filter((p) => p.id !== row.id);
+          const next = [row, ...without];
+          next.sort((a, b) => {
+            const ta = a.updated_at ? new Date(a.updated_at).getTime() : 0;
+            const tb = b.updated_at ? new Date(b.updated_at).getTime() : 0;
+            return tb - ta;
+          });
+          return next;
+        });
+      } catch {
+        /* non-fatal */
+      }
+    };
+    es.onerror = () => {
+      /* auto-reconnect from EventSource; nothing to do */
+    };
+    return () => {
+      es.close();
+      taskStreamRef.current = null;
+    };
+  }, []);
+
   // Poll on a schedule: 3s when anything is actively moving, else 15s.
+  // The SSE covers companion tasks; polling is still needed for fetch rows,
+  // since JobFetchQueue's state transitions aren't funneled through the bus
+  // in every path.
   useEffect(() => {
     if (pollRef.current) clearInterval(pollRef.current);
-    const active = items.some(
-      (i) =>
-        (i.state === "queued" || i.state === "processing") && !isWaiting(i),
-    );
+    const active = items.some(isActive);
     const ms = active ? 3000 : 15000;
     pollRef.current = setInterval(refresh, ms);
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [items.map((i) => i.state + (i.resume_after ?? "")).join(",")]);
+  }, [items.map((i) => i.status + (i.resume_after ?? "")).join(",")]);
 
   async function enqueue(e: React.FormEvent) {
     e.preventDefault();
@@ -96,14 +185,14 @@ export default function QueuePage() {
     }
   }
 
-  async function retry(id: number) {
-    await api.post(`/api/v1/jobs/queue/${id}/retry`);
+  async function retry(fetchQueueId: number) {
+    await api.post(`/api/v1/jobs/queue/${fetchQueueId}/retry`);
     await refresh();
   }
 
-  async function remove(id: number) {
+  async function remove(fetchQueueId: number) {
     if (!confirm("Remove this queue item?")) return;
-    await api.delete(`/api/v1/jobs/queue/${id}`);
+    await api.delete(`/api/v1/jobs/queue/${fetchQueueId}`);
     await refresh();
   }
 
@@ -115,31 +204,30 @@ export default function QueuePage() {
     let processing = 0;
     for (const it of items) {
       if (isWaiting(it)) waiting++;
-      else if (it.state === "processing") {
+      else if (it.status === "processing" || it.status === "running") {
         processing++;
         active++;
-      } else if (it.state === "queued") active++;
-      else if (it.state === "done") done++;
-      else if (it.state === "error") errored++;
+      } else if (it.status === "queued") active++;
+      else if (it.status === "done") done++;
+      else if (it.status === "error") errored++;
     }
     return { active, waiting, done, errored, processing, total: items.length };
   }, [items]);
 
-  const visible = useMemo(() => {
+  const visible = useMemo<ActivityRow[]>(() => {
     switch (filter) {
       case "all":
         return items;
       case "active":
-        return items.filter(
-          (i) =>
-            (i.state === "queued" || i.state === "processing") && !isWaiting(i),
-        );
+        return items.filter(isActive);
       case "waiting":
         return items.filter(isWaiting);
       case "done":
-        return items.filter((i) => i.state === "done");
+        return items.filter((i) => i.status === "done");
       case "error":
-        return items.filter((i) => i.state === "error");
+        return items.filter((i) => i.status === "error");
+      default:
+        return items;
     }
   }, [items, filter]);
 
@@ -323,8 +411,12 @@ export default function QueuePage() {
             <QueueRow
               key={it.id}
               item={it}
-              onRetry={() => retry(it.id)}
-              onRemove={() => remove(it.id)}
+              onRetry={() => {
+                if (it.fetch_queue_id != null) void retry(it.fetch_queue_id);
+              }}
+              onRemove={() => {
+                if (it.fetch_queue_id != null) void remove(it.fetch_queue_id);
+              }}
             />
           ))}
         </ul>
@@ -410,17 +502,35 @@ function QueueRow({
   onRetry,
   onRemove,
 }: {
-  item: JobFetchQueueItem;
+  item: ActivityRow;
   onRetry: () => void;
   onRemove: () => void;
 }) {
   const waiting = isWaiting(item);
-  const pillClass = waiting ? WAITING_STYLE : STATE_STYLES[item.state];
-  const pillText = waiting ? "waiting" : item.state;
+  const pillClass = waiting
+    ? WAITING_STYLE
+    : STATUS_STYLES[item.status] ??
+      "bg-corp-surface2 text-corp-muted border-corp-border";
+  const pillText = waiting ? "waiting" : item.status;
 
   const resumeIn = item.resume_after
     ? Math.max(0, Math.floor((new Date(item.resume_after).getTime() - Date.now()) / 60000))
     : null;
+
+  const srcLabel = SOURCE_LABEL[item.source] ?? item.source.toUpperCase();
+  const srcColor =
+    SOURCE_COLOR[item.source] ??
+    "bg-corp-surface2 text-corp-muted border-corp-border";
+
+  const isCompanion = item.kind === "companion";
+
+  // Cost formatted as $0.0023 if present.
+  const costStr =
+    item.cost_usd != null
+      ? `$${item.cost_usd < 0.01 ? item.cost_usd.toFixed(4) : item.cost_usd.toFixed(2)}`
+      : null;
+  const durationStr =
+    item.duration_ms != null ? `${(item.duration_ms / 1000).toFixed(1)}s` : null;
 
   return (
     <li className="flex items-start gap-3 py-3 px-4">
@@ -429,71 +539,96 @@ function QueueRow({
       >
         {pillText}
       </span>
+      <span
+        className={`inline-block px-2 py-0.5 rounded text-[10px] uppercase tracking-wider border shrink-0 mt-0.5 ${srcColor}`}
+      >
+        {srcLabel}
+      </span>
       <div className="min-w-0 flex-1">
         <div className="text-sm truncate">
-          <a
-            href={item.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="hover:text-corp-accent"
-          >
-            {item.url}
-          </a>
+          {isCompanion ? (
+            <span>{item.label}</span>
+          ) : item.url ? (
+            <a
+              href={item.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="hover:text-corp-accent"
+            >
+              {item.url}
+            </a>
+          ) : (
+            <span className="text-corp-muted">{item.label}</span>
+          )}
         </div>
         <div className="text-[11px] text-corp-muted mt-1 flex flex-wrap gap-x-3 gap-y-0.5">
-          {item.desired_status ? <span>→ {item.desired_status}</span> : null}
-          {item.desired_priority ? <span>pri: {item.desired_priority}</span> : null}
-          {item.desired_date_applied ? (
-            <span>applied {item.desired_date_applied}</span>
-          ) : null}
-          {item.desired_date_posted ? (
-            <span>posted {item.desired_date_posted}</span>
-          ) : null}
-          {item.desired_date_closed ? (
-            <span>closed {item.desired_date_closed}</span>
-          ) : null}
-          <span>
-            {item.attempts} attempt{item.attempts === 1 ? "" : "s"}
-          </span>
-          {item.last_attempt_at ? (
+          {item.attempts != null ? (
             <span>
-              last tried {new Date(item.last_attempt_at).toLocaleString()}
+              {item.attempts} attempt{item.attempts === 1 ? "" : "s"}
             </span>
           ) : null}
+          {item.started_at ? (
+            <span>
+              started {new Date(item.started_at).toLocaleTimeString()}
+            </span>
+          ) : null}
+          {item.updated_at && item.updated_at !== item.started_at ? (
+            <span>
+              last event {new Date(item.updated_at).toLocaleTimeString()}
+            </span>
+          ) : null}
+          {item.last_tool ? <span>tool: {item.last_tool}</span> : null}
+          {durationStr ? <span>{durationStr}</span> : null}
+          {costStr ? <span>{costStr}</span> : null}
+          {item.num_turns != null ? <span>{item.num_turns} turns</span> : null}
         </div>
+        {item.last_text && item.status !== "done" && item.status !== "error" ? (
+          <div className="text-xs text-corp-text/80 mt-1 italic truncate">
+            {item.last_text}
+          </div>
+        ) : null}
         {waiting && item.resume_after ? (
           <div className="text-xs text-corp-accent2 mt-1">
             Resumes {new Date(item.resume_after).toLocaleString()}{" "}
             {resumeIn !== null ? `(≈${resumeIn} min)` : ""}
-            {item.error_message ? ` · ${item.error_message}` : ""}
+            {item.error ? ` · ${item.error}` : ""}
           </div>
-        ) : item.error_message ? (
-          <div className="text-xs text-corp-danger mt-1">{item.error_message}</div>
+        ) : item.status === "error" && item.error ? (
+          <div className="text-xs text-corp-danger mt-1 whitespace-pre-wrap">
+            {item.error}
+          </div>
         ) : null}
-        {item.created_tracked_job_id ? (
+        {item.tracked_job_id ? (
           <div className="text-xs mt-1">
             <Link
-              href={`/jobs/${item.created_tracked_job_id}`}
+              href={`/jobs/${item.tracked_job_id}`}
               className="text-corp-accent hover:underline"
             >
-              → Open job #{item.created_tracked_job_id}
+              → Open job #{item.tracked_job_id}
             </Link>
           </div>
         ) : null}
       </div>
       <div className="flex gap-1 shrink-0">
-        {item.state === "error" ? (
-          <button className="jsp-btn-ghost text-xs" onClick={onRetry}>
+        {item.kind === "fetch" &&
+        item.status === "error" &&
+        item.fetch_queue_id != null ? (
+          <button
+            className="jsp-btn-ghost text-xs"
+            onClick={onRetry}
+          >
             Retry
           </button>
         ) : null}
-        <button
-          className="jsp-btn-ghost text-xs text-corp-danger border-corp-danger/40"
-          onClick={onRemove}
-          title="Remove from queue"
-        >
-          ×
-        </button>
+        {item.kind === "fetch" && item.fetch_queue_id != null ? (
+          <button
+            className="jsp-btn-ghost text-xs text-corp-danger border-corp-danger/40"
+            onClick={onRemove}
+            title="Remove from queue"
+          >
+            ×
+          </button>
+        ) : null}
       </div>
     </li>
   );

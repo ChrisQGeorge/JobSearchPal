@@ -1713,6 +1713,159 @@ async def list_queue(
     return list((await db.execute(stmt)).scalars().all())
 
 
+class ActivityRowOut(BaseModel):
+    """Unified row shape covering both persistent fetch-queue items and
+    in-memory Companion task-registry rows. The Companion Activity page
+    renders one list mixing both."""
+
+    # Stable id unique across kinds. "fetch:<id>" or "task:<source>:<item_id>".
+    id: str
+    kind: str                       # "fetch" | "companion"
+    source: str                     # "fetch", "tailor_resume", etc.
+    label: str                      # url (fetch) or task label (companion)
+    status: str                     # queued | processing | running | done | error
+    started_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    last_text: Optional[str] = None
+    last_tool: Optional[str] = None
+    error: Optional[str] = None
+    # Fetch-specific
+    fetch_queue_id: Optional[int] = None
+    url: Optional[str] = None
+    attempts: Optional[int] = None
+    resume_after: Optional[datetime] = None
+    tracked_job_id: Optional[int] = None
+    # Companion-task-specific
+    cost_usd: Optional[float] = None
+    duration_ms: Optional[int] = None
+    num_turns: Optional[int] = None
+
+
+def _companion_task_to_row(task: dict) -> ActivityRowOut:
+    def _parse_iso(v):
+        if not v:
+            return None
+        try:
+            return datetime.fromisoformat(v)
+        except Exception:
+            return None
+
+    return ActivityRowOut(
+        id=f"task:{task['key']}",
+        kind="companion",
+        source=task["source"],
+        label=task.get("label") or task["source"],
+        status=task.get("status") or "running",
+        started_at=_parse_iso(task.get("started_at")),
+        updated_at=_parse_iso(task.get("updated_at")),
+        finished_at=_parse_iso(task.get("finished_at")),
+        last_text=task.get("last_text"),
+        last_tool=task.get("last_tool"),
+        error=task.get("error"),
+        cost_usd=task.get("cost_usd"),
+        duration_ms=task.get("duration_ms"),
+        num_turns=task.get("num_turns"),
+    )
+
+
+def _fetch_queue_to_row(item: JobFetchQueue) -> ActivityRowOut:
+    # JobFetchQueue has no `started_at`; use last_attempt_at as proxy.
+    return ActivityRowOut(
+        id=f"fetch:{item.id}",
+        kind="fetch",
+        source="fetch",
+        label=item.url or "(no url)",
+        status=item.state or "queued",
+        started_at=item.last_attempt_at,
+        updated_at=item.last_attempt_at or item.created_at,
+        finished_at=None,
+        last_text=None,
+        last_tool=None,
+        error=item.error_message,
+        fetch_queue_id=item.id,
+        url=item.url,
+        attempts=item.attempts,
+        resume_after=item.resume_after,
+        tracked_job_id=item.created_tracked_job_id,
+    )
+
+
+@router.get("/activity", response_model=list[ActivityRowOut])
+async def list_activity(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[ActivityRowOut]:
+    """Unified Companion Activity feed: fetch-queue items + every in-flight
+    / recent task from the Claude bus (tailor, humanize, score, research,
+    chat, etc.). Sorted by updated_at descending so the most recently
+    active rows float to the top.
+    """
+    from app.skills import queue_bus as _bus
+
+    fetch_stmt = (
+        select(JobFetchQueue)
+        .where(JobFetchQueue.user_id == user.id)
+        .order_by(JobFetchQueue.id.desc())
+    )
+    fetch_rows = [
+        _fetch_queue_to_row(i)
+        for i in (await db.execute(fetch_stmt)).scalars().all()
+    ]
+    task_rows = [_companion_task_to_row(t) for t in _bus.list_tasks(limit=200)]
+
+    merged = fetch_rows + task_rows
+    merged.sort(
+        key=lambda r: r.updated_at or r.started_at or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    return merged
+
+
+@router.get("/activity/stream")
+async def stream_activity_tasks(
+    _: User = Depends(get_current_user),
+):
+    """SSE stream of task-registry row updates. Each event is one row's
+    current state (the frontend replaces by id). A separate, lighter-weight
+    stream than `/queue/stream` — use this to keep the unified activity
+    list live without having to reason about raw text deltas."""
+    import asyncio as _a
+    import json as _json
+
+    from fastapi.responses import StreamingResponse
+    from app.skills import queue_bus as _bus
+
+    q = _bus.subscribe_tasks()
+
+    async def gen():
+        try:
+            yield f'data: {_json.dumps({"kind": "subscribed"})}\n\n'.encode("utf-8")
+            # Prime with current snapshot so a fresh client gets the full list
+            # without waiting for the next event.
+            for t in _bus.list_tasks(limit=200):
+                payload = {"kind": "task_update", **t}
+                yield f"data: {_json.dumps(payload)}\n\n".encode("utf-8")
+            while True:
+                try:
+                    ev = await _a.wait_for(q.get(), timeout=15.0)
+                    yield f"data: {_json.dumps(ev)}\n\n".encode("utf-8")
+                except _a.TimeoutError:
+                    yield b": keepalive\n\n"
+        finally:
+            _bus.unsubscribe_tasks(q)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
 @router.post(
     "/queue",
     response_model=JobFetchQueueOut,
