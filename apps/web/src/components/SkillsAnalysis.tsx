@@ -38,8 +38,37 @@ export function SkillsAnalysis({ required, niceToHave, onSkillAdded }: Props) {
     refresh();
   }, [refresh]);
 
+  // Re-fetch whenever the tab regains focus or becomes visible. Without
+  // this, a skill the user added on /history or via the Companion stays
+  // invisible on the jobs page until a full reload, and the "+ Add" button
+  // on a matched skill would pointlessly POST a duplicate.
+  useEffect(() => {
+    function onFocus() {
+      refresh();
+    }
+    function onVisibility() {
+      if (!document.hidden) refresh();
+    }
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [refresh]);
+
   const { matchingRequired, missingRequired, matchingNice, missingNice } = useMemo(() => {
-    const catSet = new Set(catalog.map((s) => normalize(s.name)));
+    // Build a lookup that covers skill.name AND every alias, so a JD that
+    // uses "next" still matches a catalog entry named "Next.js" whose
+    // aliases include "next". Dedupe by lowercasing — the backend already
+    // enforces case-insensitive uniqueness on create.
+    const catSet = new Set<string>();
+    for (const s of catalog) {
+      catSet.add(normalize(s.name));
+      for (const a of s.aliases ?? []) {
+        if (a && a.trim()) catSet.add(normalize(a));
+      }
+    }
     const classify = (list: string[] | null | undefined) => {
       const matching: string[] = [];
       const missing: string[] = [];
@@ -65,14 +94,19 @@ export function SkillsAnalysis({ required, niceToHave, onSkillAdded }: Props) {
     setBusyFor(name);
     setError(null);
     try {
+      // POST is idempotent on the backend (case-insensitive dedupe returns
+      // the existing row), so clicking "+ Add" on a skill that was already
+      // added elsewhere just refreshes the view rather than failing.
       const created = await api.post<Skill>("/api/v1/history/skills", {
         name,
         category,
       });
       await refresh();
       onSkillAdded?.(created);
-    } catch {
-      setError(`Couldn't add "${name}".`);
+    } catch (e) {
+      setError(
+        e instanceof Error ? `Couldn't add "${name}": ${e.message}` : `Couldn't add "${name}".`,
+      );
     } finally {
       setBusyFor(null);
     }

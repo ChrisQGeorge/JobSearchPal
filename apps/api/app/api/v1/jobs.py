@@ -22,7 +22,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
@@ -1008,7 +1008,7 @@ Keep the lookups light — two or three calls is enough.
 
 When scoring location fit, check the posting's `location` against the user's
 `preferred_locations` list. Each preferred_locations entry is
-`{name, max_distance_miles}` — if the posting is within that radius (or the
+`{{name, max_distance_miles}}` — if the posting is within that radius (or the
 posting is remote-friendly and `remote_policies_acceptable` includes the
 posting's remote_policy), count it as a green flag; if the posting is onsite
 and outside every preferred radius, surface it as a red_flag unless the
@@ -1685,9 +1685,17 @@ async def list_queue(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> list[JobFetchQueue]:
+    """Legacy fetch-only view of the queue. Kind=score/tailor/… tasks have
+    `url=""` which doesn't satisfy `JobFetchQueueOut.url` (min_length=8),
+    so filter to the original fetch rows here. The unified activity feed
+    is at `GET /jobs/activity`."""
     stmt = (
         select(JobFetchQueue)
-        .where(JobFetchQueue.user_id == user.id)
+        .where(
+            JobFetchQueue.user_id == user.id,
+            # NULL `kind` = pre-migration-0012 rows, which were always fetch.
+            or_(JobFetchQueue.kind.is_(None), JobFetchQueue.kind == "fetch"),
+        )
         .order_by(JobFetchQueue.id.desc())
     )
     return list((await db.execute(stmt)).scalars().all())
