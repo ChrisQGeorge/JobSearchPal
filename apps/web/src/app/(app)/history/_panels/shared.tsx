@@ -2,10 +2,12 @@
 
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
+import { OrganizationCombobox } from "@/components/OrganizationCombobox";
 import {
   RelatedItemsPanel,
   type EntityType,
 } from "@/components/RelatedItemsPanel";
+import type { OrganizationType } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
 // FieldDef — lightweight declarative form-field spec used by GenericEntityPanel.
@@ -36,6 +38,18 @@ export type FieldDef<T> =
       required?: boolean;
       placeholder?: string;
       fullWidth?: boolean;
+    }
+  | {
+      // Organization picker using the same combobox as Jobs (type-to-search
+      // or create). Writes the FK id to `key`; when paired with a mirror
+      // field (e.g. issuer/venue/organization) the backend syncs the name.
+      key: keyof T;
+      label: string;
+      kind: "org";
+      defaultOrgType?: OrganizationType;
+      required?: boolean;
+      fullWidth?: boolean;
+      placeholder?: string;
     };
 
 type GenericEntity = { id: number; [key: string]: unknown };
@@ -249,7 +263,17 @@ function EntityForm<T extends GenericEntity>({
                 {f.label}
                 {f.required ? " *" : ""}
               </label>
-              {f.kind === "textarea" ? (
+              {f.kind === "org" ? (
+                <OrganizationCombobox
+                  value={
+                    typeof state[k] === "number" ? (state[k] as number) : null
+                  }
+                  onChange={(orgId) => setState({ ...state, [k]: orgId })}
+                  defaultTypeOnCreate={f.defaultOrgType ?? "company"}
+                  placeholder={f.placeholder ?? "Search or create organization…"}
+                  required={f.required}
+                />
+              ) : f.kind === "textarea" ? (
                 <textarea
                   className="jsp-input min-h-[80px]"
                   required={f.required}

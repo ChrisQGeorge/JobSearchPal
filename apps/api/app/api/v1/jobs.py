@@ -317,7 +317,10 @@ async def update_job(
         # the user hasn't already set it.
         if data["status"] == "applied" and job.date_applied is None:
             job.date_applied = date.today()
-        if data["status"] in {"won", "lost", "withdrawn", "ghosted", "archived"} and job.date_closed is None:
+        if (
+            data["status"] in {"won", "lost", "withdrawn", "ghosted", "archived", "not_interested"}
+            and job.date_closed is None
+        ):
             job.date_closed = date.today()
 
     await db.commit()
@@ -346,6 +349,7 @@ def _status_to_event_type(status: str) -> str:
         "archived": "note",
         "watching": "note",
         "interested": "note",
+        "not_interested": "note",
     }.get(status, "note")
 
 

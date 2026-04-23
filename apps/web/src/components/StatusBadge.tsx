@@ -4,6 +4,7 @@ import type { JobStatus } from "@/lib/types";
 const STATUS_STYLES: Record<JobStatus, string> = {
   watching: "bg-corp-surface2 text-corp-muted border-corp-border",
   interested: "bg-sky-500/20 text-sky-300 border-sky-500/40",
+  not_interested: "bg-zinc-500/20 text-zinc-400 border-zinc-500/40 line-through decoration-zinc-500/60",
   applied: "bg-corp-accent/25 text-corp-accent border-corp-accent/40",
   responded: "bg-sky-500/25 text-sky-200 border-sky-500/50",
   screening: "bg-violet-500/25 text-violet-300 border-violet-500/40",
@@ -17,12 +18,17 @@ const STATUS_STYLES: Record<JobStatus, string> = {
   archived: "bg-corp-surface2 text-corp-muted border-corp-border",
 };
 
+// Human-readable labels for statuses whose raw token is awkward.
+const STATUS_LABELS: Partial<Record<JobStatus, string>> = {
+  not_interested: "not interested",
+};
+
 export function StatusBadge({ status }: { status: JobStatus }) {
   return (
     <span
       className={`inline-block px-2 py-0.5 rounded text-[10px] uppercase tracking-wider border ${STATUS_STYLES[status]}`}
     >
-      {status}
+      {STATUS_LABELS[status] ?? status}
     </span>
   );
 }

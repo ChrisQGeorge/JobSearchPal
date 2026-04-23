@@ -175,7 +175,7 @@ export default function DocumentEditorPage({
       .then((u) => {
         if (cancelled) return;
         // Only use auth name if Resume Profile didn't answer first.
-        setProfileName((prev) => prev ?? (u?.display_name || "").trim() || null);
+        setProfileName((prev) => prev ?? ((u?.display_name || "").trim() || null));
       })
       .catch(() => {});
     return () => {

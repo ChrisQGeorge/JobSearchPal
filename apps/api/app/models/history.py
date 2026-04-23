@@ -125,6 +125,12 @@ class Certification(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     user_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    # Canonical issuer via Organization FK (preferred, populated by the
+    # OrganizationCombobox). Falls back to the free-text `issuer` string for
+    # legacy rows and issuers the user doesn't want to promote to an Org.
+    organization_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     issuer: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     issued_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
@@ -190,6 +196,12 @@ class Publication(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     user_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    # Canonical venue via Organization FK (preferred). Free-text `venue`
+    # kept for legacy data and one-off venues the user doesn't want to
+    # promote to a full Organization row.
+    organization_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     venue: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
@@ -225,6 +237,11 @@ class Achievement(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     user_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    # Canonical issuer via Organization FK (preferred). Free-text `issuer`
+    # kept for legacy data and one-off issuers (e.g. individual mentors).
+    organization_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     date_awarded: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
@@ -239,6 +256,12 @@ class VolunteerWork(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
 
     user_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Canonical org via FK (preferred, populated by the combobox). Free-text
+    # `organization` remains required because it's the display label on
+    # legacy rows and a fallback if the org later gets soft-deleted.
+    organization_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True, index=True
     )
     organization: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)

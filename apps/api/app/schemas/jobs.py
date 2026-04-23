@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 JOB_STATUSES = {
     "watching",
     "interested",
+    "not_interested",
     "applied",
     "responded",
     "screening",

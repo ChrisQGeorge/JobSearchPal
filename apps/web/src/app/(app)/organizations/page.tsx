@@ -155,10 +155,28 @@ function OrganizationCard({
   onDelete: (id: number) => void;
 }) {
   const [usage, setUsage] = useState<OrganizationUsage | null>(null);
+  const [researching, setResearching] = useState(false);
+  const [researchErr, setResearchErr] = useState<string | null>(null);
 
   useEffect(() => {
     api.get<OrganizationUsage>(`/api/v1/organizations/${summary.id}/usage`).then(setUsage);
   }, [summary.id]);
+
+  async function research() {
+    setResearching(true);
+    setResearchErr(null);
+    try {
+      // Fires a Companion activity row; no job listing needed. The endpoint
+      // is idempotent — re-running re-populates research_notes / reputation
+      // signals / tech_stack_hints for the same org.
+      await api.post(`/api/v1/organizations/${summary.id}/research`, {});
+    } catch (e) {
+      setResearchErr(e instanceof ApiError ? `HTTP ${e.status}` : "failed");
+      setTimeout(() => setResearchErr(null), 6000);
+    } finally {
+      setResearching(false);
+    }
+  }
 
   const total = usage
     ? usage.work_experiences + usage.educations + usage.tracked_jobs + usage.contacts
@@ -188,7 +206,18 @@ function OrganizationCard({
           <span className="text-xs text-corp-muted truncate">· {usageLabel}</span>
         ) : null}
       </div>
-      <div className="flex gap-1 shrink-0">
+      <div className="flex gap-1 shrink-0 items-center">
+        {researchErr ? (
+          <span className="text-[11px] text-corp-danger">{researchErr}</span>
+        ) : null}
+        <button
+          className="jsp-btn-ghost text-xs"
+          onClick={research}
+          disabled={researching}
+          title="Ask the Companion to populate industry, size, description, tech stack hints, and reputation signals. No job listing required."
+        >
+          {researching ? "Queued…" : "Research"}
+        </button>
         <button className="jsp-btn-ghost text-xs" onClick={() => onEdit(summary)}>
           Edit
         </button>

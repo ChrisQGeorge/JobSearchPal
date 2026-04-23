@@ -101,6 +101,7 @@ export type Skill = {
 
 export type Achievement = {
   id: number;
+  organization_id?: number | null;
   title: string;
   type?: string | null;
   date_awarded?: string | null;
@@ -113,6 +114,7 @@ export type Achievement = {
 export type JobStatus =
   | "watching"
   | "interested"
+  | "not_interested"
   | "applied"
   | "responded"
   | "screening"
@@ -128,6 +130,7 @@ export type JobStatus =
 export const JOB_STATUSES: JobStatus[] = [
   "watching",
   "interested",
+  "not_interested",
   "applied",
   "responded",
   "screening",
@@ -504,6 +507,7 @@ export type Course = {
 
 export type Certification = {
   id: number;
+  organization_id?: number | null;
   name: string;
   issuer?: string | null;
   issued_date?: string | null;
@@ -539,6 +543,7 @@ export type Project = {
 
 export type Publication = {
   id: number;
+  organization_id?: number | null;
   title: string;
   type?: string | null;
   venue?: string | null;
@@ -566,6 +571,7 @@ export type Presentation = {
 
 export type VolunteerWork = {
   id: number;
+  organization_id?: number | null;
   organization: string;
   role?: string | null;
   cause_area?: string | null;

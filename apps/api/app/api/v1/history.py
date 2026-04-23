@@ -719,6 +719,49 @@ def _soft_delete(obj) -> None:
     obj.deleted_at = datetime.now(tz=timezone.utc)
 
 
+# For a subset of models, a legacy free-text column is kept alongside the
+# new `organization_id` FK (migration 0013). When the user picks an org via
+# the combobox, we mirror the org's name into that free-text column so
+# reads still work without every caller joining through Organization.
+_MIRROR_ORG_NAME_TO: dict[type, str] = {
+    Certification: "issuer",
+    Achievement: "issuer",
+    Publication: "venue",
+    VolunteerWork: "organization",
+}
+
+
+async def _mirror_org_name_if_needed(
+    db: AsyncSession, obj
+) -> None:
+    """If `obj.organization_id` is set, overwrite the legacy name-field with
+    the resolved Organization.name. If the name-field is a NOT NULL column
+    (VolunteerWork.organization) and both FK + free-text are missing, raise
+    a 422 rather than letting the DB commit explode on the constraint."""
+    attr = _MIRROR_ORG_NAME_TO.get(type(obj))
+    if not attr:
+        return
+    org_id = getattr(obj, "organization_id", None)
+    current = getattr(obj, attr, None)
+    if org_id is not None:
+        row = (
+            await db.execute(
+                select(Organization.name).where(Organization.id == org_id)
+            )
+        ).first()
+        if row and row[0]:
+            setattr(obj, attr, row[0])
+            return
+        # FK was set but org doesn't exist / was soft-deleted. Fall through
+        # to the required-text check below.
+    # Volunteer's `organization` column is NOT NULL; other tables allow null.
+    if attr == "organization" and not (current and str(current).strip()):
+        raise HTTPException(
+            status_code=422,
+            detail="Provide an Organization (pick from the combobox) or type a name.",
+        )
+
+
 def _simple_crud(path: str, model, pydantic_in, pydantic_out) -> None:
     """Register list/create/update/delete routes for a user-owned model."""
 
@@ -741,6 +784,7 @@ def _simple_crud(path: str, model, pydantic_in, pydantic_out) -> None:
         user: User = Depends(get_current_user),
     ):
         obj = model(user_id=user.id, **payload.model_dump(exclude_unset=True))
+        await _mirror_org_name_if_needed(db, obj)
         db.add(obj)
         await db.commit()
         await db.refresh(obj)
@@ -760,6 +804,7 @@ def _simple_crud(path: str, model, pydantic_in, pydantic_out) -> None:
         obj = await _get_owned(db, model, entity_id, user.id)
         for k, v in payload.model_dump(exclude_unset=True).items():
             setattr(obj, k, v)
+        await _mirror_org_name_if_needed(db, obj)
         await db.commit()
         await db.refresh(obj)
         return obj

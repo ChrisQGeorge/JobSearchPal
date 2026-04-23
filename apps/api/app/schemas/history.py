@@ -69,6 +69,11 @@ class SkillOut(SkillIn):
 
 
 class AchievementIn(BaseModel):
+    # Preferred: an Organization row via FK, same combobox as Work/Education.
+    # `issuer` is the legacy free-text field; API keeps both in sync (the
+    # router mirrors the resolved org name into `issuer` on save so old
+    # reads still work).
+    organization_id: Optional[int] = None
     title: str
     type: Optional[str] = None
     date_awarded: Optional[date] = None
@@ -117,6 +122,9 @@ class CourseOut(CourseIn):
 
 
 class CertificationIn(BaseModel):
+    # Preferred issuer via Organization FK. `issuer` free text remains as
+    # legacy / one-off fallback; router keeps them in sync.
+    organization_id: Optional[int] = None
     name: str = Field(min_length=1, max_length=255)
     issuer: Optional[str] = None
     issued_date: Optional[date] = None
@@ -164,6 +172,9 @@ class ProjectOut(ProjectIn):
 
 
 class PublicationIn(BaseModel):
+    # Preferred venue via Organization FK. `venue` free text kept for
+    # legacy / one-off rows; router keeps them in sync.
+    organization_id: Optional[int] = None
     title: str = Field(min_length=1, max_length=512)
     type: Optional[str] = None
     venue: Optional[str] = None
@@ -199,7 +210,13 @@ class PresentationOut(PresentationIn):
 
 
 class VolunteerWorkIn(BaseModel):
-    organization: str = Field(min_length=1, max_length=255)
+    # Preferred: an Organization row via FK (same combobox as Work/Education).
+    # Either `organization_id` OR `organization` (free text) must be set —
+    # enforced at the router level so the FK picker alone is sufficient. When
+    # only the FK is set, the server mirrors the resolved org name into the
+    # `organization` column so the DB's NOT NULL column stays populated.
+    organization_id: Optional[int] = None
+    organization: Optional[str] = Field(default=None, max_length=255)
     role: Optional[str] = None
     cause_area: Optional[str] = None
     start_date: Optional[date] = None

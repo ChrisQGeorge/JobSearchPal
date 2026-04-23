@@ -119,9 +119,11 @@ Project skill definitions already exist at `/skills/<name>/SKILL.md`. Wire them 
 
 **Deferred (low priority / requires more scope):**
 - [ ] Project panel: dedicated skills-link field with `usage_notes` (parity with Work/Courses). Today skills attach via `entity_links`/RelatedItemsPanel which is functionally equivalent but doesn't persist usage notes.
-- ✅ **Contact-link picker on history rows** — `RelatedItemsPanel` is now on Work, Education, Courses (new this turn), and Project; each can link to contacts (and every other polymorphic type) with relation + note. TrackedJob keeps its dedicated Contacts tab.
-- [ ] Achievement / Certification / Publication / VolunteerWork issuer+venue: upgrade to `OrganizationCombobox` (schema change + migration).
+- ✅ **Contact-link picker on history rows** — `RelatedItemsPanel` is now on Work, Education, Courses, and Project; each can link to contacts (and every other polymorphic type) with relation + note. TrackedJob keeps its dedicated Contacts tab.
+- ✅ **Organization FK on Achievement / Certification / Publication / VolunteerWork** (migration 0013) — each now has an optional `organization_id` FK to `organizations.id`. The history panels use the same `OrganizationCombobox` as Jobs/Work/Education (type-to-search-or-create). Backend mirrors the resolved org name into the legacy free-text columns (`issuer` / `venue` / `organization`) on save so old reads keep working without a data migration. A new `kind: "org"` option on the declarative `FieldDef` in `shared.tsx` renders the combobox inline with every other field.
 - ✅ **Skills catalog: full attachment-detail side view** — click a skill row to open a right-side panel showing evidence notes + every attached Work (with org + dates + usage notes), Course (with parent degree + term + usage notes), and polymorphic EntityLink (tracked_jobs deep-link to `/jobs/{id}`, generated_documents to `/studio/{id}`). Backend endpoint now resolves labels, org names, and usage notes in a single call.
+- ✅ **`not_interested` job status** — added to `JOB_STATUSES` on both sides; zinc-grey styled badge with a strikethrough; counts toward `date_closed` auto-stamp alongside won/lost/withdrawn/ghosted/archived.
+- ✅ **Company research without a job link** — Organizations page gained a Research button per row; `POST /organizations/{id}/research` already ran standalone (no `tracked_job_id` required) — the button makes the workflow discoverable without opening the edit form first.
 - [ ] Spend cap (SRS REQ-COST-002) — enforce per-month LLM ceiling **only when using an API key**. OAuth sessions have no per-turn cost.
 
 ## Known minor issues

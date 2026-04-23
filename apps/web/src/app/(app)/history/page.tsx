@@ -97,7 +97,7 @@ export default function HistoryEditorPage() {
           }
           fields={[
             { key: "title", label: "Title", kind: "text", required: true, fullWidth: true },
-            { key: "issuer", label: "Issuer", kind: "text" },
+            { key: "organization_id", label: "Issuer (organization)", kind: "org", fullWidth: true },
             { key: "type", label: "Type", kind: "text", placeholder: "award / scholarship / patent / ..." },
             { key: "date_awarded", label: "Date awarded", kind: "date" },
             { key: "url", label: "URL", kind: "url" },
@@ -117,7 +117,7 @@ export default function HistoryEditorPage() {
           }
           fields={[
             { key: "name", label: "Name", kind: "text", required: true, fullWidth: true },
-            { key: "issuer", label: "Issuer", kind: "text" },
+            { key: "organization_id", label: "Issuer (organization)", kind: "org", fullWidth: true },
             { key: "verification_status", label: "Verification status", kind: "text" },
             { key: "issued_date", label: "Issued", kind: "date" },
             { key: "expires_date", label: "Expires", kind: "date" },
@@ -185,7 +185,7 @@ export default function HistoryEditorPage() {
                 "other",
               ],
             },
-            { key: "venue", label: "Venue", kind: "text" },
+            { key: "organization_id", label: "Venue (organization)", kind: "org", fullWidth: true, defaultOrgType: "publisher" },
             { key: "publication_date", label: "Publication date", kind: "date" },
             { key: "doi", label: "DOI", kind: "text" },
             { key: "url", label: "URL", kind: "url" },
@@ -235,11 +235,23 @@ export default function HistoryEditorPage() {
           }
           fields={[
             {
-              key: "organization",
+              key: "organization_id",
               label: "Organization",
+              kind: "org",
+              fullWidth: true,
+              defaultOrgType: "nonprofit",
+            },
+            // Mirror free-text name kept only as a fallback for orgs the
+            // user didn't promote to a full Organization row. The combobox
+            // above is what the UI uses day-to-day; the backend syncs this
+            // string from the resolved org name when an id is set.
+            {
+              key: "organization",
+              label: "Organization name (fallback)",
               kind: "text",
               required: true,
               fullWidth: true,
+              placeholder: "Auto-filled when you pick an organization above",
             },
             { key: "role", label: "Role", kind: "text" },
             { key: "cause_area", label: "Cause area", kind: "text" },
