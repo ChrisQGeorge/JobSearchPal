@@ -660,18 +660,50 @@ async def send_message_stream(
 
         _bus_emit({"kind": "start"})
 
+        # Pipe events through an intermediate asyncio.Queue so the generator
+        # can emit an SSE keepalive comment every few seconds even when
+        # Claude is silent inside a long tool run (e.g. bulk-adding 80
+        # skills via one big shell loop). Without this, the SSE socket
+        # goes idle, the Next.js proxy cuts it off, and the chat "hangs"
+        # from the user's perspective even though the backend is working.
+        import asyncio as _asyncio
+        ev_queue: _asyncio.Queue = _asyncio.Queue()
+        _DONE_SENTINEL: object = object()
+        _STREAM_TIMEOUT_SECONDS = 900  # 15 min; covers long bulk operations
+
+        async def _producer():
+            try:
+                async for ev in stream_claude_prompt(
+                    prompt=user_content,
+                    session_id=session_id_in,
+                    system_prompt_append=primer,
+                    allowed_tools=["Bash", "Read", "Grep", "Glob", "WebFetch", "WebSearch"],
+                    extra_env={
+                        "JSP_API_BASE_URL": "http://localhost:8000",
+                        "JSP_API_TOKEN": api_token,
+                    },
+                    timeout_seconds=_STREAM_TIMEOUT_SECONDS,
+                ):
+                    await ev_queue.put(ev)
+            except Exception as exc:
+                await ev_queue.put({"type": "error", "message": f"Streaming failed: {exc}"})
+            finally:
+                await ev_queue.put(_DONE_SENTINEL)
+
+        producer_task = _asyncio.create_task(_producer())
+
         try:
-            async for ev in stream_claude_prompt(
-                prompt=user_content,
-                session_id=session_id_in,
-                system_prompt_append=primer,
-                allowed_tools=["Bash", "Read", "Grep", "Glob", "WebFetch", "WebSearch"],
-                extra_env={
-                    "JSP_API_BASE_URL": "http://localhost:8000",
-                    "JSP_API_TOKEN": api_token,
-                },
-                timeout_seconds=300,
-            ):
+            while True:
+                try:
+                    ev = await _asyncio.wait_for(ev_queue.get(), timeout=12.0)
+                except _asyncio.TimeoutError:
+                    # 12 s of silence → send an SSE comment so the browser and
+                    # every intermediate proxy know the socket is alive. Comment
+                    # lines (":...") are ignored by EventSource consumers.
+                    yield b": keepalive\n\n"
+                    continue
+                if ev is _DONE_SENTINEL:
+                    break
                 ev_type = ev.get("type")
 
                 if ev_type == "error":
@@ -765,6 +797,15 @@ async def send_message_stream(
             error_message = f"Streaming failed: {exc}"
             yield _sse({"type": "error", "message": error_message})
             _bus_emit({"kind": "error", "text": error_message})
+        finally:
+            # Make sure the background producer is cleaned up even if the
+            # client disconnects mid-stream.
+            if not producer_task.done():
+                producer_task.cancel()
+            try:
+                await producer_task
+            except (_asyncio.CancelledError, Exception):
+                pass
 
         # Publish a terminal "done" to the activity feed so users on /queue
         # see chat tasks reach completion even when they don't have the chat
