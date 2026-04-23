@@ -2515,6 +2515,8 @@ Structural tells to avoid
 - **Ring-composition autopilot.** Don't close every paragraph by
   restating the opener. Let paragraphs end on the last real thought.
 
+{imperfections_section}
+
 Final rules
 -----------
 - Preserve section structure: if the source is a resume with headings,
@@ -2523,15 +2525,77 @@ Final rules
 - Never add claims, metrics, companies, or stories not in the source.
 - **Self-check before returning:** read your own output once, specifically
   hunting for em dashes and banned phrases. If you find any, rewrite that
-  sentence before submitting.
+  sentence before submitting.{self_check_mistakes}
 
 Return ONE JSON object, no prose and no markdown fences:
 
 {{
   "content_md": string,
-  "notes": string | null,   // 1-2 sentences on which voice tics from the samples you matched
-  "warning": string | null  // flag thin samples, conflicting samples, source too short, etc.
+  "notes": string | null,        // 1-2 sentences on which voice tics from the samples you matched
+  "warning": string | null,      // flag thin samples, conflicting samples, source too short, etc.
+  "intentional_mistakes": [      // {mistakes_schema_hint}
+    {{
+      "description": string,     // e.g. "comma splice joining two clauses"
+      "excerpt": string          // exact short text span, 60 chars or less, so the user can search for it
+    }}
+  ]
 }}
+"""
+
+
+_HUMANIZE_IMPERFECTIONS_SECTION = """Introduce controlled imperfections (important — do this DELIBERATELY)
+---------------------------------------------------------------------
+Perfect prose is itself an AI tell. Real humans write with small,
+harmless-looking quirks. After you write the draft, go back and add
+**3 to 6 intentional small mistakes** drawn from this menu:
+
+- A lowercase word where capitalization is technically required but the
+  error reads as plausibly casual (e.g. "i worked on the rewrite" — only
+  where the surrounding tone permits lowercase-i; never in a formal cover
+  letter opening).
+- A sentence-ending punctuation placed OUTSIDE a quotation mark in
+  American English contexts where the rule says inside
+  (e.g. `he called it "the old way".` instead of `"the old way."`).
+- One comma splice where two short clauses get joined with a comma
+  rather than a semicolon (e.g. "I owned the migration, my teammate
+  handled the rollback.").
+- A mild stilted phrasing that a native writer might leave uncorrected
+  (e.g. "that being said" mid-sentence, or "so yeah," tacked onto a
+  paragraph close).
+- A slightly off idiom or collocation — "learned me a lot" instead of
+  "taught me a lot", "broke" instead of "broken" in a gerund phrase —
+  only where it reads as dialect/voice, not confusion.
+- One run-on sentence of 30+ words where the rhythm carries it.
+- A trailing parenthetical that sort of peters out (like this — and
+  then never quite lands).
+- Sentence-initial "And" or "But" used where formal grammar would
+  disallow it.
+- A missing Oxford comma in ONE place. Only one. The user likes Oxford
+  commas; a single missing one reads as a lapse, multiple reads as
+  inconsistency.
+
+**Rules for the imperfections:**
+- Spread them across the document; don't cluster them.
+- None should create actual ambiguity, factual error, or damage a key
+  claim. They are surface tics, not substantive errors.
+- Never put one on a date, metric, proper noun, or job title.
+- If the output is short (e.g. a 150-word email), aim for 2-3; if it's
+  long (a full resume), aim for 5-6.
+- **List every intentional mistake in the output JSON's
+  `intentional_mistakes` array** so the user can audit and either keep
+  or reject each one. Each entry must have `description` (one line
+  naming the mistake) and `excerpt` (the exact short text span where it
+  appears, so the user can find it with Ctrl-F).
+"""
+
+_HUMANIZE_NO_IMPERFECTIONS_SECTION = """No controlled imperfections this run
+-------------------------------------
+The user has disabled the imperfections feature for this run. Produce
+clean, correct prose — no planted comma splices, no missed capitals, no
+deliberate awkwardness. You may still match the samples' natural voice
+tics (contractions, sentence-opening "But", terseness), but nothing that
+a proofreader would flag as an error. Leave the output JSON's
+`intentional_mistakes` array empty.
 """
 
 
@@ -2554,19 +2618,43 @@ Original source document (for reference — preserve these facts):
 {source_body}
 -----
 
+{imperfections_directive}
+
 Return ONE JSON object, no prose, no markdown fences:
 
 {{
   "content_md": string,
   "notes": string | null,
-  "warning": string | null
+  "warning": string | null,
+  "intentional_mistakes": [
+    {{ "description": string, "excerpt": string }}
+  ]
 }}
 """
+
+_FIX_PRESERVE_IMPERFECTIONS = """**Preserve the intentional imperfections.** The previous draft should
+have planted 3-6 deliberate small mistakes (listed as
+`intentional_mistakes`) to make the text read as human. Do NOT "fix"
+those — keep them in place, and re-list them in the new JSON. If one of
+them happens to be inside a sentence you're rewriting to remove a banned
+phrase, plant an equivalent imperfection elsewhere so the total count
+stays the same."""
+
+_FIX_NO_IMPERFECTIONS = """The imperfections feature is disabled for this run — don't introduce
+any deliberate mistakes, and leave `intentional_mistakes` as an empty
+array. Just produce clean corrected prose without the banned patterns."""
 
 
 class HumanizeIn(BaseModel):
     sample_tags: Optional[list[str]] = None
     max_samples: int = Field(default=5, ge=1, le=20)
+    # When True (default), the humanizer plants 3-6 small intentional
+    # imperfections (comma splices, missed capitalization, mild stilted
+    # phrasing, etc.) to make the text read as human, and surfaces each
+    # one on the resulting doc for user audit. When False, the
+    # imperfection-planting section is omitted from the prompt entirely
+    # and the output JSON's `intentional_mistakes` array stays empty.
+    plant_mistakes: bool = True
 
 
 @router.post(
@@ -2637,9 +2725,28 @@ async def humanize_document(
     def _esc_h(v: object) -> str:
         return str(v).replace("{", "{{").replace("}", "}}")
 
+    # Swap the imperfections block based on the user's checkbox. When off,
+    # substitute a short "produce clean output" section and trim the
+    # self-check's reference to planted mistakes so the prompt reads
+    # coherently either way.
+    if payload.plant_mistakes:
+        imperfections_section = _HUMANIZE_IMPERFECTIONS_SECTION
+        self_check_mistakes = (
+            " Then confirm every intentional mistake you planted is actually "
+            "present in the text and listed in `intentional_mistakes`."
+        )
+        mistakes_schema_hint = "3-6 planted imperfections, listed for user audit"
+    else:
+        imperfections_section = _HUMANIZE_NO_IMPERFECTIONS_SECTION
+        self_check_mistakes = ""
+        mistakes_schema_hint = "empty — imperfections disabled for this run"
+
     prompt = _HUMANIZE_PROMPT.format(
         source_body=_esc_h(source.content_md),
         samples_block=_esc_h(samples_block),
+        imperfections_section=imperfections_section,
+        self_check_mistakes=self_check_mistakes,
+        mistakes_schema_hint=mistakes_schema_hint,
     )
 
     # Version per (user, tracked_job_id, doc_type). Humanized output lives in
@@ -2698,6 +2805,7 @@ async def humanize_document(
             # which banned phrases were already in the source document
             # (and shouldn't be flagged as Claude-introduced).
             source_body=source.content_md or "",
+            plant_mistakes=payload.plant_mistakes,
         ),
         name=f"humanize-{humanized_doc.id}",
     )
@@ -2711,6 +2819,7 @@ async def _finish_humanize_in_background(
     source_doc_id: int,
     source_title: str,
     source_body: str = "",
+    plant_mistakes: bool = True,
 ) -> None:
     """Run the humanizer in the background, then validate the output against
     the banned-phrase list + em-dash rule. If violations are found, issue
@@ -2760,6 +2869,11 @@ async def _finish_humanize_in_background(
             violations=violations_block,
             previous_output=content_md.replace("{", "{{").replace("}", "}}"),
             source_body=source_body.replace("{", "{{").replace("}", "}}"),
+            imperfections_directive=(
+                _FIX_PRESERVE_IMPERFECTIONS
+                if plant_mistakes
+                else _FIX_NO_IMPERFECTIONS
+            ),
         )
         try:
             fix_text = await run_claude_to_bus(
@@ -2815,6 +2929,23 @@ async def _finish_humanize_in_background(
         notes_parts.append("Fix-pass summary: " + " | ".join(fix_notes))
     final_notes = " · ".join(notes_parts) if notes_parts else None
 
+    # Normalize intentional_mistakes into a list of {description, excerpt}
+    # dicts, dropping anything malformed. The studio renders this as an
+    # audit checklist so the user can keep-or-delete each planted quirk.
+    raw_mistakes = data.get("intentional_mistakes") or []
+    intentional_mistakes: list[dict] = []
+    if isinstance(raw_mistakes, list):
+        for m in raw_mistakes:
+            if not isinstance(m, dict):
+                continue
+            desc = str(m.get("description") or "").strip()
+            excerpt = str(m.get("excerpt") or "").strip()
+            if not desc:
+                continue
+            intentional_mistakes.append(
+                {"description": desc[:240], "excerpt": excerpt[:240]}
+            )
+
     async with SessionLocal() as db:
         doc = (
             await db.execute(
@@ -2833,5 +2964,6 @@ async def _finish_humanize_in_background(
             "error": None,
             "humanize_fix_passes": len(fix_notes),
             "humanize_residual_violations": residual_violations or None,
+            "intentional_mistakes": intentional_mistakes or None,
         }
         await db.commit()

@@ -361,6 +361,9 @@ export default function DocumentEditorPage({
     warning?: string | null;
     error?: string | null;
     started_at?: string | null;
+    intentional_mistakes?:
+      | { description: string; excerpt?: string | null }[]
+      | null;
   } | null;
   const isUpload = !!structured?.stored_path;
   const genStatus = structured?.status ?? null;
@@ -369,6 +372,7 @@ export default function DocumentEditorPage({
   const extractedFrom = structured?.extracted_from ?? null;
   const isExtracted =
     isUpload && extractedFrom && extractedFrom !== "text";
+  const intentionalMistakes = structured?.intentional_mistakes ?? null;
 
   // Build the download filename: `Firstname-Lastname_Resume_Acme`. Every
   // component is sanitized (space → hyphen, non-safe chars dropped) and
@@ -566,6 +570,10 @@ export default function DocumentEditorPage({
               <span className="text-corp-danger ml-auto">{saveErr}</span>
             ) : null}
           </div>
+
+          {intentionalMistakes && intentionalMistakes.length > 0 ? (
+            <IntentionalMistakesPanel mistakes={intentionalMistakes} />
+          ) : null}
           {showDiff && parentDoc ? (
             <DiffPanel
               previous={parentDoc.content_md ?? ""}
@@ -884,6 +892,63 @@ function ModeButton({
   );
 }
 
+/** Audit checklist for the humanizer's deliberately-planted imperfections.
+ * Each entry has a human description of the mistake and a short verbatim
+ * excerpt the user can copy/Ctrl-F to locate it in the document. The user
+ * can mark each one "keep" or "revert" — `revert` just means "I want to
+ * fix this"; the UI doesn't auto-edit the doc (too brittle). The user
+ * makes the edit in the normal editor and the review is recorded in
+ * localStorage so the list stays per-doc-per-browser.
+ */
+function IntentionalMistakesPanel({
+  mistakes,
+}: {
+  mistakes: { description: string; excerpt?: string | null }[];
+}) {
+  // Collapsed by default — this is background info, not the main content.
+  const [open, setOpen] = useState(true);
+  return (
+    <div className="jsp-card p-4 mt-3 border-corp-accent2/40 jsp-no-print">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-baseline justify-between gap-2 text-left"
+      >
+        <div>
+          <h3 className="text-xs uppercase tracking-wider text-corp-accent2">
+            Planted imperfections ({mistakes.length})
+          </h3>
+          <p className="text-[11px] text-corp-muted mt-0.5">
+            Small, intentional quirks the humanizer added so the text reads as
+            human. Review each — keep the ones that feel natural, fix the ones
+            that don't. The document body above is what gets saved; edit it
+            directly.
+          </p>
+        </div>
+        <span className="text-xs text-corp-muted">{open ? "hide" : "show"}</span>
+      </button>
+      {open ? (
+        <ol className="space-y-2 mt-3">
+          {mistakes.map((m, i) => (
+            <li
+              key={i}
+              className="text-xs border border-corp-border rounded p-2 bg-corp-surface2"
+            >
+              <div className="font-medium text-corp-text">{m.description}</div>
+              {m.excerpt ? (
+                <div className="mt-1 font-mono text-[11px] text-corp-accent2 break-words">
+                  “{m.excerpt}”
+                </div>
+              ) : null}
+            </li>
+          ))}
+        </ol>
+      ) : null}
+    </div>
+  );
+}
+
+
 function HumanizeButton({
   docId,
   onCreated,
@@ -893,6 +958,27 @@ function HumanizeButton({
 }) {
   const [running, setRunning] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // Remember the user's preference across re-renders of the same doc page
+  // and across docs — humanize is usually a repeat action with consistent
+  // taste. Default ON because the imperfections are the feature; users who
+  // want squeaky-clean output can flip it off.
+  const [plantMistakes, setPlantMistakes] = useState<boolean>(() => {
+    if (typeof window === "undefined") return true;
+    const saved = window.localStorage.getItem("jsp:humanize:plant_mistakes");
+    return saved === null ? true : saved === "1";
+  });
+
+  function togglePlant(next: boolean) {
+    setPlantMistakes(next);
+    try {
+      window.localStorage.setItem(
+        "jsp:humanize:plant_mistakes",
+        next ? "1" : "0",
+      );
+    } catch {
+      /* localStorage unavailable (SSR / privacy mode) — non-fatal */
+    }
+  }
 
   async function run() {
     setRunning(true);
@@ -900,7 +986,7 @@ function HumanizeButton({
     try {
       const created = await api.post<GeneratedDocument>(
         `/api/v1/documents/${docId}/humanize`,
-        { max_samples: 5 },
+        { max_samples: 5, plant_mistakes: plantMistakes },
       );
       onCreated(created.id);
     } catch (e) {
@@ -916,15 +1002,35 @@ function HumanizeButton({
 
   return (
     <div className="flex flex-col items-end">
-      <button
-        type="button"
-        className="jsp-btn-ghost text-xs"
-        onClick={run}
-        disabled={running}
-        title="Rewrite this document in your voice using your Writing Samples"
-      >
-        {running ? "Humanizing..." : "Humanize"}
-      </button>
+      <div className="flex items-center gap-2">
+        <label
+          className="inline-flex items-center gap-1 text-[11px] text-corp-muted cursor-pointer select-none"
+          title={
+            "When on, the humanizer plants 3–6 small intentional imperfections " +
+            "(comma splice, missed capitalization, mild stilted phrasing) to " +
+            "make the text read as human. Each is listed on the resulting doc " +
+            "so you can review them. Turn off for squeaky-clean output."
+          }
+        >
+          <input
+            type="checkbox"
+            className="accent-corp-accent"
+            checked={plantMistakes}
+            onChange={(e) => togglePlant(e.target.checked)}
+            disabled={running}
+          />
+          imperfections
+        </label>
+        <button
+          type="button"
+          className="jsp-btn-ghost text-xs"
+          onClick={run}
+          disabled={running}
+          title="Rewrite this document in your voice using your Writing Samples"
+        >
+          {running ? "Humanizing..." : "Humanize"}
+        </button>
+      </div>
       {err ? (
         <span className="text-[10px] text-corp-danger mt-0.5">{err}</span>
       ) : null}
