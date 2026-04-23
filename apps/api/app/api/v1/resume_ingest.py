@@ -221,10 +221,14 @@ async def resume_ingest(
 
     prompt = _INGEST_PROMPT.format(body=body[:80_000])
 
+    from app.skills.queue_bus import run_claude_to_bus
+
     try:
-        result = await run_claude_prompt(
+        final_text = await run_claude_to_bus(
             prompt=prompt,
-            output_format="json",
+            source="resume_ingest",
+            item_id=f"ingest:{doc.id}",
+            label=f"Resume ingest: {doc.title}",
             allowed_tools=[],
             timeout_seconds=180,
         )
@@ -232,7 +236,7 @@ async def resume_ingest(
         log.warning("resume-ingest failed: %s", exc)
         raise HTTPException(status_code=502, detail=f"Claude Code error: {exc}")
 
-    data = _extract_json(result.result) or {}
+    data = _extract_json(final_text) or {}
     proposals = {
         "work_experiences": data.get("work_experiences") or [],
         "educations": data.get("educations") or [],

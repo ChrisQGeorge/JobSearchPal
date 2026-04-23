@@ -314,10 +314,14 @@ async def autofill(
         placeholder_keys=", ".join(sorted(_DEMOGRAPHIC_PLACEHOLDERS.keys())),
     )
 
+    from app.skills.queue_bus import run_claude_to_bus
+
     try:
-        result = await run_claude_prompt(
+        final_text = await run_claude_to_bus(
             prompt=prompt,
-            output_format="json",
+            source="autofill",
+            item_id=f"autofill:{user.id}:{int(__import__('time').time())}",
+            label=f"Autofill ({len(payload.questions)} q)",
             allowed_tools=[],
             timeout_seconds=120,
         )
@@ -325,7 +329,7 @@ async def autofill(
         log.warning("autofill failed: %s", exc)
         raise HTTPException(status_code=502, detail=f"Claude Code error: {exc}")
 
-    data = _extract_json(result.result) or {}
+    data = _extract_json(final_text) or {}
     raw_answers = data.get("answers") or []
 
     # Build response, resolving placeholders.

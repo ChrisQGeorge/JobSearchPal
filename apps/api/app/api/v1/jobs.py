@@ -735,10 +735,14 @@ async def interview_prep(
         subject=str(user.id), extra={"purpose": "interview_prep"}
     )
 
+    from app.skills.queue_bus import run_claude_to_bus
+
     try:
-        result = await run_claude_prompt(
+        final_text = await run_claude_to_bus(
             prompt=prompt,
-            output_format="json",
+            source="interview_prep",
+            item_id=f"round:{round_id}",
+            label=f"Interview prep: round {rnd.round_number}",
             allowed_tools=["Bash"],
             timeout_seconds=180,
             extra_env={
@@ -750,7 +754,7 @@ async def interview_prep(
         log.warning("interview-prep failed for round %s: %s", round_id, exc)
         raise HTTPException(status_code=502, detail=f"Claude Code error: {exc}")
 
-    data = _extract_json_object(result.result) or {}
+    data = _extract_json_object(final_text) or {}
     prep_doc = (data.get("prep_doc_md") or "").strip()
     if not prep_doc:
         raise HTTPException(
@@ -795,10 +799,14 @@ async def interview_retrospective(
         user_recap=payload.user_recap,
     )
 
+    from app.skills.queue_bus import run_claude_to_bus
+
     try:
-        result = await run_claude_prompt(
+        final_text = await run_claude_to_bus(
             prompt=prompt,
-            output_format="json",
+            source="interview_retro",
+            item_id=f"round:{round_id}",
+            label=f"Retro: round {rnd.round_number}",
             allowed_tools=[],
             timeout_seconds=120,
         )
@@ -806,7 +814,7 @@ async def interview_retrospective(
         log.warning("interview-retro failed for round %s: %s", round_id, exc)
         raise HTTPException(status_code=502, detail=f"Claude Code error: {exc}")
 
-    data = _extract_json_object(result.result) or {}
+    data = _extract_json_object(final_text) or {}
     retro_md = (data.get("retrospective_md") or "").strip()
     if not retro_md:
         raise HTTPException(

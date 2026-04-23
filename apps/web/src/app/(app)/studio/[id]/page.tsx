@@ -111,6 +111,21 @@ export default function DocumentEditorPage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [docId]);
 
+  // While the doc is still being generated in the background (async tailor),
+  // poll every 2s until it's ready or errors. Stop polling the moment the
+  // user starts editing (`dirty`) so we don't clobber local changes.
+  useEffect(() => {
+    const status = (doc?.content_structured as { status?: string } | null)
+      ?.status;
+    if (status !== "generating") return;
+    if (dirty) return;
+    const handle = setInterval(() => {
+      load();
+    }, 2000);
+    return () => clearInterval(handle);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [doc?.content_structured, dirty]);
+
   async function save() {
     if (!doc) return;
     setSaving(true);
@@ -204,8 +219,16 @@ export default function DocumentEditorPage({
     stored_path?: string | null;
     mime_type?: string | null;
     extracted_from?: string | null;
+    status?: "generating" | "ready" | "error" | null;
+    notes?: string | null;
+    warning?: string | null;
+    error?: string | null;
+    started_at?: string | null;
   } | null;
   const isUpload = !!structured?.stored_path;
+  const genStatus = structured?.status ?? null;
+  const isGenerating = genStatus === "generating";
+  const genError = genStatus === "error" ? structured?.error ?? null : null;
   const extractedFrom = structured?.extracted_from ?? null;
   const isExtracted =
     isUpload && extractedFrom && extractedFrom !== "text";
@@ -319,7 +342,34 @@ export default function DocumentEditorPage({
         ← Document Studio
       </Link>
 
-      {isUpload && !doc.content_md ? (
+      {isGenerating ? (
+        <div className="jsp-card p-5 mt-3 text-sm">
+          <div className="flex items-center gap-3">
+            <span
+              className="inline-block w-3 h-3 rounded-full bg-corp-accent animate-pulse"
+              aria-hidden
+            />
+            <span className="text-corp-text font-medium">
+              Generating — the Companion is drafting this document.
+            </span>
+          </div>
+          <p className="text-corp-muted mt-2">
+            Checking every 2 seconds. This typically takes under a minute but
+            can run up to ~10 minutes if Claude is rate-limited. You can leave
+            this page and come back; the document will be waiting for you.
+          </p>
+        </div>
+      ) : genError ? (
+        <div className="jsp-card p-5 mt-3 text-sm border-corp-danger/40">
+          <div className="text-corp-danger font-medium">
+            Generation failed.
+          </div>
+          <p className="text-corp-muted mt-2 whitespace-pre-wrap">{genError}</p>
+          <p className="text-corp-muted mt-2">
+            Re-run the tailor from the job page to try again.
+          </p>
+        </div>
+      ) : isUpload && !doc.content_md ? (
         <div className="jsp-card p-5 mt-3 text-sm text-corp-muted">
           No readable text body — we couldn&apos;t extract anything from this
           file. Use{" "}

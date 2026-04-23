@@ -8,6 +8,7 @@ immediately.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import mimetypes
@@ -31,7 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
+from app.core.database import SessionLocal, get_db
 from app.core.deps import get_current_user
 from app.core.security import create_access_token
 from app.models.documents import DocumentEdit, GeneratedDocument, WritingSample
@@ -1348,37 +1349,7 @@ async def _run_tailor(
         subject=str(user.id), extra={"purpose": f"doc_tailor_{doc_type}"}
     )
 
-    try:
-        result = await run_claude_prompt(
-            prompt=prompt,
-            output_format="json",
-            allowed_tools=["Bash"],
-            timeout_seconds=240,
-            extra_env={
-                "JSP_API_BASE_URL": "http://localhost:8000",
-                "JSP_API_TOKEN": api_token,
-            },
-        )
-    except ClaudeCodeError as exc:
-        log.warning("Tailor %s failed for job %s: %s", doc_type, job.id, exc)
-        raise HTTPException(status_code=502, detail=f"Claude Code error: {exc}")
-
-    data = _extract_json_object(result.result) or {}
-    content_md = (data.get("content_md") or "").strip()
-    if not content_md:
-        raise HTTPException(
-            status_code=502,
-            detail="Tailoring returned no content. Check Companion logs.",
-        )
-
-    title = (
-        title_override
-        or data.get("title")
-        or f"{doc_type.replace('_', ' ').title()} – {job.title or 'job'}"
-    )
-
     # Version: one more than the highest existing version for this job + doc_type.
-    # Also grab the id of that previous version so we can thread parent_version_id.
     prev_row = (
         await db.execute(
             select(GeneratedDocument.id, GeneratedDocument.version)
@@ -1395,18 +1366,28 @@ async def _run_tailor(
     next_version = (prev_row[1] + 1) if prev_row else 1
     parent_version_id = prev_row[0] if prev_row else None
 
-    structured = {
-        "notes": data.get("notes"),
-        "warning": data.get("warning"),
-    }
+    title = (
+        title_override
+        or f"{doc_type.replace('_', ' ').title()} – {job.title or 'job'}"
+    )
 
+    # Create the placeholder row synchronously. The background task fills in
+    # content_md + structured when Claude returns. This keeps the HTTP request
+    # short (< 1s) so the Next.js proxy doesn't time out — Claude runs can
+    # take several minutes.
     doc = GeneratedDocument(
         user_id=user.id,
         tracked_job_id=job.id,
         doc_type=doc_type,
         title=title[:255],
-        content_md=content_md,
-        content_structured=structured,
+        content_md=None,
+        content_structured={
+            "status": "generating",
+            "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "notes": None,
+            "warning": None,
+            "error": None,
+        },
         version=next_version,
         parent_version_id=parent_version_id,
         humanized=False,
@@ -1417,7 +1398,117 @@ async def _run_tailor(
     db.add(doc)
     await db.commit()
     await db.refresh(doc)
+
+    # Kick off the long-running Claude call outside the request scope. We use
+    # asyncio.create_task so the request returns immediately; the task owns
+    # its own DB session via SessionLocal.
+    asyncio.create_task(
+        _finish_tailor_in_background(
+            doc_id=doc.id,
+            prompt=prompt,
+            doc_type=doc_type,
+            title_override=title_override,
+            job_title=job.title or "job",
+            api_token=api_token,
+        ),
+        name=f"tailor-{doc_type}-{doc.id}",
+    )
     return doc
+
+
+async def _finish_tailor_in_background(
+    *,
+    doc_id: int,
+    prompt: str,
+    doc_type: str,
+    title_override: Optional[str],
+    job_title: str,
+    api_token: str,
+) -> None:
+    """Run Claude in the background, then update the placeholder doc row with
+    the result. Runs with its own DB session because the request scope is gone.
+    Streams live events onto the queue_bus so /queue can narrate progress."""
+    from app.skills.queue_bus import run_claude_to_bus
+
+    label = f"{doc_type.replace('_', ' ').title()}: {job_title}"
+    try:
+        final_text = await run_claude_to_bus(
+            prompt=prompt,
+            source=f"tailor_{doc_type}",
+            item_id=f"doc:{doc_id}",
+            label=label,
+            allowed_tools=["Bash"],
+            timeout_seconds=600,
+            extra_env={
+                "JSP_API_BASE_URL": "http://localhost:8000",
+                "JSP_API_TOKEN": api_token,
+            },
+        )
+    except ClaudeCodeError as exc:
+        log.warning("Tailor %s failed (doc %s): %s", doc_type, doc_id, exc)
+        await _mark_tailor_error(doc_id, f"Claude Code error: {exc}")
+        return
+    except Exception as exc:  # defensive — task must not crash silently
+        log.exception("Tailor %s crashed (doc %s)", doc_type, doc_id)
+        await _mark_tailor_error(doc_id, f"Unexpected error: {exc}")
+        return
+
+    data = _extract_json_object(final_text) or {}
+    content_md = (data.get("content_md") or "").strip()
+    if not content_md:
+        await _mark_tailor_error(
+            doc_id, "Tailoring returned no content. Check Companion logs."
+        )
+        return
+
+    title = (
+        title_override
+        or data.get("title")
+        or f"{doc_type.replace('_', ' ').title()} – {job_title}"
+    )
+
+    async with SessionLocal() as db:
+        doc = (
+            await db.execute(
+                select(GeneratedDocument).where(GeneratedDocument.id == doc_id)
+            )
+        ).scalar_one_or_none()
+        if doc is None:
+            log.warning("Tailor background: doc %s vanished before save", doc_id)
+            return
+        doc.content_md = content_md
+        doc.title = title[:255]
+        doc.content_structured = {
+            "status": "ready",
+            "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "notes": data.get("notes"),
+            "warning": data.get("warning"),
+            "error": None,
+        }
+        await db.commit()
+
+
+async def _mark_tailor_error(doc_id: int, message: str) -> None:
+    """Update the placeholder doc row with an error status so the UI can show it."""
+    try:
+        async with SessionLocal() as db:
+            doc = (
+                await db.execute(
+                    select(GeneratedDocument).where(GeneratedDocument.id == doc_id)
+                )
+            ).scalar_one_or_none()
+            if doc is None:
+                return
+            doc.content_structured = {
+                "status": "error",
+                "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "notes": None,
+                "warning": None,
+                "error": message,
+            }
+            await db.commit()
+    except Exception:
+        log.exception("Failed to record tailor error for doc %s", doc_id)
 
 
 @router.post(
@@ -2037,10 +2128,14 @@ async def selection_edit(
         )
     )
 
+    from app.skills.queue_bus import run_claude_to_bus
+
     try:
-        result = await run_claude_prompt(
+        final_text = await run_claude_to_bus(
             prompt=prompt,
-            output_format="json",
+            source=f"selection_{payload.mode}",
+            item_id=f"doc:{doc.id}:edit:{int(datetime.now(timezone.utc).timestamp())}",
+            label=f"{payload.mode.replace('_', ' ').title()}: {doc.title}",
             allowed_tools=[],
             timeout_seconds=120,
         )
@@ -2050,7 +2145,7 @@ async def selection_edit(
         )
         raise HTTPException(status_code=502, detail=f"Claude Code error: {exc}")
 
-    data = _extract_json_object(result.result) or {}
+    data = _extract_json_object(final_text) or {}
 
     if payload.mode == "rewrite":
         replacement = (data.get("replacement_text") or "").strip()
@@ -2275,24 +2370,6 @@ async def humanize_document(
         samples_block=_esc_h(samples_block),
     )
 
-    try:
-        result = await run_claude_prompt(
-            prompt=prompt,
-            output_format="json",
-            allowed_tools=[],
-            timeout_seconds=180,
-        )
-    except ClaudeCodeError as exc:
-        log.warning("Humanize failed for doc %s: %s", doc_id, exc)
-        raise HTTPException(status_code=502, detail=f"Claude Code error: {exc}")
-
-    data = _extract_json_object(result.result) or {}
-    content_md = (data.get("content_md") or "").strip()
-    if not content_md:
-        raise HTTPException(
-            status_code=502, detail="Humanizer returned no content."
-        )
-
     # Version per (user, tracked_job_id, doc_type). Humanized output lives in
     # the same stream as the original — it's just another version of the doc.
     max_version_row = (
@@ -2310,16 +2387,22 @@ async def humanize_document(
     ).first()
     next_version = (max_version_row[0] + 1) if max_version_row else 1
 
+    # Create the placeholder row synchronously, then kick Claude into a
+    # background task so the HTTP request returns quickly. The /studio page
+    # polls the doc until status flips to "ready" or "error".
     humanized_doc = GeneratedDocument(
         user_id=user.id,
         tracked_job_id=source.tracked_job_id,
         doc_type=source.doc_type,
         title=f"{source.title} (humanized)"[:255],
-        content_md=content_md,
+        content_md=None,
         content_structured={
-            "notes": data.get("notes"),
-            "warning": data.get("warning"),
+            "status": "generating",
+            "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "humanized_source_doc_id": source.id,
+            "notes": None,
+            "warning": None,
+            "error": None,
         },
         version=next_version,
         parent_version_id=source.id,
@@ -2332,4 +2415,68 @@ async def humanize_document(
     db.add(humanized_doc)
     await db.commit()
     await db.refresh(humanized_doc)
+
+    asyncio.create_task(
+        _finish_humanize_in_background(
+            doc_id=humanized_doc.id,
+            prompt=prompt,
+            source_doc_id=source.id,
+            source_title=source.title,
+        ),
+        name=f"humanize-{humanized_doc.id}",
+    )
     return humanized_doc
+
+
+async def _finish_humanize_in_background(
+    *,
+    doc_id: int,
+    prompt: str,
+    source_doc_id: int,
+    source_title: str,
+) -> None:
+    """Mirror of _finish_tailor_in_background for the humanizer."""
+    from app.skills.queue_bus import run_claude_to_bus
+
+    try:
+        final_text = await run_claude_to_bus(
+            prompt=prompt,
+            source="humanize",
+            item_id=f"doc:{doc_id}",
+            label=f"Humanize: {source_title}",
+            allowed_tools=[],
+            timeout_seconds=600,
+        )
+    except ClaudeCodeError as exc:
+        log.warning("Humanize failed (doc %s): %s", doc_id, exc)
+        await _mark_tailor_error(doc_id, f"Claude Code error: {exc}")
+        return
+    except Exception as exc:
+        log.exception("Humanize crashed (doc %s)", doc_id)
+        await _mark_tailor_error(doc_id, f"Unexpected error: {exc}")
+        return
+
+    data = _extract_json_object(final_text) or {}
+    content_md = (data.get("content_md") or "").strip()
+    if not content_md:
+        await _mark_tailor_error(doc_id, "Humanizer returned no content.")
+        return
+
+    async with SessionLocal() as db:
+        doc = (
+            await db.execute(
+                select(GeneratedDocument).where(GeneratedDocument.id == doc_id)
+            )
+        ).scalar_one_or_none()
+        if doc is None:
+            return
+        doc.content_md = content_md
+        doc.content_structured = {
+            "status": "ready",
+            "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "humanized_source_doc_id": source_doc_id,
+            "notes": data.get("notes"),
+            "warning": data.get("warning"),
+            "error": None,
+        }
+        await db.commit()

@@ -276,10 +276,14 @@ async def job_strategy(
         hot_jobs=json.dumps(hot, indent=2) if hot else "(no active jobs)",
     )
 
+    from app.skills.queue_bus import run_claude_to_bus
+
     try:
-        result = await run_claude_prompt(
+        final_text = await run_claude_to_bus(
             prompt=prompt,
-            output_format="json",
+            source="strategy",
+            item_id=f"strategy:{user.id}",
+            label="Strategy briefing",
             allowed_tools=[],
             timeout_seconds=120,
         )
@@ -287,7 +291,7 @@ async def job_strategy(
         log.warning("strategy failed: %s", exc)
         raise HTTPException(status_code=502, detail=f"Claude Code error: {exc}")
 
-    data = _extract_json(result.result) or {}
+    data = _extract_json(final_text) or {}
     headline = (data.get("headline") or "").strip()
     if not headline:
         raise HTTPException(

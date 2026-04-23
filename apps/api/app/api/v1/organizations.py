@@ -301,10 +301,14 @@ async def research_organization(
     )
     prompt = _RESEARCH_PROMPT.format(name=obj.name, hint_block=hint_block)
 
+    from app.skills.queue_bus import run_claude_to_bus
+
     try:
-        result = await _run_claude_prompt(
+        final_text = await run_claude_to_bus(
             prompt=prompt,
-            output_format="json",
+            source="org_research",
+            item_id=f"org:{org_id}",
+            label=f"Research: {obj.name}",
             allowed_tools=["WebFetch", "WebSearch"],
             timeout_seconds=180,
         )
@@ -312,7 +316,7 @@ async def research_organization(
         _log.warning("Org research failed for %s (%s): %s", obj.name, org_id, exc)
         raise HTTPException(status_code=502, detail=f"Claude Code error: {exc}")
 
-    data = _extract_json(result.result) or {}
+    data = _extract_json(final_text) or {}
 
     # Fill only if empty — don't stomp user-entered data.
     scalar_fields = [
