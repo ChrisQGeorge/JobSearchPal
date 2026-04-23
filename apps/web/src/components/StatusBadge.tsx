@@ -2,6 +2,9 @@ import type { JobStatus } from "@/lib/types";
 
 // Status visual style for TrackedJob.status. One palette entry per status.
 const STATUS_STYLES: Record<JobStatus, string> = {
+  to_review:
+    "bg-corp-accent2/25 text-corp-accent2 border-corp-accent2/50 animate-pulse",
+  reviewed: "bg-slate-500/20 text-slate-300 border-slate-500/40",
   watching: "bg-corp-surface2 text-corp-muted border-corp-border",
   interested: "bg-sky-500/20 text-sky-300 border-sky-500/40",
   not_interested: "bg-zinc-500/20 text-zinc-400 border-zinc-500/40 line-through decoration-zinc-500/60",
@@ -21,6 +24,7 @@ const STATUS_STYLES: Record<JobStatus, string> = {
 // Human-readable labels for statuses whose raw token is awkward.
 const STATUS_LABELS: Partial<Record<JobStatus, string>> = {
   not_interested: "not interested",
+  to_review: "to review",
 };
 
 export function StatusBadge({ status }: { status: JobStatus }) {

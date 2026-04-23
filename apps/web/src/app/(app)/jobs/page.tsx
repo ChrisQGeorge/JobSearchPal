@@ -374,7 +374,7 @@ function NewJobForm({
   // Bump this key to force the OrganizationCombobox to re-read its `value`
   // prop after a URL fetch updates the organization_id externally.
   const [orgPickerKey, setOrgPickerKey] = useState(0);
-  const [status, setStatus] = useState<JobStatus>("watching");
+  const [status, setStatus] = useState<JobStatus>("to_review");
   const [sourceUrl, setSourceUrl] = useState("");
   const [location, setLocation] = useState("");
   const [remotePolicy, setRemotePolicy] = useState<RemotePolicy | "">("");

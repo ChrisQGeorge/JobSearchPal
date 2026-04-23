@@ -10,6 +10,7 @@ const NAV = [
   { href: "/history", label: "History Editor" },
   { href: "/organizations", label: "Organizations" },
   { href: "/jobs", label: "Job Tracker" },
+  { href: "/jobs/review", label: "Review Queue" },
   { href: "/queue", label: "Companion Activity" },
   { href: "/studio", label: "Document Studio" },
   { href: "/samples", label: "Writing Samples" },
@@ -27,11 +28,26 @@ export function Sidebar() {
     setOpen(false);
   }, [pathname]);
 
+  // The nav entry whose href is the longest prefix of the current path wins.
+  // Without this, `/jobs/review` lights up both "Job Tracker" and "Review
+  // Queue" because both pass `startsWith`.
+  const activeHref = (() => {
+    if (!pathname) return null;
+    if (pathname === "/") return "/";
+    let best: string | null = null;
+    for (const item of NAV) {
+      if (item.href === "/") continue;
+      if (pathname === item.href || pathname.startsWith(item.href + "/")) {
+        if (!best || item.href.length > best.length) best = item.href;
+      }
+    }
+    return best;
+  })();
+
   const navItems = (
     <nav className="flex-1 py-3">
       {NAV.map((item) => {
-        const active =
-          item.href === "/" ? pathname === "/" : pathname?.startsWith(item.href);
+        const active = item.href === activeHref;
         return (
           <Link
             key={item.href}

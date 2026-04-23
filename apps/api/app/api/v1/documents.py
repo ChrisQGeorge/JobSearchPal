@@ -2311,34 +2311,248 @@ async def selection_edit(
 
 # --- Humanizer --------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Humanizer — banned AI-tell lexicon + validator
+# ---------------------------------------------------------------------------
+# Curated from the 2024-2025 "does this sound like GPT?" discourse. Both the
+# prompt and a post-pass validator check for these. Any hit triggers a
+# retry pass telling Claude exactly which tokens to rewrite. If a phrase is
+# genuinely in the source document (e.g. the user's JD literally says
+# "leverage"), the validator preserves it by matching ONLY inside the
+# Claude-generated content that isn't already present in the source.
+#
+# We err conservative: these are flagged as "probably AI-tell" and the
+# retry prompt tells Claude to rewrite them unless they're load-bearing.
+
+_HUMANIZE_BANNED_PHRASES: tuple[str, ...] = (
+    # Overused verbs
+    "delve", "delving", "delve into",
+    "leverage", "leveraging", "leverages",
+    "navigate the complexities", "navigating the complexities",
+    "foster",  # "foster innovation", "foster collaboration"
+    "underscore", "underscores",
+    "unlock", "unlocking",  # "unlock the potential of"
+    # Overused adjectives / clichés
+    "robust solution", "seamless", "seamlessly",
+    "vibrant", "bustling",
+    "meticulous", "meticulously",
+    "crucial", "pivotal", "paramount",
+    "testament to",
+    "paradigm shift",
+    "game-changer", "game-changing",
+    # Structural openers / transitions
+    "in today's fast-paced world",
+    "in the ever-evolving",
+    "it's important to note",
+    "it's worth noting",
+    "it is worth mentioning",
+    "at the heart of",
+    "in the realm of",
+    "stands as a testament",
+    "stands as a beacon",
+    # Summary / wrap patterns
+    "in conclusion",
+    "to summarize",
+    "in summary",
+    # "Tapestry"-style metaphors
+    "rich tapestry",
+    "tapestry of",
+    # Dialectic setup-payoff
+    "it's not just", "it's not merely",
+    "this isn't just", "this isn't merely",
+    # Overused intensifiers in triplets
+    "clear, concise, and compelling",
+    "whether you're",
+    # ChatGPT-specific opener tells (rarely appear in humanized output, but
+    # worth catching if Claude slips into assistant-voice)
+    "certainly!", "absolutely!", "great question!",
+    # "Moreover / Furthermore / Additionally" as paragraph openers —
+    # validator only flags them when they start a line.
+)
+
+# Em dash variants. Claude and the Anthropic models specifically over-use
+# these; the user wants them banned outright.
+_BANNED_DASHES: tuple[str, ...] = (
+    "—",  # em dash —
+    "―",  # horizontal bar ―
+)
+
+# Paragraph-start transitions — flag only when they open a line.
+_BANNED_LINE_STARTS: tuple[str, ...] = (
+    "moreover,", "furthermore,", "additionally,",
+)
+
+
+def _validate_humanizer_output(content_md: str, source_body: str = "") -> list[str]:
+    """Return a list of violation descriptions. Empty list = clean output.
+    We compare against `source_body` so a banned word that was ALREADY in
+    the source (e.g. the JD literally uses 'leverage') doesn't flag — we
+    only care about AI-tell phrases Claude introduced."""
+    if not content_md:
+        return []
+    lower = content_md.lower()
+    source_lower = (source_body or "").lower()
+    violations: list[str] = []
+
+    for dash in _BANNED_DASHES:
+        if dash in content_md:
+            count = content_md.count(dash)
+            # Count in source too — if the user's source uses em dashes
+            # (e.g. a JD paste), that's fine. Only flag NEW dashes.
+            src_count = source_body.count(dash)
+            if count > src_count:
+                violations.append(
+                    f"em dash (U+{ord(dash):04X}) appears {count - src_count} time(s) in output "
+                    f"but not in the source. Replace with a period, comma, "
+                    f"semicolon, or parenthesis."
+                )
+
+    for phrase in _HUMANIZE_BANNED_PHRASES:
+        if phrase in lower and phrase not in source_lower:
+            violations.append(f'banned AI-tell phrase: "{phrase}"')
+
+    for opener in _BANNED_LINE_STARTS:
+        # Match only at the start of a line (after whitespace or a list marker).
+        for line in content_md.splitlines():
+            stripped = line.lstrip(" \t*->-•").lower()
+            if stripped.startswith(opener):
+                if opener not in source_lower:
+                    violations.append(
+                        f'banned paragraph-opener: line begins with "{opener}"'
+                    )
+                break  # one report per opener is enough
+
+    # Dedupe while preserving order.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for v in violations:
+        if v not in seen:
+            seen.add(v)
+            unique.append(v)
+    return unique
+
+
 _HUMANIZE_PROMPT = """You are rewriting a document in the user's own voice,
 using their writing samples as the reference corpus for tone, sentence shape,
 and word choice. This is NOT a full rewrite — preserve the structure,
-headings, bullet content, and factual claims of the source. Change only HOW
-things are said.
+headings, every factual claim, every metric, every date, every organization,
+every project name from the source. Change only HOW things are said, not
+WHAT is said.
 
-Source document:
+Source document (the content you must preserve):
 -----
 {source_body}
 -----
 
 User's writing samples (treat each as an independent example of their
-natural voice — mimic cadence and vocabulary, not topic):
+natural voice — mimic cadence, word choice, sentence-length distribution,
+and punctuation habits, NOT topic):
 
 {samples_block}
 
-Rules
+What "humanize" means for this task
+------------------------------------
+The goal is output that a careful human reader would NOT flag as
+AI-generated, while keeping every concrete fact from the source intact.
+
+1. **Match the samples' voice carefully.** Before writing, note from the
+   samples: average sentence length, use-of-contractions rate (do they
+   write "don't" vs "do not"?), first-person density, whether they start
+   sentences with "But" / "And" / "So", whether they use single-sentence
+   paragraphs, whether their paragraphs open with transitions. Replicate
+   those tics in your output. If the samples are terse, be terse. If the
+   samples use fragments, use fragments.
+
+2. **Preserve source content verbatim where the phrasing is already good.**
+   If a sentence in the source reads naturally and contains a factual
+   claim, keep it. Do not "improve" it into AI-speak. You're editing for
+   voice, not rewriting from scratch.
+
+3. **Keep every metric, date, proper noun, and section header from the
+   source.** Reword connecting tissue; leave facts alone.
+
+Banned language (HARD RULES — output that violates these will be rejected
+and you will be asked to rewrite)
+--------------------------------------------------------------------------
+- **NO em dashes.** The U+2014 character `—` is banned outright. If a
+  sentence feels like it needs one, break it with a period, a comma, a
+  semicolon, or parentheses. This rule has no exceptions.
+- **NO en dashes** for parenthetical asides (U+2013 `–` stays fine for
+  numeric ranges like "2020–2024"; not for prose).
+- **NO unicode curly quotes** (" " ' ') if the source uses ASCII (" ').
+  Match the source's quote style.
+- **Oxford commas are FINE and preferred.** The "rule of three" rule above
+  bans the *rhythm* of three-parallel-ideas-in-the-same-beat, not the
+  serial comma. A sentence like "shipped Redis, Kafka, and Postgres
+  rewrites" is correct and should stay.
+- **BANNED PHRASES** (these are flagged by an automated checker; avoid
+  them unless they're literally quoted from the source):
+  delve, delve into, leverage, leveraging, navigate the complexities,
+  foster (innovation/collaboration), underscore(s), unlock the potential,
+  robust solution, seamless(ly), vibrant, bustling, meticulous(ly),
+  crucial, pivotal, paramount, testament to, paradigm shift,
+  game-changer, game-changing, in today's fast-paced world,
+  in the ever-evolving, it's important to note, it's worth noting,
+  at the heart of, in the realm of, stands as a testament,
+  stands as a beacon, in conclusion, to summarize, in summary,
+  rich tapestry, tapestry of, "it's not just X — it's Y" dialectic,
+  "this isn't just / merely" pivot, "clear, concise, and compelling"
+  triplets, "whether you're a [X] or [Y]", certainly! absolutely!
+  great question!
+- **BANNED paragraph openers:** Do NOT start a paragraph or sentence with
+  "Moreover," / "Furthermore," / "Additionally,".
+
+Structural tells to avoid
+-------------------------
+- **Near-perfect bullet-list parallelism.** Vary grammatical shape and
+  length across bullets. Some bullets should be noticeably shorter or
+  longer than their siblings.
+- **Rule of three addiction.** If you find yourself clustering three
+  adjectives or three phrases in the same rhythm, break it — use two, or
+  four, or a different structure.
+- **Dialectic setup-payoff.** Don't frame ideas as "It's not X — it's Y"
+  or "This isn't merely X; it's Y". That rhythm is a Claude-specific tell.
+- **Ring-composition autopilot.** Don't close every paragraph by
+  restating the opener. Let paragraphs end on the last real thought.
+
+Final rules
+-----------
+- Preserve section structure: if the source is a resume with headings,
+  output a resume with the same headings. If it's a cover letter, keep
+  it a cover letter with the same number of paragraphs.
+- Never add claims, metrics, companies, or stories not in the source.
+- **Self-check before returning:** read your own output once, specifically
+  hunting for em dashes and banned phrases. If you find any, rewrite that
+  sentence before submitting.
+
+Return ONE JSON object, no prose and no markdown fences:
+
+{{
+  "content_md": string,
+  "notes": string | null,   // 1-2 sentences on which voice tics from the samples you matched
+  "warning": string | null  // flag thin samples, conflicting samples, source too short, etc.
+}}
+"""
+
+
+_HUMANIZE_FIX_PROMPT = """Your previous humanized output contained banned
+AI-tell patterns. Rewrite the document below to eliminate every violation
+listed. Preserve all facts, metrics, dates, and section structure. Don't
+reintroduce the banned phrases when rewriting; use plain English.
+
+Violations the checker caught:
+{violations}
+
+Your previous output (rewrite this, don't start over — keep everything
+that wasn't flagged):
 -----
-- NEVER add claims, metrics, companies, or stories not in the source.
-- Preserve section structure: if the source is a resume with headings, output
-  a resume with the same headings. If it's a cover letter, keep it a cover
-  letter.
-- Kill AI tells: over-polished parallelism, "moreover", "furthermore", "leveraging",
-  empty-phrase openers ("I am excited to…"), triplets-of-adjectives patterns.
-- Match the samples' contraction rate, punctuation tics, sentence-length
-  distribution, whether they use em-dashes or not, first-person density.
-- If a sample contradicts another sample, trust the one that feels closer to
-  the source's genre.
+{previous_output}
+-----
+
+Original source document (for reference — preserve these facts):
+-----
+{source_body}
+-----
 
 Return ONE JSON object, no prose, no markdown fences:
 
@@ -2480,6 +2694,10 @@ async def humanize_document(
             prompt=prompt,
             source_doc_id=source.id,
             source_title=source.title,
+            # Pass the raw (unescaped) source so the validator can tell
+            # which banned phrases were already in the source document
+            # (and shouldn't be flagged as Claude-introduced).
+            source_body=source.content_md or "",
         ),
         name=f"humanize-{humanized_doc.id}",
     )
@@ -2492,9 +2710,16 @@ async def _finish_humanize_in_background(
     prompt: str,
     source_doc_id: int,
     source_title: str,
+    source_body: str = "",
 ) -> None:
-    """Mirror of _finish_tailor_in_background for the humanizer."""
+    """Run the humanizer in the background, then validate the output against
+    the banned-phrase list + em-dash rule. If violations are found, issue
+    a fix-it pass (up to `_MAX_HUMANIZE_FIX_PASSES` retries) telling Claude
+    exactly which tokens to rewrite. Uncaught residual violations end up
+    as `warning` text on the saved doc so the user can inspect."""
     from app.skills.queue_bus import run_claude_to_bus
+
+    _MAX_HUMANIZE_FIX_PASSES = 2
 
     try:
         final_text = await run_claude_to_bus(
@@ -2520,6 +2745,76 @@ async def _finish_humanize_in_background(
         await _mark_tailor_error(doc_id, "Humanizer returned no content.")
         return
 
+    # --- Enforce the banned-phrase + em-dash rules via retry passes -------
+    fix_notes: list[str] = []
+    for pass_idx in range(_MAX_HUMANIZE_FIX_PASSES):
+        violations = _validate_humanizer_output(content_md, source_body=source_body)
+        if not violations:
+            break
+        log.info(
+            "Humanize doc %s fix-pass %d: %d violation(s): %s",
+            doc_id, pass_idx + 1, len(violations), violations,
+        )
+        violations_block = "\n".join(f"- {v}" for v in violations)
+        fix_prompt = _HUMANIZE_FIX_PROMPT.format(
+            violations=violations_block,
+            previous_output=content_md.replace("{", "{{").replace("}", "}}"),
+            source_body=source_body.replace("{", "{{").replace("}", "}}"),
+        )
+        try:
+            fix_text = await run_claude_to_bus(
+                prompt=fix_prompt,
+                source="humanize",
+                item_id=f"doc:{doc_id}",
+                label=f"Humanize fix-pass {pass_idx + 1}: {source_title}",
+                allowed_tools=[],
+                timeout_seconds=600,
+            )
+        except Exception as exc:  # pragma: no cover
+            log.warning(
+                "Humanize fix-pass %d failed (doc %s): %s — keeping prior output",
+                pass_idx + 1, doc_id, exc,
+            )
+            break
+        fix_data = _extract_json_object(fix_text) or {}
+        new_md = (fix_data.get("content_md") or "").strip()
+        if not new_md:
+            break
+        content_md = new_md
+        data = fix_data  # so `notes`/`warning` below come from the fix-pass
+        fix_notes.append(
+            f"Pass {pass_idx + 1} fixed: {', '.join(violations[:4])}"
+            + ("…" if len(violations) > 4 else "")
+        )
+    # Final check — if anything still slipped through we leave it but stamp
+    # a warning the studio surfaces in the content_structured meta.
+    residual_violations = _validate_humanizer_output(
+        content_md, source_body=source_body
+    )
+
+    # Merge any validator hits into the saved warning so the studio UI
+    # surfaces them. If the fix-pass cleaned everything, we still keep a
+    # short "notes" breadcrumb so the user knows a fix-up happened.
+    claude_warning = data.get("warning")
+    warning_parts: list[str] = []
+    if claude_warning:
+        warning_parts.append(str(claude_warning))
+    if residual_violations:
+        warning_parts.append(
+            "After retries, these AI-tell patterns still slipped through — "
+            "consider a manual pass:\n  - "
+            + "\n  - ".join(residual_violations)
+        )
+    final_warning = "\n\n".join(warning_parts) if warning_parts else None
+
+    claude_notes = data.get("notes")
+    notes_parts: list[str] = []
+    if claude_notes:
+        notes_parts.append(str(claude_notes))
+    if fix_notes:
+        notes_parts.append("Fix-pass summary: " + " | ".join(fix_notes))
+    final_notes = " · ".join(notes_parts) if notes_parts else None
+
     async with SessionLocal() as db:
         doc = (
             await db.execute(
@@ -2533,8 +2828,10 @@ async def _finish_humanize_in_background(
             "status": "ready",
             "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "humanized_source_doc_id": source_doc_id,
-            "notes": data.get("notes"),
-            "warning": data.get("warning"),
+            "notes": final_notes,
+            "warning": final_warning,
             "error": None,
+            "humanize_fix_passes": len(fix_notes),
+            "humanize_residual_violations": residual_violations or None,
         }
         await db.commit()

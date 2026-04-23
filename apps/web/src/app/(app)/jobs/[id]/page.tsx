@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useRef, useState, use as usePromise } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { OrganizationCombobox } from "@/components/OrganizationCombobox";
 import { PageShell } from "@/components/PageShell";
 import { SkillsAnalysis } from "@/components/SkillsAnalysis";
@@ -136,6 +136,11 @@ export default function JobDetailPage({
       }
       actions={
         <div className="flex gap-2 items-center">
+          <ReviewAction
+            jobId={job.id}
+            status={job.status}
+            onStatusChanged={(s) => patch({ status: s })}
+          />
           <StatusSelect
             status={job.status}
             disabled={saving}
@@ -212,6 +217,120 @@ function StatusSelect({
         ))}
       </select>
     </div>
+  );
+}
+
+/**
+ * The review-queue "Reviewed · Next →" button. Always visible so a user
+ * browsing any job can clear it out of review + jump to the next. The
+ * button's behavior depends on the current status:
+ *
+ *   status == "to_review" — marks the row as `reviewed` AND advances to
+ *       the next to_review job. If the user has already picked a more
+ *       specific status via the dropdown (applied / interested / …), the
+ *       current status counts as "already reviewed" and we just advance.
+ *   status != "to_review" — the status flip is a no-op; clicking still
+ *       advances to the next to_review job. Lets the user skim through
+ *       already-reviewed jobs without changing their status by accident.
+ *
+ * Counter shows remaining jobs in the review queue (excluding the current
+ * one if it's still to_review — the Reviewed click will decrement it).
+ */
+function ReviewAction({
+  jobId,
+  status,
+  onStatusChanged,
+}: {
+  jobId: number;
+  status: JobStatus;
+  onStatusChanged: (s: JobStatus) => void;
+}) {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const inReviewFlow = searchParams.get("from") === "review";
+  const [ids, setIds] = useState<number[]>([]);
+  const [busy, setBusy] = useState(false);
+
+  async function refreshQueue() {
+    try {
+      const out = await api.get<{ ids: number[] }>(
+        "/api/v1/jobs/review-queue",
+      );
+      setIds(out.ids ?? []);
+    } catch {
+      /* best-effort — worst case counter shows zero */
+    }
+  }
+
+  useEffect(() => {
+    refreshQueue();
+  }, [jobId]);
+
+  // How many still need review after this one? If current status is
+  // already not-to-review, the count = full queue. If current IS
+  // to_review, subtract 1 because clicking the button will clear it.
+  const remaining =
+    status === "to_review"
+      ? Math.max(0, ids.filter((i) => i !== jobId).length)
+      : ids.length;
+
+  async function act() {
+    setBusy(true);
+    try {
+      if (status === "to_review") {
+        await api.put<TrackedJob>(`/api/v1/jobs/${jobId}`, {
+          status: "reviewed",
+        });
+        onStatusChanged("reviewed");
+      }
+      // Compute next target — prefer the next to_review after the current
+      // one in the queue, wrap to the first if we're already at the end,
+      // or fall back to the Review Queue list page if the queue is empty.
+      const queue = ids.filter((i) => i !== jobId);
+      if (queue.length === 0) {
+        router.push("/jobs/review");
+        return;
+      }
+      const idx = ids.indexOf(jobId);
+      const next = idx >= 0 && idx + 1 < ids.length ? ids[idx + 1] : queue[0];
+      router.push(`/jobs/${next}?from=review`);
+    } catch {
+      /* non-fatal; stay on the page */
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const label =
+    status === "to_review"
+      ? `Reviewed · Next →`
+      : inReviewFlow
+        ? `Skip · Next →`
+        : `Next to review →`;
+
+  // Counter is only meaningful when there's at least one waiting job.
+  const counter =
+    remaining > 0 ? (
+      <span className="text-[10px] text-corp-muted ml-1">
+        ({remaining} left)
+      </span>
+    ) : null;
+
+  return (
+    <button
+      type="button"
+      className="jsp-btn-primary flex items-center gap-1"
+      onClick={act}
+      disabled={busy}
+      title={
+        status === "to_review"
+          ? "Mark this job as reviewed and move to the next one in the queue"
+          : "Move to the next to-review job"
+      }
+    >
+      {busy ? "..." : label}
+      {counter}
+    </button>
   );
 }
 

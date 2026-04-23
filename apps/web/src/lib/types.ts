@@ -112,6 +112,8 @@ export type Achievement = {
 };
 
 export type JobStatus =
+  | "to_review"
+  | "reviewed"
   | "watching"
   | "interested"
   | "not_interested"
@@ -128,6 +130,8 @@ export type JobStatus =
   | "archived";
 
 export const JOB_STATUSES: JobStatus[] = [
+  "to_review",
+  "reviewed",
   "watching",
   "interested",
   "not_interested",

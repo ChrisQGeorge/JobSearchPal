@@ -86,7 +86,20 @@ export default function DashboardPage() {
       title="Dashboard"
       subtitle={`Welcome back, ${user?.display_name ?? "valued applicant"}. Today promises opportunity, probably.`}
     >
-      <section className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+      <section className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4">
+        <Kpi
+          label="To review"
+          value={metrics.statusCounts.get("to_review") ?? 0}
+          sub={
+            (metrics.statusCounts.get("to_review") ?? 0) > 0
+              ? "Click to triage →"
+              : "Queue is clear"
+          }
+          href="/jobs/review"
+          tone={
+            (metrics.statusCounts.get("to_review") ?? 0) > 0 ? "warn" : undefined
+          }
+        />
         <Kpi
           label="Active applications"
           value={metrics.activeCount}
@@ -287,9 +300,14 @@ function Kpi({
   value: number | string;
   sub?: string;
   href?: string;
-  tone?: "good";
+  tone?: "good" | "warn";
 }) {
-  const toneClass = tone === "good" ? "text-emerald-300" : "text-corp-accent";
+  const toneClass =
+    tone === "good"
+      ? "text-emerald-300"
+      : tone === "warn"
+        ? "text-corp-accent2"
+        : "text-corp-accent";
   const body = (
     <div className="jsp-card p-5 h-full">
       <div className="text-xs text-corp-muted uppercase tracking-wider">{label}</div>

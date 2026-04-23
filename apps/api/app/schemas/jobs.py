@@ -9,6 +9,12 @@ from pydantic import BaseModel, ConfigDict, Field
 # Canonical status vocabulary. Kept loose (string) on the ORM so we can add
 # values without a migration, but validated here.
 JOB_STATUSES = {
+    # Default state for newly-ingested jobs — stays in the Review Queue
+    # until the user clicks "Reviewed" on the detail page (which flips it
+    # to `reviewed`). Both statuses are new vs. earlier versions; existing
+    # rows were persisted with `watching` and still validate fine.
+    "to_review",
+    "reviewed",
     "watching",
     "interested",
     "not_interested",

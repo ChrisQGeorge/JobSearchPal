@@ -68,7 +68,10 @@ class TrackedJob(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     salary_currency: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
     equity_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     priority: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
-    status: Mapped[str] = mapped_column(String(32), nullable=False, default="watching", index=True)
+    # Default `to_review` puts new jobs into the Review Queue. The user
+    # clicks "Reviewed" to move them out (→ `reviewed`) or changes the
+    # status directly. Pre-existing rows are `watching` and still valid.
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="to_review", index=True)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     jd_analysis: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     fit_summary: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)

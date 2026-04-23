@@ -235,7 +235,7 @@ async def create_job(
     user: User = Depends(get_current_user),
 ) -> TrackedJob:
     data = payload.model_dump(exclude_unset=True)
-    data["status"] = _validate_status(data.get("status")) or "watching"
+    data["status"] = _validate_status(data.get("status")) or "to_review"
     data["priority"] = _validate_simple(
         data.get("priority"), PRIORITIES, "priority"
     )
@@ -350,6 +350,8 @@ def _status_to_event_type(status: str) -> str:
         "watching": "note",
         "interested": "note",
         "not_interested": "note",
+        "to_review": "note",
+        "reviewed": "note",
     }.get(status, "note")
 
 
@@ -362,6 +364,60 @@ async def delete_job(
     job = await _get_owned_job(db, job_id, user.id)
     job.deleted_at = datetime.now(tz=timezone.utc)
     await db.commit()
+
+
+class ReviewQueueOut(BaseModel):
+    """Shape for the Review Queue — jobs whose status is still `to_review`.
+    Sorted FIFO by `date_discovered` then `id` so the oldest unreviewed job
+    is first. Every entry is the id, title, and org name — enough for the
+    list view and for the review flow's "Next → " navigation."""
+
+    total: int
+    ids: list[int]
+    items: list[dict]
+
+
+@router.get("/review-queue", response_model=ReviewQueueOut)
+async def review_queue(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ReviewQueueOut:
+    """All jobs that still need reviewing, in FIFO order. Frontend uses this
+    to drive the `/jobs/review` page and to compute the "next job" target
+    when the user clicks "Reviewed" on the detail page."""
+    stmt = (
+        select(TrackedJob)
+        .where(
+            TrackedJob.user_id == user.id,
+            TrackedJob.deleted_at.is_(None),
+            TrackedJob.status == "to_review",
+        )
+        .order_by(
+            TrackedJob.date_discovered.asc().nulls_last(),
+            TrackedJob.id.asc(),
+        )
+    )
+    rows = list((await db.execute(stmt)).scalars().all())
+    # Resolve org names in one shot.
+    org_ids = {r.organization_id for r in rows if r.organization_id}
+    org_names = await _org_names_for(db, org_ids)
+    items = [
+        {
+            "id": r.id,
+            "title": r.title,
+            "organization_id": r.organization_id,
+            "organization_name": org_names.get(r.organization_id) if r.organization_id else None,
+            "location": r.location,
+            "date_discovered": r.date_discovered.isoformat() if r.date_discovered else None,
+            "fit_score": (r.fit_summary or {}).get("score") if isinstance(r.fit_summary, dict) else None,
+        }
+        for r in rows
+    ]
+    return ReviewQueueOut(
+        total=len(rows),
+        ids=[r.id for r in rows],
+        items=items,
+    )
 
 
 # --- ApplicationEvents (activity feed) --------------------------------------
@@ -2041,7 +2097,7 @@ async def import_jobs_from_xlsx(
         for k, v in row.items():
             if v is not None:
                 payload[k] = v
-        payload.setdefault("status", "watching")
+        payload.setdefault("status", "to_review")
         payload.setdefault("date_discovered", date.today())
 
         try:
