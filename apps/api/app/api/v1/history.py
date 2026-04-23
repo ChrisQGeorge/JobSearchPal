@@ -1114,13 +1114,16 @@ async def timeline(
             )
         )
     ).scalars().all()
-    # Term-based dates are rough. We have no start/end_date on Course today;
-    # fall back to the parent Education dates so the timeline still places it.
+    # Prefer the course's own start_date/end_date (added in migration 0008).
+    # Fall back to the parent Education's range only if neither is set, so a
+    # course without explicit dates still renders somewhere sensible.
     ed_dates = {
         e.id: (e.start_date, e.end_date) for e in educations
     }
     for c in course_rows:
-        start, end = ed_dates.get(c.education_id, (None, None))
+        parent_start, parent_end = ed_dates.get(c.education_id, (None, None))
+        start = c.start_date or parent_start
+        end = c.end_date or parent_end
         events.append(
             TimelineEvent(
                 kind="course",
