@@ -6,7 +6,7 @@
 # annotations, FastAPI's `get_type_hints` can't resolve `pydantic_in` as it's
 # a closure variable, so it falls back to "query param" for the body.
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
