@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
@@ -49,6 +50,11 @@ USER_MODELS = [
 def _serialize(v: Any) -> Any:
     if isinstance(v, (datetime, date)):
         return v.isoformat()
+    if isinstance(v, Decimal):
+        # SQLAlchemy Numeric columns come back as Decimal; json won't take
+        # them natively. Export as float for readability — import can
+        # round-trip through SQLAlchemy's Numeric type coercion.
+        return float(v)
     return v
 
 

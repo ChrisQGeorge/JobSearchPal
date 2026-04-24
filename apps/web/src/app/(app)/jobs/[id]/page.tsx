@@ -135,11 +135,22 @@ export default function JobDetailPage({
           : job.location ?? undefined
       }
       actions={
-        <div className="flex gap-2 items-center">
+        <div className="flex gap-2 items-center flex-wrap">
           <ReviewAction
             jobId={job.id}
             status={job.status}
             onStatusChanged={(s) => patch({ status: s })}
+          />
+          <WriteDocButton jobId={job.id} docType="resume" label="Write resume" />
+          <WriteDocButton
+            jobId={job.id}
+            docType="cover_letter"
+            label="Write cover letter"
+          />
+          <ProgressStatusButton
+            status={job.status}
+            disabled={saving}
+            onAdvance={(s) => patch({ status: s })}
           />
           <StatusSelect
             status={job.status}
@@ -236,6 +247,114 @@ function StatusSelect({
  * Counter shows remaining jobs in the review queue (excluding the current
  * one if it's still to_review — the Reviewed click will decrement it).
  */
+// Header shortcut: fire a tailor for resume or cover_letter with the
+// identical call the Documents tab's Write button uses, then drop the
+// user straight into the Studio editor on the placeholder doc. The
+// editor polls the doc until tailoring completes so the user sees the
+// "Generating…" banner flip to the real content without any further
+// clicks.
+function WriteDocButton({
+  jobId,
+  docType,
+  label,
+}: {
+  jobId: number;
+  docType: "resume" | "cover_letter";
+  label: string;
+}) {
+  const router = useRouter();
+  const [running, setRunning] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function run() {
+    setRunning(true);
+    setErr(null);
+    try {
+      const doc = await api.post<GeneratedDocument>(
+        `/api/v1/documents/tailor/${jobId}`,
+        { doc_type: docType },
+      );
+      router.push(`/studio/${doc.id}`);
+    } catch (e) {
+      setErr(
+        e instanceof ApiError
+          ? `HTTP ${e.status}`
+          : "Failed",
+      );
+      setTimeout(() => setErr(null), 5000);
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  return (
+    <button
+      type="button"
+      className="jsp-btn-ghost text-xs"
+      onClick={run}
+      disabled={running}
+      title={`Run the tailor with doc_type=${docType}, then open the draft in Studio`}
+    >
+      {running ? "Queuing…" : err ? `Failed: ${err}` : label}
+    </button>
+  );
+}
+
+// Ordered stage progression per the user's preferred pipeline.
+// Each entry maps current status → next status. Terminal states
+// (not in the map) hide the button.
+const _NEXT_STAGE: Partial<Record<JobStatus, JobStatus>> = {
+  to_review: "reviewed",
+  reviewed: "interested",
+  interested: "applied",
+  applied: "responded",
+  responded: "interviewing",
+  interviewing: "assessment",
+  assessment: "offer",
+  offer: "won",
+};
+
+const _STAGE_LABEL: Partial<Record<JobStatus, string>> = {
+  reviewed: "reviewed",
+  interested: "interested",
+  applied: "applied",
+  responded: "replied",
+  interviewing: "interviewing",
+  assessment: "assessment",
+  offer: "offer",
+  won: "won",
+};
+
+function ProgressStatusButton({
+  status,
+  disabled,
+  onAdvance,
+}: {
+  status: JobStatus;
+  disabled?: boolean;
+  onAdvance: (next: JobStatus) => void;
+}) {
+  const next = _NEXT_STAGE[status];
+  if (!next) {
+    // Terminal status (won / lost / withdrawn / ghosted / archived /
+    // not_interested) — no next stage, hide the button entirely.
+    return null;
+  }
+  const nextLabel = _STAGE_LABEL[next] ?? next;
+  return (
+    <button
+      type="button"
+      className="jsp-btn-primary text-xs"
+      onClick={() => onAdvance(next)}
+      disabled={disabled}
+      title={`Advance status from "${status}" → "${next}"`}
+    >
+      → {nextLabel}
+    </button>
+  );
+}
+
+
 function ReviewAction({
   jobId,
   status,
@@ -2861,6 +2980,7 @@ function AutofillPanel({ jobId }: { jobId: number }) {
     answers: AutofillAnswer[];
     fields_shared: string[];
     warning?: string | null;
+    generated_document_id?: number | null;
   } | null>(null);
 
   async function run() {
@@ -2880,10 +3000,12 @@ function AutofillPanel({ jobId }: { jobId: number }) {
         answers: AutofillAnswer[];
         fields_shared: string[];
         warning?: string | null;
+        generated_document_id?: number | null;
       }>("/api/v1/autofill", {
         tracked_job_id: jobId,
         questions,
         extra_notes: extra.trim() || null,
+        save_as_document: true,
       });
       setOut(res);
     } catch (e) {
@@ -2964,6 +3086,19 @@ function AutofillPanel({ jobId }: { jobId: number }) {
               {out.warning ? (
                 <div className="text-xs text-corp-accent2 bg-corp-accent2/10 border border-corp-accent2/40 p-2 rounded">
                   ⚠ {out.warning}
+                </div>
+              ) : null}
+              {out.generated_document_id ? (
+                <div className="flex items-center justify-between gap-2 bg-corp-surface2 border border-corp-border rounded px-3 py-2 text-xs">
+                  <span className="text-corp-muted">
+                    Saved as a document — open it in Studio to edit, humanize, or export.
+                  </span>
+                  <Link
+                    href={`/studio/${out.generated_document_id}`}
+                    className="jsp-btn-primary text-xs shrink-0"
+                  >
+                    Open in Studio →
+                  </Link>
                 </div>
               ) : null}
               {out.fields_shared.length ? (

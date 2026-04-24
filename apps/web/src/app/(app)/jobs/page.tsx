@@ -31,18 +31,57 @@ import {
   type TrackedJobSummary,
 } from "@/lib/types";
 
+// Terminal / negative statuses hidden from the tracker list by default.
+// Rejection and withdrawal rows are clutter once the user has moved on —
+// they stay in the DB and re-appear when "Show closed/rejected" is on.
+const NEGATIVE_STATUSES: ReadonlySet<JobStatus> = new Set<JobStatus>([
+  "not_interested",
+  "lost",
+  "withdrawn",
+  "ghosted",
+  "archived",
+]);
+
 export default function JobTrackerPage() {
   const [items, setItems] = useState<TrackedJobSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [statusFilter, setStatusFilter] = useState<JobStatus | "">("");
+  const [showNegative, setShowNegative] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    return window.localStorage.getItem("jsp:jobs:show_closed") === "1";
+  });
   const [creating, setCreating] = useState(false);
+
+  function toggleShowNegative(next: boolean) {
+    setShowNegative(next);
+    try {
+      window.localStorage.setItem(
+        "jsp:jobs:show_closed",
+        next ? "1" : "0",
+      );
+    } catch {
+      /* SSR / storage blocked — non-fatal */
+    }
+  }
 
   async function refresh() {
     setLoading(true);
     try {
       const params = new URLSearchParams();
       if (statusFilter) params.set("status", statusFilter);
-      setItems(await api.get<TrackedJobSummary[]>(`/api/v1/jobs?${params.toString()}`));
+      const data = await api.get<TrackedJobSummary[]>(
+        `/api/v1/jobs?${params.toString()}`,
+      );
+      // Hide negative-connotation statuses unless the user has explicitly
+      // filtered to one of them or flipped the "show closed" toggle on.
+      // Filtering client-side so the backend stays simple and the same
+      // shape works for the dashboard too.
+      const visible =
+        showNegative ||
+        (statusFilter && NEGATIVE_STATUSES.has(statusFilter as JobStatus))
+          ? data
+          : data.filter((j) => !NEGATIVE_STATUSES.has(j.status));
+      setItems(visible);
     } finally {
       setLoading(false);
     }
@@ -51,7 +90,7 @@ export default function JobTrackerPage() {
   useEffect(() => {
     refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [statusFilter]);
+  }, [statusFilter, showNegative]);
 
   // Status counts across the full set (unfiltered). Quick-nav to each bucket.
   const [counts, setCounts] = useState<Partial<Record<JobStatus, number>>>({});
@@ -211,11 +250,29 @@ export default function JobTrackerPage() {
         <FetchQueuePanel onJobCreated={refresh} />
       </div>
 
-      <StatusFilterPills
-        current={statusFilter}
-        counts={counts}
-        onChange={setStatusFilter}
-      />
+      <div className="flex items-center gap-3 flex-wrap">
+        <StatusFilterPills
+          current={statusFilter}
+          counts={counts}
+          onChange={setStatusFilter}
+          showNegative={showNegative}
+        />
+        <label
+          className="inline-flex items-center gap-1.5 text-[11px] text-corp-muted cursor-pointer select-none ml-auto"
+          title={
+            "Hidden by default: not_interested, lost, withdrawn, ghosted, " +
+            "archived. They're still in the DB; flip this on to show them."
+          }
+        >
+          <input
+            type="checkbox"
+            className="accent-corp-accent"
+            checked={showNegative}
+            onChange={(e) => toggleShowNegative(e.target.checked)}
+          />
+          Show closed / rejected
+        </label>
+      </div>
 
       {creating ? (
         <div className="jsp-card p-4 mb-4 mt-4">
@@ -320,14 +377,26 @@ function StatusFilterPills({
   current,
   counts,
   onChange,
+  showNegative,
 }: {
   current: JobStatus | "";
   counts: Partial<Record<JobStatus, number>>;
   onChange: (s: JobStatus | "") => void;
+  showNegative: boolean;
 }) {
   const visible = useMemo(
-    () => JOB_STATUSES.filter((s) => (counts[s] ?? 0) > 0 || s === current),
-    [counts, current],
+    () =>
+      JOB_STATUSES.filter((s) => {
+        // Always show a pill if it's the current filter so the user sees
+        // what's active even if counts update or the toggle flips.
+        if (s === current) return true;
+        // Otherwise require at least one matching job AND — for negative
+        // statuses — an explicit opt-in via the "Show closed" toggle.
+        if ((counts[s] ?? 0) === 0) return false;
+        if (!showNegative && NEGATIVE_STATUSES.has(s)) return false;
+        return true;
+      }),
+    [counts, current, showNegative],
   );
 
   return (

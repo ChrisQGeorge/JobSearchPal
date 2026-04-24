@@ -275,6 +275,7 @@ async def list_skills(
         WorkExperienceSkill as _WES,
         CourseSkill as _CS,
         ProjectSkill as _PS,
+        WorkExperience as _WE,
     )
     from app.models.links import EntityLink as _EL
 
@@ -312,6 +313,37 @@ async def list_skills(
             ).group_by(_EL.from_entity_id)
         )).all()
     )
+
+    # Work-history years = sum of (end_date - start_date) for every
+    # WorkExperience linked via work_experience_skills, rounded UP to
+    # the nearest whole year. Ongoing roles (end_date IS NULL) use
+    # today's date. One query pulls the (skill_id, start, end) triples
+    # so we aggregate in Python.
+    import datetime as _dt
+    import math as _math
+
+    work_range_rows = (
+        await db.execute(
+            select(_WES.skill_id, _WE.start_date, _WE.end_date)
+            .join(_WE, _WES.work_experience_id == _WE.id)
+            .where(
+                _WES.skill_id.in_(ids),
+                _WE.user_id == user.id,
+                _WE.deleted_at.is_(None),
+            )
+        )
+    ).all()
+    today = _dt.date.today()
+    days_by_skill: dict[int, int] = {}
+    for skill_id, start_date, end_date in work_range_rows:
+        if start_date is None:
+            continue
+        end = end_date or today
+        delta = (end - start_date).days
+        if delta <= 0:
+            continue
+        days_by_skill[skill_id] = days_by_skill.get(skill_id, 0) + delta
+
     out: list[SkillOut] = []
     for r in rows:
         count = (
@@ -323,8 +355,188 @@ async def list_skills(
         )
         row = SkillOut.model_validate(r)
         row.attachment_count = int(count)
+        total_days = days_by_skill.get(r.id)
+        row.work_history_years = (
+            int(_math.ceil(total_days / 365.25)) if total_days else None
+        )
         out.append(row)
     return out
+
+
+class MissingSkillOut(BaseModel):
+    """One entry per distinct skill-name mentioned across the user's tracked
+    jobs' required/nice-to-have lists that is NOT already in their catalog
+    (neither as a Skill.name nor as one of its aliases). Case-insensitive
+    match."""
+
+    name: str
+    job_count: int
+    tier_counts: dict[str, int]  # {"required": N, "nice_to_have": M}
+    job_ids: list[int]  # small sample (first 10) for UI linking
+
+
+@router.get("/skills/missing-from-jobs", response_model=list[MissingSkillOut])
+async def skills_missing_from_jobs(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[MissingSkillOut]:
+    """Scan every TrackedJob's `required_skills` + `nice_to_have_skills` and
+    return skill names that DON'T appear in the user's Skills catalog (by
+    name or alias). Sorted by job count descending so the user can tell
+    which skills are in highest demand relative to their resume.
+
+    Client renders this as a collapsible "missing from tracked jobs"
+    section at the top of the Skills catalog page."""
+    from app.models.jobs import TrackedJob as _TJ
+
+    # Build the set of known catalog identifiers (lowercased).
+    skills = (
+        await db.execute(
+            select(Skill).where(
+                Skill.user_id == user.id,
+                Skill.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    known: set[str] = set()
+    for s in skills:
+        known.add(s.name.lower().strip())
+        for a in s.aliases or []:
+            if a and a.strip():
+                known.add(str(a).lower().strip())
+
+    # Pull tracked jobs' JD skill lists.
+    tj_rows = (
+        await db.execute(
+            select(
+                _TJ.id,
+                _TJ.required_skills,
+                _TJ.nice_to_have_skills,
+            ).where(
+                _TJ.user_id == user.id,
+                _TJ.deleted_at.is_(None),
+            )
+        )
+    ).all()
+
+    # Aggregate. Key is the lowercased name so "React" and "react" collapse;
+    # we keep the most common-cased version as the display name.
+    class _Agg:
+        __slots__ = ("display", "job_ids", "req", "nice", "case_votes")
+
+        def __init__(self, display: str) -> None:
+            self.display = display
+            self.job_ids: list[int] = []
+            self.req = 0
+            self.nice = 0
+            self.case_votes: dict[str, int] = {display: 1}
+
+    agg: dict[str, _Agg] = {}
+    for job_id, req_list, nice_list in tj_rows:
+        req_set = {
+            str(x).strip()
+            for x in (req_list or [])
+            if x and str(x).strip()
+        }
+        nice_set = {
+            str(x).strip()
+            for x in (nice_list or [])
+            if x and str(x).strip()
+        }
+        for raw in req_set | nice_set:
+            key = raw.lower()
+            if key in known:
+                continue
+            entry = agg.get(key)
+            if entry is None:
+                entry = _Agg(raw)
+                agg[key] = entry
+            else:
+                entry.case_votes[raw] = entry.case_votes.get(raw, 0) + 1
+                # Pick the best-voted display casing.
+                entry.display = max(
+                    entry.case_votes.items(), key=lambda kv: (kv[1], kv[0])
+                )[0]
+            if job_id not in entry.job_ids:
+                entry.job_ids.append(job_id)
+            if raw in req_set:
+                entry.req += 1
+            if raw in nice_set:
+                entry.nice += 1
+
+    out = [
+        MissingSkillOut(
+            name=e.display,
+            job_count=len(e.job_ids),
+            tier_counts={"required": e.req, "nice_to_have": e.nice},
+            job_ids=e.job_ids[:10],
+        )
+        for e in agg.values()
+    ]
+    out.sort(key=lambda m: (-m.job_count, m.name.lower()))
+    return out
+
+
+class BulkUpdateSkillsIn(BaseModel):
+    """Apply the same field values to every skill in `ids`. Any field left
+    unset is ignored (the row's existing value stays). To explicitly clear
+    a field (set to NULL) include it in `clear_fields`."""
+
+    ids: list[int] = Field(min_length=1)
+    category: Optional[str] = None
+    proficiency: Optional[str] = None
+    years_experience: Optional[float] = None
+    last_used_date: Optional[date] = None
+    evidence_notes: Optional[str] = None
+    clear_fields: list[str] = Field(default_factory=list)
+
+
+@router.post("/skills/bulk-update", response_model=dict)
+async def bulk_update_skills(
+    payload: BulkUpdateSkillsIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Apply the same field values to multiple catalog skills at once.
+    Used by the Skills panel's bulk-edit action when the user has selected
+    several rows and wants to stamp them all with e.g. proficiency=expert."""
+    _ALLOWED_CLEAR = {
+        "category", "proficiency", "years_experience",
+        "last_used_date", "evidence_notes",
+    }
+
+    rows = (
+        await db.execute(
+            select(Skill).where(
+                Skill.user_id == user.id,
+                Skill.id.in_(payload.ids),
+                Skill.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    if not rows:
+        return {"updated": 0, "skipped": len(payload.ids)}
+
+    # Only write fields the caller explicitly set (exclude_unset).
+    explicit_updates = payload.model_dump(
+        exclude_unset=True, exclude={"ids", "clear_fields"}
+    )
+    clears = {f for f in payload.clear_fields if f in _ALLOWED_CLEAR}
+
+    for s in rows:
+        for field, value in explicit_updates.items():
+            if field in clears:
+                # Clear takes precedence if the field is in both lists.
+                continue
+            setattr(s, field, value)
+        for field in clears:
+            setattr(s, field, None)
+
+    await db.commit()
+    return {
+        "updated": len(rows),
+        "skipped": len(payload.ids) - len(rows),
+    }
 
 
 @router.get("/skills/{skill_id:int}/attachments")
@@ -364,7 +576,15 @@ async def skill_attachments(
                     _WES.usage_notes,
                 ).join(_WES, _WES.work_experience_id == _WE.id)
                 .where(_WES.skill_id == skill_id, _WE.user_id == user.id)
-                .order_by(_WE.end_date.desc().nulls_first())
+                # MySQL-portable "nulls first on desc": explicit IS NULL
+                # sort key first — `col IS NULL` evaluates to 1 for null
+                # (sorts before 0 descending), then within each group by
+                # the actual date descending. Rows with no end_date (still
+                # ongoing) sit at the top.
+                .order_by(
+                    _WE.end_date.is_(None).desc(),
+                    _WE.end_date.desc(),
+                )
             )
         ).all()
     )
@@ -387,7 +607,10 @@ async def skill_attachments(
                 ).join(_CS, _CS.course_id == _Course.id)
                 .join(_Education, _Education.id == _Course.education_id)
                 .where(_CS.skill_id == skill_id, _Education.user_id == user.id)
-                .order_by(_Course.end_date.desc().nulls_first())
+                .order_by(
+                    _Course.end_date.is_(None).desc(),
+                    _Course.end_date.desc(),
+                )
             )
         ).all()
     )
@@ -417,7 +640,10 @@ async def skill_attachments(
                     _PS.usage_notes,
                 ).join(_PS, _PS.project_id == _Project.id)
                 .where(_PS.skill_id == skill_id, _Project.user_id == user.id)
-                .order_by(_Project.end_date.desc().nulls_first())
+                .order_by(
+                    _Project.end_date.is_(None).desc(),
+                    _Project.end_date.desc(),
+                )
             )
         ).all()
     )

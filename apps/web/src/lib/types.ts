@@ -97,6 +97,11 @@ export type Skill = {
   evidence_notes?: string | null;
   aliases?: string[] | null;
   attachment_count?: number | null;
+  // Server-computed: sum of durations of every Work row this skill is
+  // attached to, rounded up to the nearest whole year. Ongoing roles
+  // run to today. Null when the skill isn't attached to any Work or
+  // when the attached Work rows have no usable start_date.
+  work_history_years?: number | null;
 };
 
 export type Achievement = {

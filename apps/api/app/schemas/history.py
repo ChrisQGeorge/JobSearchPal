@@ -66,6 +66,12 @@ class SkillOut(SkillIn):
     # to across work_experience_skills + course_skills + entity_links. Zero
     # means the skill is orphaned.
     attachment_count: int = 0
+    # Sum of WorkExperience durations for every job this skill is attached
+    # to, rounded UP to the nearest whole year. Ongoing roles (no end_date)
+    # run to today. Overlapping jobs count once per job (additive — two
+    # concurrent roles each using Python contribute their full lengths).
+    # None means no Work attachments or nothing with dates to measure.
+    work_history_years: Optional[int] = None
 
 
 class AchievementIn(BaseModel):

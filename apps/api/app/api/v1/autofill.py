@@ -76,6 +76,11 @@ class AutofillIn(BaseModel):
     questions: list[str] = Field(min_length=1, max_length=80)
     tracked_job_id: Optional[int] = None
     extra_notes: Optional[str] = None
+    # When True (default), the answers are also saved as a GeneratedDocument
+    # (doc_type="other") so the user can edit, humanize, or diff them in
+    # the Document Studio. The AutofillLog row is still written either way
+    # so demographic-field sharing remains audit-able.
+    save_as_document: bool = True
 
 
 class AutofillAnswer(BaseModel):
@@ -89,6 +94,10 @@ class AutofillOut(BaseModel):
     answers: list[AutofillAnswer]
     fields_shared: list[str]
     warning: Optional[str] = None
+    # Populated when `save_as_document=True` (the default). The frontend
+    # uses this to offer "Open in Studio" / "Humanize" actions on the
+    # autofill output without having to round-trip through the tracker.
+    generated_document_id: Optional[int] = None
 
 
 _AUTOFILL_PROMPT = """You're filling out an application form for a job-seeker.
@@ -262,6 +271,25 @@ async def autofill(
 
     # Prepare prompt inputs. Note: Demographics is intentionally OMITTED from
     # the prompt — the LLM must use placeholders for demographic questions.
+    #
+    # SQLAlchemy returns Numeric columns as `decimal.Decimal`, which json
+    # refuses to serialize by default. Route any non-native types through
+    # a default-fallback so salary fields / float-ish fields stringify
+    # cleanly in the prompt.
+    from decimal import Decimal as _Decimal
+
+    def _json_default(v: Any) -> Any:
+        if isinstance(v, _Decimal):
+            # Floats are fine here — this is prompt context, not a
+            # financial calculation, and the LLM reads "85000.00" the
+            # same as "85000.0".
+            return float(v)
+        if hasattr(v, "isoformat"):
+            return v.isoformat()
+        if isinstance(v, (set, frozenset)):
+            return sorted(v)
+        return str(v)
+
     def _safe_dump(model: Any, exclude: set[str] | None = None) -> str:
         if model is None:
             return "(none)"
@@ -275,7 +303,9 @@ async def autofill(
             if hasattr(v, "isoformat"):
                 v = v.isoformat()
             out[c.name] = v
-        return json.dumps(out, indent=2) if out else "(empty)"
+        return (
+            json.dumps(out, indent=2, default=_json_default) if out else "(empty)"
+        )
 
     prefs_str = _safe_dump(prefs, exclude={"id", "user_id", "created_at", "updated_at", "deleted_at"})
     # Strip visa dates from auth dump so LLM uses placeholders.
@@ -381,8 +411,63 @@ async def autofill(
         await db.commit()
 
     ordered = [resolved[i] for i in sorted(resolved.keys())]
+
+    # Optionally save the answers as a GeneratedDocument so the user can
+    # edit / humanize / print them in the Studio. Written as Q/A markdown
+    # that the studio's preview + tailor-flow already handle gracefully.
+    generated_document_id: Optional[int] = None
+    if payload.save_as_document and ordered:
+        from app.models.documents import GeneratedDocument as _GD
+
+        lines: list[str] = []
+        job_title = job.title if job else None
+        heading = "# Application answers"
+        if job_title:
+            heading += f" — {job_title}"
+        lines.append(heading)
+        lines.append("")
+        for i, a in enumerate(ordered, 1):
+            lines.append(f"## Q{i}. {a.question.strip()}")
+            lines.append("")
+            if a.answer:
+                lines.append(a.answer.strip())
+            elif a.skipped_reason:
+                lines.append(f"_(skipped: {a.skipped_reason})_")
+            else:
+                lines.append("_(no answer)_")
+            lines.append("")
+        content_md = "\n".join(lines).strip() + "\n"
+
+        title = (
+            f"Autofill answers — {job_title}" if job_title else "Autofill answers"
+        )
+        structured = {
+            # Mirror the tailor/humanize shape so the studio's status
+            # handling treats this as a finished doc.
+            "status": "ready",
+            "autofill_fields_shared": sorted(fields_shared),
+            "autofill_question_count": len(ordered),
+            "warning": data.get("warning"),
+        }
+        doc = _GD(
+            user_id=user.id,
+            tracked_job_id=payload.tracked_job_id,
+            doc_type="other",
+            title=title[:255],
+            content_md=content_md,
+            content_structured=structured,
+            version=1,
+            humanized=False,
+            source_skill="autofill",
+        )
+        db.add(doc)
+        await db.commit()
+        await db.refresh(doc)
+        generated_document_id = doc.id
+
     return AutofillOut(
         answers=ordered,
         fields_shared=sorted(fields_shared),
         warning=data.get("warning"),
+        generated_document_id=generated_document_id,
     )

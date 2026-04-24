@@ -916,6 +916,51 @@ async def _build_candidate_profile_block(
     ).scalars().all()
     skill_by_id = {s.id: s for s in skills_rows}
 
+    # Pre-compute work-history-years per skill so the Companion can cite it
+    # when writing bullets ("6 yrs Python" — derived from actual Work
+    # durations, not a field the user manually typed). Matches the same
+    # algorithm the skills catalog UI uses: sum of WorkExperience
+    # durations, round up to the nearest whole year, ongoing roles run to
+    # today.
+    import datetime as _dt_s
+    import math as _math_s
+
+    if skills_rows:
+        skill_ids_for_wh = [s.id for s in skills_rows]
+        wh_rows = (
+            await db.execute(
+                select(
+                    WorkExperienceSkill.skill_id,
+                    WorkExperience.start_date,
+                    WorkExperience.end_date,
+                )
+                .join(
+                    WorkExperience,
+                    WorkExperienceSkill.work_experience_id == WorkExperience.id,
+                )
+                .where(
+                    WorkExperienceSkill.skill_id.in_(skill_ids_for_wh),
+                    WorkExperience.user_id == user.id,
+                    WorkExperience.deleted_at.is_(None),
+                )
+            )
+        ).all()
+        today_wh = _dt_s.date.today()
+        days_by_skill: dict[int, int] = {}
+        for sid, sd, ed in wh_rows:
+            if sd is None:
+                continue
+            end = ed or today_wh
+            delta = (end - sd).days
+            if delta > 0:
+                days_by_skill[sid] = days_by_skill.get(sid, 0) + delta
+        work_years_by_skill: dict[int, int] = {
+            sid: int(_math_s.ceil(days / 365.25))
+            for sid, days in days_by_skill.items()
+        }
+    else:
+        work_years_by_skill = {}
+
     if skills_rows:
         by_cat: dict[str, list[Skill]] = {}
         for s in skills_rows:
@@ -926,6 +971,13 @@ async def _build_candidate_profile_block(
             "(Every skill the user has on file. Only include the ones actually "
             "relevant to this JD in the final resume — this list is your source of truth.)"
         )
+        out.append(
+            "(For each skill, `work history: N yrs` = cumulative duration of "
+            "every Work role tagged with this skill, rounded up. Prefer this "
+            "number to the self-reported `yrs` field on resume bullets when "
+            "both are present — it's derived from actual job tenure and is "
+            "defensible in an interview.)"
+        )
         for cat in sorted(by_cat.keys()):
             out.append(f"### {cat}")
             for s in sorted(by_cat[cat], key=lambda x: x.name.lower()):
@@ -933,7 +985,10 @@ async def _build_candidate_profile_block(
                 if s.proficiency:
                     bits.append(f"proficiency: {s.proficiency}")
                 if s.years_experience is not None:
-                    bits.append(f"{float(s.years_experience):g} yrs")
+                    bits.append(f"self-reported: {float(s.years_experience):g} yrs")
+                wh_years = work_years_by_skill.get(s.id)
+                if wh_years:
+                    bits.append(f"work history: {wh_years} yr{'' if wh_years == 1 else 's'}")
                 last = _fmt_date(s.last_used_date)
                 if last:
                     bits.append(f"last used {last}")

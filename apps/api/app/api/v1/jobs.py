@@ -392,8 +392,12 @@ async def review_queue(
             TrackedJob.deleted_at.is_(None),
             TrackedJob.status == "to_review",
         )
+        # MySQL has no NULLS LAST / NULLS FIRST syntax. `col.is_(None)`
+        # compiles to `col IS NULL`, which evaluates to 0/1 at sort time;
+        # putting it first with ASC pushes nulls to the bottom portably.
         .order_by(
-            TrackedJob.date_discovered.asc().nulls_last(),
+            TrackedJob.date_discovered.is_(None),
+            TrackedJob.date_discovered.asc(),
             TrackedJob.id.asc(),
         )
     )
