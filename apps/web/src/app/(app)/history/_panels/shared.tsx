@@ -51,6 +51,16 @@ export type FieldDef<T> =
       required?: boolean;
       fullWidth?: boolean;
       placeholder?: string;
+    }
+  | {
+      // Boolean checkbox. Label sits next to the box; optional helpText
+      // appears under it in small muted type for fields where the
+      // implication isn't obvious from the label alone.
+      key: keyof T;
+      label: string;
+      kind: "boolean";
+      helpText?: string;
+      fullWidth?: boolean;
     };
 
 type GenericEntity = { id: number; [key: string]: unknown };
@@ -281,10 +291,15 @@ function EntityForm<T extends GenericEntity>({
           const wrapClass = fullWidth ? "col-span-2" : "";
           return (
             <div key={k} className={wrapClass}>
-              <label className="jsp-label">
-                {f.label}
-                {f.required ? " *" : ""}
-              </label>
+              {/* Boolean fields render their label inline next to the
+                  checkbox; suppress the top-of-field label so we don't
+                  show it twice. */}
+              {f.kind === "boolean" ? null : (
+                <label className="jsp-label">
+                  {f.label}
+                  {f.required ? " *" : ""}
+                </label>
+              )}
               {f.kind === "org" ? (
                 <OrganizationCombobox
                   value={
@@ -295,6 +310,25 @@ function EntityForm<T extends GenericEntity>({
                   placeholder={f.placeholder ?? "Search or create organization…"}
                   required={f.required}
                 />
+              ) : f.kind === "boolean" ? (
+                <div>
+                  <label className="inline-flex items-center gap-2 text-sm cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      className="accent-corp-accent"
+                      checked={!!state[k]}
+                      onChange={(e) =>
+                        setState({ ...state, [k]: e.target.checked })
+                      }
+                    />
+                    {f.label}
+                  </label>
+                  {f.helpText ? (
+                    <p className="text-[11px] text-corp-muted mt-0.5">
+                      {f.helpText}
+                    </p>
+                  ) : null}
+                </div>
               ) : f.kind === "textarea" ? (
                 <textarea
                   className="jsp-input min-h-[80px]"

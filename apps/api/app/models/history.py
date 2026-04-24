@@ -210,6 +210,14 @@ class Project(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     highlights: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     technologies_used: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     visibility: Mapped[str] = mapped_column(String(32), nullable=False, default="private")
+    # When True, this project's duration gets added to each attached skill's
+    # `work_history_years` total alongside formal Work rows. Off by default
+    # so existing rows don't silently inflate skill totals; the user flips
+    # it on per-project for open-source contributions, freelance gigs, and
+    # other non-W-2 experience that should still count toward tenure claims.
+    include_as_work_history: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
 
 
 class Publication(Base, IdMixin, TimestampMixin, SoftDeleteMixin):

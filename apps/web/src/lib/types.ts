@@ -548,6 +548,9 @@ export type Project = {
   highlights?: string[] | null;
   technologies_used?: string[] | null;
   visibility: string;
+  // When true, the project's duration is added to each attached skill's
+  // `work_history_years` total alongside formal Work rows. Off by default.
+  include_as_work_history?: boolean;
 };
 
 export type Publication = {

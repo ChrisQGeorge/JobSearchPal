@@ -276,6 +276,7 @@ async def list_skills(
         CourseSkill as _CS,
         ProjectSkill as _PS,
         WorkExperience as _WE,
+        Project as _P,
     )
     from app.models.links import EntityLink as _EL
 
@@ -333,12 +334,41 @@ async def list_skills(
             )
         )
     ).all()
+    # Projects opted in via `include_as_work_history` add to the same total.
+    # For ongoing projects (is_ongoing=True with no end_date), we use today.
+    project_range_rows = (
+        await db.execute(
+            select(
+                _PS.skill_id,
+                _P.start_date,
+                _P.end_date,
+                _P.is_ongoing,
+            )
+            .join(_P, _PS.project_id == _P.id)
+            .where(
+                _PS.skill_id.in_(ids),
+                _P.user_id == user.id,
+                _P.deleted_at.is_(None),
+                _P.include_as_work_history.is_(True),
+            )
+        )
+    ).all()
     today = _dt.date.today()
     days_by_skill: dict[int, int] = {}
     for skill_id, start_date, end_date in work_range_rows:
         if start_date is None:
             continue
         end = end_date or today
+        delta = (end - start_date).days
+        if delta <= 0:
+            continue
+        days_by_skill[skill_id] = days_by_skill.get(skill_id, 0) + delta
+    for skill_id, start_date, end_date, is_ongoing in project_range_rows:
+        if start_date is None:
+            continue
+        end = end_date or (today if is_ongoing else None)
+        if end is None:
+            continue
         delta = (end - start_date).days
         if delta <= 0:
             continue

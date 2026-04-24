@@ -151,6 +151,14 @@ export default function HistoryEditorPage() {
             { key: "repo_url", label: "Repo URL", kind: "url" },
             { key: "start_date", label: "Start date", kind: "date" },
             { key: "end_date", label: "End date", kind: "date" },
+            {
+              key: "include_as_work_history",
+              label: "Count toward skill work history",
+              kind: "boolean",
+              fullWidth: true,
+              helpText:
+                "When on, this project's start→end duration counts toward the \"work history\" total on every attached skill. Use for open-source, freelance, or side-project tenure you'd defend in an interview.",
+            },
             { key: "summary", label: "Summary", kind: "textarea", fullWidth: true },
             {
               key: "technologies_used",

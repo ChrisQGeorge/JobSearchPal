@@ -170,6 +170,11 @@ class ProjectIn(BaseModel):
     highlights: Optional[list[str]] = None
     technologies_used: Optional[list[str]] = None
     visibility: str = "private"
+    # User-opted-in: when True, the project's start→end duration is added
+    # to each attached skill's work_history_years total alongside Work
+    # rows. Open-source work, freelance gigs, side projects that should
+    # count toward "I've used Python for N years" claims.
+    include_as_work_history: bool = False
 
 
 class ProjectOut(ProjectIn):

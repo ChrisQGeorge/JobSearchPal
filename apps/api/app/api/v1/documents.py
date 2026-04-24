@@ -926,6 +926,8 @@ async def _build_candidate_profile_block(
     import math as _math_s
 
     if skills_rows:
+        from app.models.history import ProjectSkill as _PS_doc, Project as _P_doc
+
         skill_ids_for_wh = [s.id for s in skills_rows]
         wh_rows = (
             await db.execute(
@@ -945,12 +947,38 @@ async def _build_candidate_profile_block(
                 )
             )
         ).all()
+        project_wh_rows = (
+            await db.execute(
+                select(
+                    _PS_doc.skill_id,
+                    _P_doc.start_date,
+                    _P_doc.end_date,
+                    _P_doc.is_ongoing,
+                )
+                .join(_P_doc, _PS_doc.project_id == _P_doc.id)
+                .where(
+                    _PS_doc.skill_id.in_(skill_ids_for_wh),
+                    _P_doc.user_id == user.id,
+                    _P_doc.deleted_at.is_(None),
+                    _P_doc.include_as_work_history.is_(True),
+                )
+            )
+        ).all()
         today_wh = _dt_s.date.today()
         days_by_skill: dict[int, int] = {}
         for sid, sd, ed in wh_rows:
             if sd is None:
                 continue
             end = ed or today_wh
+            delta = (end - sd).days
+            if delta > 0:
+                days_by_skill[sid] = days_by_skill.get(sid, 0) + delta
+        for sid, sd, ed, ongoing in project_wh_rows:
+            if sd is None:
+                continue
+            end = ed or (today_wh if ongoing else None)
+            if end is None:
+                continue
             delta = (end - sd).days
             if delta > 0:
                 days_by_skill[sid] = days_by_skill.get(sid, 0) + delta
