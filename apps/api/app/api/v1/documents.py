@@ -1540,116 +1540,31 @@ async def _run_tailor(
     await db.commit()
     await db.refresh(doc)
 
-    # Kick off the long-running Claude call outside the request scope. We use
-    # asyncio.create_task so the request returns immediately; the task owns
-    # its own DB session via SessionLocal.
-    asyncio.create_task(
-        _finish_tailor_in_background(
-            doc_id=doc.id,
-            prompt=prompt,
-            doc_type=doc_type,
-            title_override=title_override,
-            job_title=job.title or "job",
-            api_token=api_token,
-        ),
-        name=f"tailor-{doc_type}-{doc.id}",
+    # Enqueue through the shared task queue so tailor runs drain serially
+    # alongside fetch + score. The row appears on the Companion Activity
+    # page as `queued` immediately, flips to `processing` when the worker
+    # picks it up, and respects the same rate-limit cooldowns as every
+    # other Claude-backed task.
+    from app.models.jobs import JobFetchQueue
+
+    label = f"{doc_type.replace('_', ' ').title()}: {job.title or 'job'}"
+    task = JobFetchQueue(
+        user_id=user.id,
+        kind="tailor",
+        label=label[:512],
+        url="",
+        payload={
+            "generated_document_id": doc.id,
+            "prompt": prompt,
+            "doc_type": doc_type,
+            "title_override": title_override,
+            "job_title": job.title or "job",
+        },
+        state="queued",
     )
+    db.add(task)
+    await db.commit()
     return doc
-
-
-async def _finish_tailor_in_background(
-    *,
-    doc_id: int,
-    prompt: str,
-    doc_type: str,
-    title_override: Optional[str],
-    job_title: str,
-    api_token: str,
-) -> None:
-    """Run Claude in the background, then update the placeholder doc row with
-    the result. Runs with its own DB session because the request scope is gone.
-    Streams live events onto the queue_bus so /queue can narrate progress."""
-    from app.skills.queue_bus import run_claude_to_bus
-
-    label = f"{doc_type.replace('_', ' ').title()}: {job_title}"
-    try:
-        final_text = await run_claude_to_bus(
-            prompt=prompt,
-            source=f"tailor_{doc_type}",
-            item_id=f"doc:{doc_id}",
-            label=label,
-            allowed_tools=["Bash"],
-            timeout_seconds=600,
-            extra_env={
-                "JSP_API_BASE_URL": "http://localhost:8000",
-                "JSP_API_TOKEN": api_token,
-            },
-        )
-    except ClaudeCodeError as exc:
-        log.warning("Tailor %s failed (doc %s): %s", doc_type, doc_id, exc)
-        await _mark_tailor_error(doc_id, f"Claude Code error: {exc}")
-        return
-    except Exception as exc:  # defensive — task must not crash silently
-        log.exception("Tailor %s crashed (doc %s)", doc_type, doc_id)
-        await _mark_tailor_error(doc_id, f"Unexpected error: {exc}")
-        return
-
-    data = _extract_json_object(final_text) or {}
-    content_md = (data.get("content_md") or "").strip()
-    if not content_md:
-        await _mark_tailor_error(
-            doc_id, "Tailoring returned no content. Check Companion logs."
-        )
-        return
-
-    title = (
-        title_override
-        or data.get("title")
-        or f"{doc_type.replace('_', ' ').title()} – {job_title}"
-    )
-
-    async with SessionLocal() as db:
-        doc = (
-            await db.execute(
-                select(GeneratedDocument).where(GeneratedDocument.id == doc_id)
-            )
-        ).scalar_one_or_none()
-        if doc is None:
-            log.warning("Tailor background: doc %s vanished before save", doc_id)
-            return
-        doc.content_md = content_md
-        doc.title = title[:255]
-        doc.content_structured = {
-            "status": "ready",
-            "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "notes": data.get("notes"),
-            "warning": data.get("warning"),
-            "error": None,
-        }
-        await db.commit()
-
-
-async def _mark_tailor_error(doc_id: int, message: str) -> None:
-    """Update the placeholder doc row with an error status so the UI can show it."""
-    try:
-        async with SessionLocal() as db:
-            doc = (
-                await db.execute(
-                    select(GeneratedDocument).where(GeneratedDocument.id == doc_id)
-                )
-            ).scalar_one_or_none()
-            if doc is None:
-                return
-            doc.content_structured = {
-                "status": "error",
-                "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                "notes": None,
-                "warning": None,
-                "error": message,
-            }
-            await db.commit()
-    except Exception:
-        log.exception("Failed to record tailor error for doc %s", doc_id)
 
 
 @router.post(
@@ -2878,175 +2793,29 @@ async def humanize_document(
     await db.commit()
     await db.refresh(humanized_doc)
 
-    asyncio.create_task(
-        _finish_humanize_in_background(
-            doc_id=humanized_doc.id,
-            prompt=prompt,
-            source_doc_id=source.id,
-            source_title=source.title,
-            # Pass the raw (unescaped) source so the validator can tell
-            # which banned phrases were already in the source document
-            # (and shouldn't be flagged as Claude-introduced).
-            source_body=source.content_md or "",
-            plant_mistakes=payload.plant_mistakes,
-        ),
-        name=f"humanize-{humanized_doc.id}",
+    # Enqueue through the shared task queue so humanize runs drain serially
+    # alongside fetch / score / tailor. `source_body` is the raw (unescaped)
+    # source — the banned-phrase validator uses it to tell Claude-introduced
+    # tells apart from tells the user's document already had.
+    from app.models.jobs import JobFetchQueue
+
+    task = JobFetchQueue(
+        user_id=user.id,
+        kind="humanize",
+        label=f"Humanize: {source.title}"[:512],
+        url="",
+        payload={
+            "generated_document_id": humanized_doc.id,
+            "prompt": prompt,
+            "source_doc_id": source.id,
+            "source_title": source.title,
+            "source_body": source.content_md or "",
+            "plant_mistakes": payload.plant_mistakes,
+        },
+        state="queued",
     )
+    db.add(task)
+    await db.commit()
     return humanized_doc
 
 
-async def _finish_humanize_in_background(
-    *,
-    doc_id: int,
-    prompt: str,
-    source_doc_id: int,
-    source_title: str,
-    source_body: str = "",
-    plant_mistakes: bool = True,
-) -> None:
-    """Run the humanizer in the background, then validate the output against
-    the banned-phrase list + em-dash rule. If violations are found, issue
-    a fix-it pass (up to `_MAX_HUMANIZE_FIX_PASSES` retries) telling Claude
-    exactly which tokens to rewrite. Uncaught residual violations end up
-    as `warning` text on the saved doc so the user can inspect."""
-    from app.skills.queue_bus import run_claude_to_bus
-
-    _MAX_HUMANIZE_FIX_PASSES = 2
-
-    try:
-        final_text = await run_claude_to_bus(
-            prompt=prompt,
-            source="humanize",
-            item_id=f"doc:{doc_id}",
-            label=f"Humanize: {source_title}",
-            allowed_tools=[],
-            timeout_seconds=600,
-        )
-    except ClaudeCodeError as exc:
-        log.warning("Humanize failed (doc %s): %s", doc_id, exc)
-        await _mark_tailor_error(doc_id, f"Claude Code error: {exc}")
-        return
-    except Exception as exc:
-        log.exception("Humanize crashed (doc %s)", doc_id)
-        await _mark_tailor_error(doc_id, f"Unexpected error: {exc}")
-        return
-
-    data = _extract_json_object(final_text) or {}
-    content_md = (data.get("content_md") or "").strip()
-    if not content_md:
-        await _mark_tailor_error(doc_id, "Humanizer returned no content.")
-        return
-
-    # --- Enforce the banned-phrase + em-dash rules via retry passes -------
-    fix_notes: list[str] = []
-    for pass_idx in range(_MAX_HUMANIZE_FIX_PASSES):
-        violations = _validate_humanizer_output(content_md, source_body=source_body)
-        if not violations:
-            break
-        log.info(
-            "Humanize doc %s fix-pass %d: %d violation(s): %s",
-            doc_id, pass_idx + 1, len(violations), violations,
-        )
-        violations_block = "\n".join(f"- {v}" for v in violations)
-        fix_prompt = _HUMANIZE_FIX_PROMPT.format(
-            violations=violations_block,
-            previous_output=content_md.replace("{", "{{").replace("}", "}}"),
-            source_body=source_body.replace("{", "{{").replace("}", "}}"),
-            imperfections_directive=(
-                _FIX_PRESERVE_IMPERFECTIONS
-                if plant_mistakes
-                else _FIX_NO_IMPERFECTIONS
-            ),
-        )
-        try:
-            fix_text = await run_claude_to_bus(
-                prompt=fix_prompt,
-                source="humanize",
-                item_id=f"doc:{doc_id}",
-                label=f"Humanize fix-pass {pass_idx + 1}: {source_title}",
-                allowed_tools=[],
-                timeout_seconds=600,
-            )
-        except Exception as exc:  # pragma: no cover
-            log.warning(
-                "Humanize fix-pass %d failed (doc %s): %s — keeping prior output",
-                pass_idx + 1, doc_id, exc,
-            )
-            break
-        fix_data = _extract_json_object(fix_text) or {}
-        new_md = (fix_data.get("content_md") or "").strip()
-        if not new_md:
-            break
-        content_md = new_md
-        data = fix_data  # so `notes`/`warning` below come from the fix-pass
-        fix_notes.append(
-            f"Pass {pass_idx + 1} fixed: {', '.join(violations[:4])}"
-            + ("…" if len(violations) > 4 else "")
-        )
-    # Final check — if anything still slipped through we leave it but stamp
-    # a warning the studio surfaces in the content_structured meta.
-    residual_violations = _validate_humanizer_output(
-        content_md, source_body=source_body
-    )
-
-    # Merge any validator hits into the saved warning so the studio UI
-    # surfaces them. If the fix-pass cleaned everything, we still keep a
-    # short "notes" breadcrumb so the user knows a fix-up happened.
-    claude_warning = data.get("warning")
-    warning_parts: list[str] = []
-    if claude_warning:
-        warning_parts.append(str(claude_warning))
-    if residual_violations:
-        warning_parts.append(
-            "After retries, these AI-tell patterns still slipped through — "
-            "consider a manual pass:\n  - "
-            + "\n  - ".join(residual_violations)
-        )
-    final_warning = "\n\n".join(warning_parts) if warning_parts else None
-
-    claude_notes = data.get("notes")
-    notes_parts: list[str] = []
-    if claude_notes:
-        notes_parts.append(str(claude_notes))
-    if fix_notes:
-        notes_parts.append("Fix-pass summary: " + " | ".join(fix_notes))
-    final_notes = " · ".join(notes_parts) if notes_parts else None
-
-    # Normalize intentional_mistakes into a list of {description, excerpt}
-    # dicts, dropping anything malformed. The studio renders this as an
-    # audit checklist so the user can keep-or-delete each planted quirk.
-    raw_mistakes = data.get("intentional_mistakes") or []
-    intentional_mistakes: list[dict] = []
-    if isinstance(raw_mistakes, list):
-        for m in raw_mistakes:
-            if not isinstance(m, dict):
-                continue
-            desc = str(m.get("description") or "").strip()
-            excerpt = str(m.get("excerpt") or "").strip()
-            if not desc:
-                continue
-            intentional_mistakes.append(
-                {"description": desc[:240], "excerpt": excerpt[:240]}
-            )
-
-    async with SessionLocal() as db:
-        doc = (
-            await db.execute(
-                select(GeneratedDocument).where(GeneratedDocument.id == doc_id)
-            )
-        ).scalar_one_or_none()
-        if doc is None:
-            return
-        doc.content_md = content_md
-        doc.content_structured = {
-            "status": "ready",
-            "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "humanized_source_doc_id": source_doc_id,
-            "notes": final_notes,
-            "warning": final_warning,
-            "error": None,
-            "humanize_fix_passes": len(fix_notes),
-            "humanize_residual_violations": residual_violations or None,
-            "intentional_mistakes": intentional_mistakes or None,
-        }
-        await db.commit()

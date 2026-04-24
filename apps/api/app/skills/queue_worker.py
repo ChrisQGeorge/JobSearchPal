@@ -505,10 +505,361 @@ async def _handle_score(item: JobFetchQueue) -> None:
         log.info("Score task %d → applied jd_analysis to TrackedJob %d", row.id, job.id)
 
 
+async def _mark_doc(
+    doc_id: int,
+    *,
+    content_md: str | None = None,
+    title: str | None = None,
+    structured: dict | None = None,
+) -> None:
+    """Update a GeneratedDocument row after a queued tailor/humanize run."""
+    from app.models.documents import GeneratedDocument as _GD
+
+    async with SessionLocal() as db:
+        doc = (
+            await db.execute(select(_GD).where(_GD.id == doc_id))
+        ).scalar_one_or_none()
+        if doc is None:
+            return
+        if content_md is not None:
+            doc.content_md = content_md
+        if title is not None:
+            doc.title = title[:255]
+        if structured is not None:
+            doc.content_structured = structured
+        await db.commit()
+
+
+async def _handle_tailor(item: JobFetchQueue) -> None:
+    """Run a tailor prompt (resume / cover letter / email / generic) and
+    update the placeholder GeneratedDocument with the result. Payload:
+      - generated_document_id: int
+      - prompt: str (already-escaped, ready for Claude)
+      - doc_type: str
+      - title_override: str | None
+      - job_title: str  (for the default title and bus label)
+    Rate limits are handled by the shared `_handle_rate_limit` so the
+    task parks and auto-resumes when the window opens.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    from app.core.security import create_access_token
+    from app.skills.runner import ClaudeCodeError
+    from app.skills import queue_bus
+
+    async with SessionLocal() as db:
+        row = (
+            await db.execute(select(JobFetchQueue).where(JobFetchQueue.id == item.id))
+        ).scalar_one_or_none()
+        if row is None:
+            return
+        payload = row.payload or {}
+        doc_id = payload.get("generated_document_id")
+        prompt = payload.get("prompt")
+        doc_type = payload.get("doc_type", "other")
+        title_override = payload.get("title_override")
+        job_title = payload.get("job_title") or "job"
+        if not doc_id or not prompt:
+            await _fail(db, row, "tailor task missing doc_id or prompt")
+            return
+
+        api_token = create_access_token(
+            subject=str(row.user_id), extra={"purpose": f"doc_tailor_{doc_type}"}
+        )
+        label = row.label or f"{doc_type.replace('_', ' ').title()}: {job_title}"
+
+        try:
+            final_text = await queue_bus.run_claude_to_bus(
+                prompt=prompt,
+                source=f"tailor_{doc_type}",
+                item_id=f"queue:{row.id}",
+                label=label,
+                allowed_tools=["Bash"],
+                timeout_seconds=600,
+                extra_env={
+                    "JSP_API_BASE_URL": "http://localhost:8000",
+                    "JSP_API_TOKEN": api_token,
+                },
+            )
+        except ClaudeCodeError as exc:
+            err = str(exc)
+            if _is_rate_limited(err):
+                await _handle_rate_limit(db, row, err)
+                return
+            await _fail(db, row, err)
+            await _mark_doc(
+                doc_id,
+                structured={
+                    "status": "error",
+                    "finished_at": _dt.now(tz=_tz.utc).isoformat(timespec="seconds"),
+                    "error": f"Claude Code error: {exc}",
+                },
+            )
+            return
+        except Exception as exc:  # pragma: no cover
+            await _fail(db, row, f"Unexpected error: {exc}")
+            await _mark_doc(
+                doc_id,
+                structured={
+                    "status": "error",
+                    "finished_at": _dt.now(tz=_tz.utc).isoformat(timespec="seconds"),
+                    "error": f"Unexpected error: {exc}",
+                },
+            )
+            log.exception("Tailor task %d unhandled error", row.id)
+            return
+
+        # Parse and apply. Defer the import so queue_worker stays importable
+        # without pulling all of documents.py.
+        from app.api.v1.documents import _extract_json_object
+
+        data = _extract_json_object(final_text) or {}
+        content_md = (data.get("content_md") or "").strip()
+        if not content_md:
+            msg = "Tailoring returned no content."
+            await _fail(db, row, msg)
+            await _mark_doc(
+                doc_id,
+                structured={
+                    "status": "error",
+                    "finished_at": _dt.now(tz=_tz.utc).isoformat(timespec="seconds"),
+                    "error": msg,
+                },
+            )
+            return
+
+        title = (
+            title_override
+            or data.get("title")
+            or f"{doc_type.replace('_', ' ').title()} – {job_title}"
+        )
+        await _mark_doc(
+            doc_id,
+            content_md=content_md,
+            title=title,
+            structured={
+                "status": "ready",
+                "finished_at": _dt.now(tz=_tz.utc).isoformat(timespec="seconds"),
+                "notes": data.get("notes"),
+                "warning": data.get("warning"),
+                "error": None,
+            },
+        )
+
+        row.state = "done"
+        row.result = {"generated_document_id": doc_id}
+        row.error_message = None
+        if isinstance(row.payload, dict) and "rate_limit_count" in row.payload:
+            new_payload = dict(row.payload)
+            new_payload.pop("rate_limit_count", None)
+            row.payload = new_payload or None
+        await db.commit()
+        log.info("Tailor task %d → updated GeneratedDocument %d", row.id, doc_id)
+
+
+async def _handle_humanize(item: JobFetchQueue) -> None:
+    """Run the humanizer's main prompt + any AI-tell fix-passes and update
+    the placeholder GeneratedDocument. Payload:
+      - generated_document_id: int
+      - prompt: str
+      - source_doc_id: int
+      - source_title: str
+      - source_body: str  (raw source, used by the banned-phrase validator)
+      - plant_mistakes: bool
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    from app.skills.runner import ClaudeCodeError
+    from app.skills import queue_bus
+
+    _MAX_FIX_PASSES = 2
+
+    async with SessionLocal() as db:
+        row = (
+            await db.execute(select(JobFetchQueue).where(JobFetchQueue.id == item.id))
+        ).scalar_one_or_none()
+        if row is None:
+            return
+        payload = row.payload or {}
+        doc_id = payload.get("generated_document_id")
+        prompt = payload.get("prompt")
+        source_doc_id = payload.get("source_doc_id")
+        source_title = payload.get("source_title") or ""
+        source_body = payload.get("source_body") or ""
+        plant_mistakes = bool(payload.get("plant_mistakes", True))
+        if not doc_id or not prompt:
+            await _fail(db, row, "humanize task missing doc_id or prompt")
+            return
+
+        label = row.label or f"Humanize: {source_title}"
+
+        # First pass. Rate limits park the queue row; other errors mark the doc.
+        try:
+            final_text = await queue_bus.run_claude_to_bus(
+                prompt=prompt,
+                source="humanize",
+                item_id=f"queue:{row.id}",
+                label=label,
+                allowed_tools=[],
+                timeout_seconds=600,
+            )
+        except ClaudeCodeError as exc:
+            err = str(exc)
+            if _is_rate_limited(err):
+                await _handle_rate_limit(db, row, err)
+                return
+            await _fail(db, row, err)
+            await _mark_doc(
+                doc_id,
+                structured={
+                    "status": "error",
+                    "finished_at": _dt.now(tz=_tz.utc).isoformat(timespec="seconds"),
+                    "error": f"Claude Code error: {exc}",
+                },
+            )
+            return
+        except Exception as exc:  # pragma: no cover
+            await _fail(db, row, f"Unexpected error: {exc}")
+            log.exception("Humanize task %d unhandled error", row.id)
+            return
+
+        from app.api.v1.documents import (
+            _extract_json_object,
+            _validate_humanizer_output,
+            _HUMANIZE_FIX_PROMPT,
+            _FIX_PRESERVE_IMPERFECTIONS,
+            _FIX_NO_IMPERFECTIONS,
+        )
+
+        data = _extract_json_object(final_text) or {}
+        content_md = (data.get("content_md") or "").strip()
+        if not content_md:
+            await _fail(db, row, "Humanizer returned no content.")
+            await _mark_doc(
+                doc_id,
+                structured={
+                    "status": "error",
+                    "finished_at": _dt.now(tz=_tz.utc).isoformat(timespec="seconds"),
+                    "error": "Humanizer returned no content.",
+                },
+            )
+            return
+
+        fix_notes: list[str] = []
+        for pass_idx in range(_MAX_FIX_PASSES):
+            violations = _validate_humanizer_output(content_md, source_body=source_body)
+            if not violations:
+                break
+            log.info(
+                "Humanize task %d fix-pass %d: %d violations",
+                row.id, pass_idx + 1, len(violations),
+            )
+            violations_block = "\n".join(f"- {v}" for v in violations)
+            fix_prompt = _HUMANIZE_FIX_PROMPT.format(
+                violations=violations_block,
+                previous_output=content_md.replace("{", "{{").replace("}", "}}"),
+                source_body=source_body.replace("{", "{{").replace("}", "}}"),
+                imperfections_directive=(
+                    _FIX_PRESERVE_IMPERFECTIONS
+                    if plant_mistakes
+                    else _FIX_NO_IMPERFECTIONS
+                ),
+            )
+            try:
+                fix_text = await queue_bus.run_claude_to_bus(
+                    prompt=fix_prompt,
+                    source="humanize",
+                    item_id=f"queue:{row.id}",
+                    label=f"Humanize fix-pass {pass_idx + 1}: {source_title}",
+                    allowed_tools=[],
+                    timeout_seconds=600,
+                )
+            except ClaudeCodeError as exc:
+                err = str(exc)
+                if _is_rate_limited(err):
+                    # Park for cooldown but keep what we've got so far — next
+                    # run starts from the main pass again, which is fine.
+                    await _handle_rate_limit(db, row, err)
+                    return
+                log.warning("Humanize fix-pass %d failed: %s — keeping prior", pass_idx + 1, exc)
+                break
+            fix_data = _extract_json_object(fix_text) or {}
+            new_md = (fix_data.get("content_md") or "").strip()
+            if not new_md:
+                break
+            content_md = new_md
+            data = fix_data
+            fix_notes.append(
+                f"Pass {pass_idx + 1} fixed: {', '.join(violations[:4])}"
+                + ("…" if len(violations) > 4 else "")
+            )
+
+        residual_violations = _validate_humanizer_output(content_md, source_body=source_body)
+
+        claude_warning = data.get("warning")
+        warning_parts: list[str] = []
+        if claude_warning:
+            warning_parts.append(str(claude_warning))
+        if residual_violations:
+            warning_parts.append(
+                "After retries, these AI-tell patterns still slipped through — "
+                "consider a manual pass:\n  - " + "\n  - ".join(residual_violations)
+            )
+        final_warning = "\n\n".join(warning_parts) if warning_parts else None
+
+        claude_notes = data.get("notes")
+        notes_parts: list[str] = []
+        if claude_notes:
+            notes_parts.append(str(claude_notes))
+        if fix_notes:
+            notes_parts.append("Fix-pass summary: " + " | ".join(fix_notes))
+        final_notes = " · ".join(notes_parts) if notes_parts else None
+
+        raw_mistakes = data.get("intentional_mistakes") or []
+        intentional_mistakes: list[dict] = []
+        if isinstance(raw_mistakes, list):
+            for m in raw_mistakes:
+                if not isinstance(m, dict):
+                    continue
+                desc = str(m.get("description") or "").strip()
+                excerpt = str(m.get("excerpt") or "").strip()
+                if not desc:
+                    continue
+                intentional_mistakes.append(
+                    {"description": desc[:240], "excerpt": excerpt[:240]}
+                )
+
+        await _mark_doc(
+            doc_id,
+            content_md=content_md,
+            structured={
+                "status": "ready",
+                "finished_at": _dt.now(tz=_tz.utc).isoformat(timespec="seconds"),
+                "humanized_source_doc_id": source_doc_id,
+                "notes": final_notes,
+                "warning": final_warning,
+                "error": None,
+                "humanize_fix_passes": len(fix_notes),
+                "humanize_residual_violations": residual_violations or None,
+                "intentional_mistakes": intentional_mistakes or None,
+            },
+        )
+
+        row.state = "done"
+        row.result = {"generated_document_id": doc_id}
+        row.error_message = None
+        if isinstance(row.payload, dict) and "rate_limit_count" in row.payload:
+            new_payload = dict(row.payload)
+            new_payload.pop("rate_limit_count", None)
+            row.payload = new_payload or None
+        await db.commit()
+        log.info("Humanize task %d → updated GeneratedDocument %d", row.id, doc_id)
+
+
 # kind → handler. Extensible: add new kinds here.
 _HANDLERS = {
     "fetch": _handle_fetch,
     "score": _handle_score,
+    "tailor": _handle_tailor,
+    "humanize": _handle_humanize,
 }
 
 
