@@ -141,6 +141,11 @@ export default function JobDetailPage({
             status={job.status}
             onStatusChanged={(s) => patch({ status: s })}
           />
+          <ApplyAction
+            jobId={job.id}
+            status={job.status}
+            onStatusChanged={(s) => patch({ status: s })}
+          />
           <WriteDocButton jobId={job.id} docType="resume" label="Write resume" />
           <WriteDocButton
             jobId={job.id}
@@ -488,6 +493,143 @@ function ReviewAction({
       title="Move to the next to-review job"
     >
       Next to review →{counter}
+    </button>
+  );
+}
+
+/**
+ * Apply-flow counterpart to `ReviewAction`. Appears only when the user
+ * arrived via `?from=apply` OR the row's status is `interested` (which is
+ * the apply-queue membership condition). Three buttons:
+ *
+ *   Applied           → status=applied,         advance to next interested
+ *   Not interested    → status=not_interested,  advance to next interested
+ *   Skip              → leave status=interested, advance to next
+ *
+ * Like ReviewAction, a minimal "Next to apply →" nav affordance surfaces
+ * when the user came via `?from=apply` but this row is no longer
+ * `interested` (they already acted), so they don't lose their place.
+ */
+function ApplyAction({
+  jobId,
+  status,
+  onStatusChanged,
+}: {
+  jobId: number;
+  status: JobStatus;
+  onStatusChanged: (s: JobStatus) => void;
+}) {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const inApplyFlow = searchParams.get("from") === "apply";
+  const [ids, setIds] = useState<number[]>([]);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  // Only run when relevant — avoids hammering the endpoint on every job
+  // detail page even though the component is always mounted.
+  const active = inApplyFlow || status === "interested";
+
+  useEffect(() => {
+    if (!active) return;
+    let cancelled = false;
+    api
+      .get<{ ids: number[] }>("/api/v1/jobs/apply-queue")
+      .then((out) => {
+        if (!cancelled) setIds(out.ids ?? []);
+      })
+      .catch(() => {
+        /* best-effort */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [jobId, active]);
+
+  const remaining =
+    status === "interested"
+      ? Math.max(0, ids.filter((i) => i !== jobId).length)
+      : ids.length;
+
+  function nextTarget(): string {
+    const queue = ids.filter((i) => i !== jobId);
+    if (queue.length === 0) return "/jobs/apply";
+    const idx = ids.indexOf(jobId);
+    const next = idx >= 0 && idx + 1 < ids.length ? ids[idx + 1] : queue[0];
+    return `/jobs/${next}?from=apply`;
+  }
+
+  async function triage(newStatus: JobStatus, key: string, keepStatus: boolean) {
+    setBusy(key);
+    try {
+      if (!keepStatus) {
+        await api.put<TrackedJob>(`/api/v1/jobs/${jobId}`, {
+          status: newStatus,
+        });
+        onStatusChanged(newStatus);
+      }
+      router.push(nextTarget());
+    } catch {
+      /* non-fatal */
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  if (!active) return null;
+
+  const counter =
+    remaining > 0 ? (
+      <span className="text-[10px] text-corp-muted ml-1">
+        ({remaining} left)
+      </span>
+    ) : null;
+
+  if (status === "interested") {
+    return (
+      <div className="flex items-center gap-1.5">
+        <button
+          type="button"
+          className="jsp-btn-primary text-xs"
+          onClick={() => triage("applied", "applied", false)}
+          disabled={busy !== null}
+          title="Mark as applied and jump to the next interested row"
+        >
+          {busy === "applied" ? "…" : "Applied"}
+        </button>
+        <button
+          type="button"
+          className="jsp-btn-ghost text-xs text-corp-danger border-corp-danger/40"
+          onClick={() => triage("not_interested", "not_interested", false)}
+          disabled={busy !== null}
+          title="Changed your mind — mark as not interested and jump to the next"
+        >
+          {busy === "not_interested" ? "…" : "Not interested"}
+        </button>
+        <button
+          type="button"
+          className="jsp-btn-ghost text-xs"
+          onClick={() => triage(status, "skip", true)}
+          disabled={busy !== null}
+          title="Leave this one as interested for now and jump to the next"
+        >
+          {busy === "skip" ? "…" : "Skip"}
+        </button>
+        {counter}
+      </div>
+    );
+  }
+
+  // Already triaged out of `interested` — user is still in apply flow
+  // but this row has moved on. Offer a nav button only.
+  if (!inApplyFlow || remaining === 0) return null;
+  return (
+    <button
+      type="button"
+      className="jsp-btn-ghost text-xs"
+      onClick={() => router.push(nextTarget())}
+      title="Move to the next interested job"
+    >
+      Next to apply →{counter}
     </button>
   );
 }

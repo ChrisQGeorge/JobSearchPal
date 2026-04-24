@@ -396,6 +396,30 @@ async def create_criterion(
             status_code=422,
             detail="tier must be preferred / acceptable / unacceptable",
         )
+
+    # Upsert semantics: `uq_job_criterion` covers (user_id, category, value)
+    # *including* soft-deleted rows — MySQL doesn't do partial-unique
+    # indexes. So if this exact tuple exists (live or previously deleted),
+    # overwrite its tier/weight/notes and clear `deleted_at` instead of
+    # inserting a collision.
+    existing = (
+        await db.execute(
+            select(JobCriterion).where(
+                JobCriterion.user_id == user.id,
+                JobCriterion.category == payload.category,
+                JobCriterion.value == payload.value,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        data = payload.model_dump()
+        for k, v in data.items():
+            setattr(existing, k, v)
+        existing.deleted_at = None
+        await db.commit()
+        await db.refresh(existing)
+        return existing
+
     c = JobCriterion(user_id=user.id, **payload.model_dump())
     db.add(c)
     await db.commit()

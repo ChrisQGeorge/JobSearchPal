@@ -86,7 +86,7 @@ export default function DashboardPage() {
       title="Dashboard"
       subtitle={`Welcome back, ${user?.display_name ?? "valued applicant"}. Today promises opportunity, probably.`}
     >
-      <section className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4">
+      <section className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-4">
         <Kpi
           label="To review"
           value={metrics.statusCounts.get("to_review") ?? 0}
@@ -99,6 +99,16 @@ export default function DashboardPage() {
           tone={
             (metrics.statusCounts.get("to_review") ?? 0) > 0 ? "warn" : undefined
           }
+        />
+        <Kpi
+          label="Ready to apply"
+          value={metrics.statusCounts.get("interested") ?? 0}
+          sub={
+            (metrics.statusCounts.get("interested") ?? 0) > 0
+              ? "Click to start applying →"
+              : "Nothing queued"
+          }
+          href="/jobs/apply"
         />
         <Kpi
           label="Active applications"

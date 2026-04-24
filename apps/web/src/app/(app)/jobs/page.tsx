@@ -51,6 +51,12 @@ export default function JobTrackerPage() {
     return window.localStorage.getItem("jsp:jobs:show_closed") === "1";
   });
   const [creating, setCreating] = useState(false);
+  // Multi-select on the tracker table. Selection survives filter-pill
+  // switches (so the user can stage a bulk action across statuses) but
+  // resets when a bulk action completes or Clear is clicked.
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [bulkRunning, setBulkRunning] = useState(false);
+  const [bulkMsg, setBulkMsg] = useState<string | null>(null);
 
   function toggleShowNegative(next: boolean) {
     setShowNegative(next);
@@ -139,6 +145,68 @@ export default function JobTrackerPage() {
       setImporting(false);
       if (fileInput.current) fileInput.current.value = "";
     }
+  }
+
+  function toggleSelected(id: number) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+    setBulkMsg(null);
+  }
+
+  function toggleSelectAllVisible(visibleIds: number[]) {
+    setSelectedIds((prev) => {
+      // If every visible row is currently selected → clear the visible set.
+      // Otherwise → add every visible row.
+      const every = visibleIds.every((id) => prev.has(id));
+      const next = new Set(prev);
+      if (every) {
+        for (const id of visibleIds) next.delete(id);
+      } else {
+        for (const id of visibleIds) next.add(id);
+      }
+      return next;
+    });
+    setBulkMsg(null);
+  }
+
+  /**
+   * Fire a tailor POST for every selected job × every doc_type in
+   * `docTypes`. The backend returns immediately with a placeholder
+   * `GeneratedDocument`, so we can parallelize safely — the heavy
+   * Claude work happens in the task queue. Counts successes and
+   * failures; one bad row (e.g. missing JD) doesn't stop the rest.
+   */
+  async function bulkTailor(docTypes: ("resume" | "cover_letter")[]) {
+    const ids = [...selectedIds];
+    if (ids.length === 0 || docTypes.length === 0) return;
+    setBulkRunning(true);
+    setBulkMsg(null);
+    const results = await Promise.allSettled(
+      ids.flatMap((id) =>
+        docTypes.map((doc_type) =>
+          api.post<{ id: number }>(`/api/v1/documents/tailor/${id}`, {
+            doc_type,
+          }),
+        ),
+      ),
+    );
+    const ok = results.filter((r) => r.status === "fulfilled").length;
+    const fail = results.length - ok;
+    setBulkRunning(false);
+    setSelectedIds(new Set());
+    const kinds = docTypes
+      .map((t) => (t === "cover_letter" ? "cover letter" : t))
+      .join(" + ");
+    setBulkMsg(
+      fail === 0
+        ? `Queued ${ok} ${kinds} task${ok === 1 ? "" : "s"} for ${ids.length} job${ids.length === 1 ? "" : "s"}. Watch the Companion Activity page for progress.`
+        : `Queued ${ok} of ${results.length} (${fail} failed — usually missing job descriptions). Check /queue.`,
+    );
+    setTimeout(() => setBulkMsg(null), 15000);
   }
 
   async function onQueueImport(file: File | null) {
@@ -288,6 +356,59 @@ export default function JobTrackerPage() {
         </div>
       ) : null}
 
+      {bulkMsg ? (
+        <div className="jsp-card p-3 mt-3 text-xs text-corp-muted border-l-4 border-l-corp-accent">
+          {bulkMsg}
+        </div>
+      ) : null}
+
+      {selectedIds.size > 0 ? (
+        <div className="jsp-card p-3 mt-3 flex flex-wrap gap-2 items-center border-l-4 border-l-corp-accent">
+          <span className="text-sm">
+            <strong>{selectedIds.size}</strong> selected
+          </span>
+          <div className="flex-1" />
+          <button
+            type="button"
+            className="jsp-btn-ghost text-xs"
+            onClick={() => bulkTailor(["resume"])}
+            disabled={bulkRunning}
+            title="Queue a tailor run for each selected job — writes a resume per job"
+          >
+            Write resumes
+          </button>
+          <button
+            type="button"
+            className="jsp-btn-ghost text-xs"
+            onClick={() => bulkTailor(["cover_letter"])}
+            disabled={bulkRunning}
+            title="Queue a tailor run for each selected job — writes a cover letter per job"
+          >
+            Write cover letters
+          </button>
+          <button
+            type="button"
+            className="jsp-btn-primary text-xs"
+            onClick={() => bulkTailor(["resume", "cover_letter"])}
+            disabled={bulkRunning}
+            title="Queue both a resume and a cover letter per selected job"
+          >
+            {bulkRunning ? "Queuing…" : "Write both"}
+          </button>
+          <button
+            type="button"
+            className="jsp-btn-ghost text-xs"
+            onClick={() => {
+              setSelectedIds(new Set());
+              setBulkMsg(null);
+            }}
+            disabled={bulkRunning}
+          >
+            Clear
+          </button>
+        </div>
+      ) : null}
+
       {loading ? (
         <p className="text-corp-muted mt-4">Loading...</p>
       ) : items.length === 0 ? (
@@ -301,6 +422,33 @@ export default function JobTrackerPage() {
           <table className="w-full text-sm">
             <thead>
               <tr className="bg-corp-surface2 text-left text-[11px] uppercase tracking-wider text-corp-muted">
+                <th className="py-2 px-2 w-8">
+                  <input
+                    type="checkbox"
+                    className="accent-corp-accent"
+                    aria-label="Select all visible rows"
+                    checked={
+                      items.length > 0 &&
+                      items.every((j) => selectedIds.has(j.id))
+                    }
+                    // Indeterminate state when some but not all visible rows
+                    // are selected — React doesn't expose it as a prop, so
+                    // set via ref on the DOM element.
+                    ref={(el) => {
+                      if (el) {
+                        const count = items.filter((j) =>
+                          selectedIds.has(j.id),
+                        ).length;
+                        el.indeterminate =
+                          count > 0 && count < items.length;
+                      }
+                    }}
+                    onChange={() =>
+                      toggleSelectAllVisible(items.map((j) => j.id))
+                    }
+                    onClick={(e) => e.stopPropagation()}
+                  />
+                </th>
                 <th className="py-2 px-4">Title</th>
                 <th className="py-2 px-4">Organization</th>
                 <th className="py-2 px-4">Status</th>
@@ -314,9 +462,23 @@ export default function JobTrackerPage() {
               {items.map((j) => (
                 <tr
                   key={j.id}
-                  className="border-t border-corp-border hover:bg-corp-surface2 cursor-pointer"
+                  className={`border-t border-corp-border hover:bg-corp-surface2 cursor-pointer ${
+                    selectedIds.has(j.id) ? "bg-corp-accent/10" : ""
+                  }`}
                   onClick={() => (window.location.href = `/jobs/${j.id}`)}
                 >
+                  <td
+                    className="py-2 px-2 w-8"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <input
+                      type="checkbox"
+                      className="accent-corp-accent"
+                      checked={selectedIds.has(j.id)}
+                      onChange={() => toggleSelected(j.id)}
+                      aria-label={`Select ${j.title}`}
+                    />
+                  </td>
                   <td className="py-2 px-4">
                     <Link href={`/jobs/${j.id}`} className="hover:text-corp-accent">
                       {j.title}

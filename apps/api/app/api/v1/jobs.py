@@ -377,20 +377,17 @@ class ReviewQueueOut(BaseModel):
     items: list[dict]
 
 
-@router.get("/review-queue", response_model=ReviewQueueOut)
-async def review_queue(
-    db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
+async def _queue_by_status(
+    db: AsyncSession, user_id: int, status_value: str
 ) -> ReviewQueueOut:
-    """All jobs that still need reviewing, in FIFO order. Frontend uses this
-    to drive the `/jobs/review` page and to compute the "next job" target
-    when the user clicks "Reviewed" on the detail page."""
+    """Shared worker for status-filtered queue endpoints (review + apply).
+    Sorted FIFO by `date_discovered` then `id` so the oldest job is first."""
     stmt = (
         select(TrackedJob)
         .where(
-            TrackedJob.user_id == user.id,
+            TrackedJob.user_id == user_id,
             TrackedJob.deleted_at.is_(None),
-            TrackedJob.status == "to_review",
+            TrackedJob.status == status_value,
         )
         # MySQL has no NULLS LAST / NULLS FIRST syntax. `col.is_(None)`
         # compiles to `col IS NULL`, which evaluates to 0/1 at sort time;
@@ -402,7 +399,6 @@ async def review_queue(
         )
     )
     rows = list((await db.execute(stmt)).scalars().all())
-    # Resolve org names in one shot.
     org_ids = {r.organization_id for r in rows if r.organization_id}
     org_names = await _org_names_for(db, org_ids)
     items = [
@@ -422,6 +418,27 @@ async def review_queue(
         ids=[r.id for r in rows],
         items=items,
     )
+
+
+@router.get("/review-queue", response_model=ReviewQueueOut)
+async def review_queue(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ReviewQueueOut:
+    """Jobs with status=to_review — fresh, not yet triaged. Drives the
+    `/jobs/review` page and the "Next → " navigation on the detail page."""
+    return await _queue_by_status(db, user.id, "to_review")
+
+
+@router.get("/apply-queue", response_model=ReviewQueueOut)
+async def apply_queue(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ReviewQueueOut:
+    """Jobs with status=interested — triaged as worth pursuing, not yet
+    applied to. Drives the `/jobs/apply` page; the detail page's apply-flow
+    buttons move rows from here to status=applied."""
+    return await _queue_by_status(db, user.id, "interested")
 
 
 # --- ApplicationEvents (activity feed) --------------------------------------

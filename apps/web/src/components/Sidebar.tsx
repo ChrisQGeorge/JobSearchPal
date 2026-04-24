@@ -11,6 +11,7 @@ const NAV = [
   { href: "/organizations", label: "Organizations" },
   { href: "/jobs", label: "Job Tracker" },
   { href: "/jobs/review", label: "Review Queue" },
+  { href: "/jobs/apply", label: "Apply Queue" },
   { href: "/queue", label: "Companion Activity" },
   { href: "/studio", label: "Document Studio" },
   { href: "/samples", label: "Writing Samples" },
