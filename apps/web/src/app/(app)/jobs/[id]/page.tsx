@@ -355,6 +355,23 @@ function ProgressStatusButton({
 }
 
 
+/**
+ * Triage controls for the review queue. Three buttons:
+ *
+ *   Interested       → status=interested,    advance to next to_review
+ *   Not interested   → status=not_interested, advance to next to_review
+ *   Skip             → status=reviewed,       advance to next to_review
+ *
+ * "Skip" is for rows where the user saw the posting, wants to move on, but
+ * hasn't decided yet. All three actions change the status AND navigate —
+ * the user never has to click twice.
+ *
+ * For rows that have already been triaged (status ≠ to_review), the
+ * triage component hides itself (the ProgressStatusButton takes over for
+ * moving through the application pipeline). A thin "Next to review →"
+ * affordance appears only when there are still queued rows AND the user
+ * arrived via the review flow, so they don't lose their place.
+ */
 function ReviewAction({
   jobId,
   status,
@@ -368,66 +385,53 @@ function ReviewAction({
   const searchParams = useSearchParams();
   const inReviewFlow = searchParams.get("from") === "review";
   const [ids, setIds] = useState<number[]>([]);
-  const [busy, setBusy] = useState(false);
-
-  async function refreshQueue() {
-    try {
-      const out = await api.get<{ ids: number[] }>(
-        "/api/v1/jobs/review-queue",
-      );
-      setIds(out.ids ?? []);
-    } catch {
-      /* best-effort — worst case counter shows zero */
-    }
-  }
+  const [busy, setBusy] = useState<string | null>(null);
 
   useEffect(() => {
-    refreshQueue();
+    let cancelled = false;
+    api
+      .get<{ ids: number[] }>("/api/v1/jobs/review-queue")
+      .then((out) => {
+        if (!cancelled) setIds(out.ids ?? []);
+      })
+      .catch(() => {
+        /* best-effort */
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [jobId]);
 
-  // How many still need review after this one? If current status is
-  // already not-to-review, the count = full queue. If current IS
-  // to_review, subtract 1 because clicking the button will clear it.
+  // Remaining = jobs that will still need review AFTER this action. When
+  // status is to_review, any triage button clears this row, so subtract 1.
   const remaining =
     status === "to_review"
       ? Math.max(0, ids.filter((i) => i !== jobId).length)
       : ids.length;
 
-  async function act() {
-    setBusy(true);
+  function nextTarget(): string {
+    const queue = ids.filter((i) => i !== jobId);
+    if (queue.length === 0) return "/jobs/review";
+    const idx = ids.indexOf(jobId);
+    const next = idx >= 0 && idx + 1 < ids.length ? ids[idx + 1] : queue[0];
+    return `/jobs/${next}?from=review`;
+  }
+
+  async function triage(newStatus: JobStatus, key: string) {
+    setBusy(key);
     try {
-      if (status === "to_review") {
-        await api.put<TrackedJob>(`/api/v1/jobs/${jobId}`, {
-          status: "reviewed",
-        });
-        onStatusChanged("reviewed");
-      }
-      // Compute next target — prefer the next to_review after the current
-      // one in the queue, wrap to the first if we're already at the end,
-      // or fall back to the Review Queue list page if the queue is empty.
-      const queue = ids.filter((i) => i !== jobId);
-      if (queue.length === 0) {
-        router.push("/jobs/review");
-        return;
-      }
-      const idx = ids.indexOf(jobId);
-      const next = idx >= 0 && idx + 1 < ids.length ? ids[idx + 1] : queue[0];
-      router.push(`/jobs/${next}?from=review`);
+      await api.put<TrackedJob>(`/api/v1/jobs/${jobId}`, {
+        status: newStatus,
+      });
+      onStatusChanged(newStatus);
+      router.push(nextTarget());
     } catch {
-      /* non-fatal; stay on the page */
+      /* non-fatal; stay put */
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   }
 
-  const label =
-    status === "to_review"
-      ? `Reviewed · Next →`
-      : inReviewFlow
-        ? `Skip · Next →`
-        : `Next to review →`;
-
-  // Counter is only meaningful when there's at least one waiting job.
   const counter =
     remaining > 0 ? (
       <span className="text-[10px] text-corp-muted ml-1">
@@ -435,20 +439,55 @@ function ReviewAction({
       </span>
     ) : null;
 
+  if (status === "to_review") {
+    return (
+      <div className="flex items-center gap-1.5">
+        <button
+          type="button"
+          className="jsp-btn-primary text-xs"
+          onClick={() => triage("interested", "interested")}
+          disabled={busy !== null}
+          title="Mark this job as interested and jump to the next to-review row"
+        >
+          {busy === "interested" ? "…" : "Interested"}
+        </button>
+        <button
+          type="button"
+          className="jsp-btn-ghost text-xs text-corp-danger border-corp-danger/40"
+          onClick={() => triage("not_interested", "not_interested")}
+          disabled={busy !== null}
+          title="Mark this job as not interested and jump to the next to-review row"
+        >
+          {busy === "not_interested" ? "…" : "Not interested"}
+        </button>
+        <button
+          type="button"
+          className="jsp-btn-ghost text-xs"
+          onClick={() => triage("reviewed", "skip")}
+          disabled={busy !== null}
+          title={
+            'Mark as reviewed without a decision yet — "I\'ve seen it, will come back later" ' +
+            "— and jump to the next to-review row"
+          }
+        >
+          {busy === "skip" ? "…" : "Skip"}
+        </button>
+        {counter}
+      </div>
+    );
+  }
+
+  // Already triaged — offer just the "continue review queue" affordance
+  // when the user arrived via /jobs/review and there's still a queue.
+  if (!inReviewFlow || remaining === 0) return null;
   return (
     <button
       type="button"
-      className="jsp-btn-primary flex items-center gap-1"
-      onClick={act}
-      disabled={busy}
-      title={
-        status === "to_review"
-          ? "Mark this job as reviewed and move to the next one in the queue"
-          : "Move to the next to-review job"
-      }
+      className="jsp-btn-ghost text-xs"
+      onClick={() => router.push(nextTarget())}
+      title="Move to the next to-review job"
     >
-      {busy ? "..." : label}
-      {counter}
+      Next to review →{counter}
     </button>
   );
 }
@@ -2232,6 +2271,28 @@ function JdAnalysisPanel({
 }) {
   const [running, setRunning] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // Collapse preference is remembered per-browser — the user might want the
+  // JD analysis hidden while they triage rapid-fire, or expanded when
+  // they're deep-reading a particular posting.
+  const [expanded, setExpanded] = useState<boolean>(() => {
+    if (typeof window === "undefined") return true;
+    const saved = window.localStorage.getItem("jsp:jd_analysis:expanded");
+    return saved === null ? true : saved === "1";
+  });
+  function toggleExpanded() {
+    setExpanded((prev) => {
+      const next = !prev;
+      try {
+        window.localStorage.setItem(
+          "jsp:jd_analysis:expanded",
+          next ? "1" : "0",
+        );
+      } catch {
+        /* localStorage unavailable */
+      }
+      return next;
+    });
+  }
   const analysis = (job.jd_analysis ?? null) as JdAnalysis | null;
   const hasDescription = !!(job.job_description && job.job_description.trim());
 
@@ -2294,9 +2355,17 @@ function JdAnalysisPanel({
     <div className="jsp-card p-5 space-y-4">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h3 className="text-sm uppercase tracking-wider text-corp-muted">
-            JD Analysis
-          </h3>
+          <button
+            type="button"
+            onClick={toggleExpanded}
+            className="text-sm uppercase tracking-wider text-corp-muted hover:text-corp-text inline-flex items-baseline gap-1.5"
+            title={expanded ? "Hide JD Analysis body" : "Show JD Analysis body"}
+          >
+            <span>JD Analysis</span>
+            <span className="text-[10px] normal-case tracking-normal text-corp-muted">
+              {expanded ? "(hide)" : "(show)"}
+            </span>
+          </button>
           {analysis.fit_summary ? (
             <p className="text-sm mt-1">{analysis.fit_summary}</p>
           ) : null}
@@ -2314,6 +2383,7 @@ function JdAnalysisPanel({
         </div>
       </div>
 
+      {!expanded ? null : (
       <div className="grid grid-cols-2 gap-4">
         <BulletList label="Strengths" items={analysis.strengths} tone="good" />
         <BulletList label="Gaps" items={analysis.gaps} tone="warn" />
@@ -2347,6 +2417,7 @@ function JdAnalysisPanel({
           </div>
         ) : null}
       </div>
+      )}
 
       {err ? <div className="text-xs text-corp-danger">{err}</div> : null}
     </div>
