@@ -70,6 +70,12 @@ async def run_claude_prompt(
 
     cmd: list[str] = [settings.CLAUDE_CODE_BIN, "-p", prompt, "--output-format", output_format]
 
+    # Pin the model so changing ANTHROPIC_DEFAULT_MODEL in .env actually
+    # takes effect. Without --model the CLI uses whatever default the
+    # account / config dir resolves to, which made the env var look inert.
+    if settings.ANTHROPIC_DEFAULT_MODEL:
+        cmd += ["--model", settings.ANTHROPIC_DEFAULT_MODEL]
+
     if session_id:
         cmd += ["--resume", session_id]
 
@@ -198,6 +204,8 @@ async def stream_claude_prompt(
         "--verbose",  # stream-json requires --verbose
         "--include-partial-messages",
     ]
+    if settings.ANTHROPIC_DEFAULT_MODEL:
+        cmd += ["--model", settings.ANTHROPIC_DEFAULT_MODEL]
     if session_id:
         cmd += ["--resume", session_id]
 
