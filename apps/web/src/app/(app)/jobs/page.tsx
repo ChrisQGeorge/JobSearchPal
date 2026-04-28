@@ -128,7 +128,8 @@ export default function JobTrackerPage() {
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
 
   // Apply the search filter on top of whatever the backend returned.
-  // Matches case-insensitively across title / org / location / notes.
+  // Matches case-insensitively across title / org / location.
+  // (TrackedJobSummary doesn't carry notes — that's full TrackedJob only.)
   const visibleItems = useMemo(() => {
     const q = search.trim().toLowerCase();
     let arr = q
@@ -136,7 +137,6 @@ export default function JobTrackerPage() {
           if (j.title?.toLowerCase().includes(q)) return true;
           if (j.organization_name?.toLowerCase().includes(q)) return true;
           if (j.location?.toLowerCase().includes(q)) return true;
-          if ((j.notes ?? "").toLowerCase().includes(q)) return true;
           return false;
         })
       : items;
@@ -513,7 +513,7 @@ export default function JobTrackerPage() {
         <input
           type="text"
           className="jsp-input"
-          placeholder="Search jobs by title, organization, location, or notes…"
+          placeholder="Search jobs by title, organization, or location…"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
