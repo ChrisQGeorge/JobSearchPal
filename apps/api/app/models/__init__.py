@@ -36,7 +36,12 @@ from app.models.jobs import (
     Organization,
     TrackedJob,
 )
-from app.models.documents import DocumentEdit, GeneratedDocument, WritingSample
+from app.models.documents import (
+    CoverLetterSnippet,
+    DocumentEdit,
+    GeneratedDocument,
+    WritingSample,
+)
 from app.models.companion import CompanionConversation, ConversationMessage, Task
 from app.models.links import EntityLink
 from app.models.operational import AuditLog, AutofillLog, MetricSnapshot
@@ -77,6 +82,7 @@ __all__ = [
     "GeneratedDocument",
     "DocumentEdit",
     "WritingSample",
+    "CoverLetterSnippet",
     "CompanionConversation",
     "ConversationMessage",
     "Task",
