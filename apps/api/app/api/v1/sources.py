@@ -32,6 +32,104 @@ LEAD_TRIAGE_STATES = {"interested", "watching", "dismissed"}
 LEAD_PROMOTE_STATUSES = {"interested", "watching"}
 
 
+# Seed sources offered to brand-new users so the /leads inbox isn't a
+# blank slate. All shipped DISABLED so the poller doesn't blast every
+# new account with noise — the user toggles on whichever ones are
+# relevant. A few are wired with regex filters specifically to show off
+# what the filter fields can do; copy-paste them as a starting point.
+DEFAULT_SEEDS: list[dict] = [
+    {
+        "kind": "greenhouse",
+        "slug_or_url": "anthropic",
+        "label": "Anthropic — all roles",
+        "filters": None,
+        "poll_interval_hours": 24,
+        "lead_ttl_hours": 168,
+    },
+    {
+        "kind": "greenhouse",
+        "slug_or_url": "stripe",
+        "label": "Stripe — engineering only",
+        # `(?i)` makes the regex case-insensitive. Anchored alternatives
+        # match anywhere in the title — Greenhouse titles are usually
+        # "Senior Software Engineer, Payments" / "Staff Engineer" / etc.
+        "filters": {
+            "title_include": r"(?i)\b(engineer|developer|sre|devops|infra)\b",
+        },
+        "poll_interval_hours": 24,
+        "lead_ttl_hours": 168,
+    },
+    {
+        "kind": "greenhouse",
+        "slug_or_url": "discord",
+        "label": "Discord — senior+ engineering, US-only",
+        "filters": {
+            # Combine include + exclude on title and a location include.
+            "title_include": r"(?i)\b(senior|staff|principal)\b.*\b(engineer|developer)\b",
+            "title_exclude": r"(?i)\b(intern|sales|recruiter|marketing|legal)\b",
+            "location_include": r"(?i)united states|remote|san francisco|new york|seattle",
+        },
+        "poll_interval_hours": 12,
+        "lead_ttl_hours": 168,
+    },
+    {
+        "kind": "lever",
+        "slug_or_url": "netflix",
+        "label": "Netflix — engineering, exclude leadership / contract",
+        "filters": {
+            "title_include": r"(?i)\b(engineer|developer|sre)\b",
+            # Drop director-and-above + non-perm hires.
+            "title_exclude": r"(?i)\b(director|vp|vice president|head of|manager|intern|contract|temporary)\b",
+        },
+        "poll_interval_hours": 24,
+        "lead_ttl_hours": 168,
+    },
+    {
+        "kind": "ashby",
+        "slug_or_url": "ramp",
+        "label": "Ramp — remote or NYC only",
+        "filters": {
+            "location_include": r"(?i)remote|new york|nyc",
+            "title_exclude": r"(?i)\b(intern|sales)\b",
+        },
+        "poll_interval_hours": 24,
+        "lead_ttl_hours": 168,
+    },
+    {
+        "kind": "ashby",
+        "slug_or_url": "Linear",
+        "label": "Linear — remote-only",
+        "filters": {"remote_only": True},
+        "poll_interval_hours": 48,
+        "lead_ttl_hours": 168,
+    },
+    {
+        "kind": "yc",
+        "slug_or_url": "https://www.workatastartup.com/companies/feed.atom?role=engineering",
+        "label": "Y Combinator — engineering, remote-only",
+        # YC's feed mixes posting and re-postings; remote_only tightens
+        # the firehose down a lot.
+        "filters": {
+            "remote_only": True,
+            "title_exclude": r"(?i)\b(intern|sales|founding designer)\b",
+        },
+        "poll_interval_hours": 24,
+        "lead_ttl_hours": 168,
+    },
+    {
+        "kind": "rss",
+        "slug_or_url": "https://weworkremotely.com/categories/remote-programming-jobs.rss",
+        "label": "We Work Remotely — programming feed",
+        "filters": {
+            # Quick way to filter to senior+ specifically.
+            "title_include": r"(?i)\b(senior|staff|principal|lead)\b",
+        },
+        "poll_interval_hours": 12,
+        "lead_ttl_hours": 168,
+    },
+]
+
+
 # ----- Schemas --------------------------------------------------------------
 
 
@@ -293,6 +391,67 @@ async def delete_source(
     src = await _owned_source(db, source_id, user.id)
     src.deleted_at = datetime.now(tz=timezone.utc)
     await db.commit()
+
+
+class SeedDefaultsOut(BaseModel):
+    created: int
+    skipped: int  # rows that already existed for this user
+    sources: list[SourceOut]
+
+
+@router.post("/seed-defaults", response_model=SeedDefaultsOut)
+async def seed_defaults(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> SeedDefaultsOut:
+    """Insert a small library of known-good sources so the leads page
+    has something to start from. All seeded rows are created DISABLED
+    so the poller doesn't fire until the user toggles them on. Skips
+    any (kind, slug_or_url) pair that already exists for this user —
+    safe to call repeatedly."""
+    existing_rows = (
+        await db.execute(
+            select(JobSource.kind, JobSource.slug_or_url).where(
+                JobSource.user_id == user.id,
+                JobSource.deleted_at.is_(None),
+            )
+        )
+    ).all()
+    existing = {(k, s) for k, s in existing_rows}
+
+    created_rows: list[JobSource] = []
+    skipped = 0
+    for seed in DEFAULT_SEEDS:
+        key = (seed["kind"], seed["slug_or_url"])
+        if key in existing:
+            skipped += 1
+            continue
+        if seed["kind"] not in SOURCE_KINDS:
+            # Defensive — shouldn't happen unless the seed list drifts.
+            continue
+        row = JobSource(
+            user_id=user.id,
+            kind=seed["kind"],
+            slug_or_url=seed["slug_or_url"],
+            label=seed.get("label") or None,
+            enabled=False,
+            filters=seed.get("filters"),
+            poll_interval_hours=seed.get("poll_interval_hours", 24),
+            lead_ttl_hours=seed.get("lead_ttl_hours", 168),
+        )
+        db.add(row)
+        created_rows.append(row)
+
+    if created_rows:
+        await db.commit()
+        for row in created_rows:
+            await db.refresh(row)
+
+    return SeedDefaultsOut(
+        created=len(created_rows),
+        skipped=skipped,
+        sources=[SourceOut.model_validate(r) for r in created_rows],
+    )
 
 
 @router.post("/{source_id:int}/poll", response_model=SourceOut)

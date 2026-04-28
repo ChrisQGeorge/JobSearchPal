@@ -135,6 +135,7 @@ export default function LeadsPage() {
   const [err, setErr] = useState<string | null>(null);
   const [editing, setEditing] = useState<SourceForm | null>(null);
   const [savingSource, setSavingSource] = useState(false);
+  const [seeding, setSeeding] = useState(false);
   const [polling, setPolling] = useState<number | null>(null);
   // Inbox filters / state
   const [stateFilter, setStateFilter] = useState<"new" | "promoted" | "dismissed" | "expired" | "all">(
@@ -227,6 +228,33 @@ export default function LeadsPage() {
     await loadAll();
   }
 
+  async function seedDefaults() {
+    setSeeding(true);
+    setErr(null);
+    try {
+      const out = await api.post<{ created: number; skipped: number }>(
+        "/api/v1/job-sources/seed-defaults",
+        {},
+      );
+      await loadAll();
+      // Light status — re-use err slot only for failure; success is
+      // self-evident from the populated list.
+      if (out.created === 0 && out.skipped > 0) {
+        setErr(
+          `All ${out.skipped} default sources already exist for your account.`,
+        );
+      }
+    } catch (e) {
+      setErr(
+        e instanceof ApiError
+          ? `Seed failed (HTTP ${e.status}).`
+          : "Seed failed.",
+      );
+    } finally {
+      setSeeding(false);
+    }
+  }
+
   async function pollNow(id: number) {
     setPolling(id);
     setErr(null);
@@ -312,13 +340,23 @@ export default function LeadsPage() {
       title="Job Leads"
       subtitle="ATS feeds polled on your schedule. Triage the inbox, promote interesting rows to the tracker — they auto-queue for scoring."
       actions={
-        <button
-          className="jsp-btn-primary"
-          onClick={() => setEditing(emptyForm(kinds))}
-          disabled={!!editing || kinds.length === 0}
-        >
-          + Add source
-        </button>
+        <div className="flex gap-2">
+          <button
+            className="jsp-btn-ghost"
+            onClick={seedDefaults}
+            disabled={seeding}
+            title="Insert a small library of known-good Greenhouse / Lever / Ashby / RSS / YC sources, all DISABLED so nothing polls until you toggle them on. Several have regex filter examples baked in to copy from."
+          >
+            {seeding ? "Seeding…" : "Load examples"}
+          </button>
+          <button
+            className="jsp-btn-primary"
+            onClick={() => setEditing(emptyForm(kinds))}
+            disabled={!!editing || kinds.length === 0}
+          >
+            + Add source
+          </button>
+        </div>
       }
     >
       {err ? (
@@ -345,11 +383,27 @@ export default function LeadsPage() {
         {loading ? (
           <p className="text-corp-muted text-sm">Loading…</p>
         ) : sources.length === 0 ? (
-          <p className="text-sm text-corp-muted">
-            No sources yet. Click <b>+ Add source</b> to register one — start
-            with a Greenhouse / Lever / Ashby / Workable company slug, or
-            paste an RSS / Atom feed URL.
-          </p>
+          <div className="text-sm text-corp-muted space-y-2">
+            <p>
+              No sources yet. Click <b>+ Add source</b> to register one — start
+              with a Greenhouse / Lever / Ashby / Workable company slug, or
+              paste an RSS / Atom feed URL.
+            </p>
+            <p>
+              Or click{" "}
+              <button
+                type="button"
+                className="text-corp-accent hover:underline"
+                onClick={seedDefaults}
+                disabled={seeding}
+              >
+                Load examples
+              </button>{" "}
+              to seed a starter library (all disabled — toggle on whichever
+              you actually want polled). Several include regex filter
+              examples worth copying.
+            </p>
+          </div>
         ) : (
           <ul className="divide-y divide-corp-border">
             {sources.map((s) => (
