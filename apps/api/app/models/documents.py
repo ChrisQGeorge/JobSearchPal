@@ -34,6 +34,7 @@ class GeneratedDocument(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     )
     prompt_snapshot: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     source_skill: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    tags: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
 
 
 class DocumentEdit(Base, IdMixin, TimestampMixin):
@@ -67,3 +68,22 @@ class WritingSample(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     source: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     word_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     style_signals: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
+
+class CoverLetterSnippet(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
+    """Reusable cover-letter snippet — opening hooks, bridges, closes, etc.
+
+    The user maintains a small library of voice-matched fragments they
+    like, and the tailor / Companion can pull a few in by kind/tag when
+    drafting cover letters so the model isn't inventing fresh openers
+    every time."""
+
+    __tablename__ = "cover_letter_snippets"
+
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    content_md: Mapped[str] = mapped_column(Text, nullable=False)
+    tags: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)

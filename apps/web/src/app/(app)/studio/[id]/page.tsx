@@ -143,6 +143,12 @@ export default function DocumentEditorPage({
   const [popup, setPopup] = useState<PopupState | null>(null);
   const [showDiff, setShowDiff] = useState(false);
   const [parentDoc, setParentDoc] = useState<GeneratedDocument | null>(null);
+  // List of sibling versions (same user × tracked_job × doc_type), used by
+  // the version picker so the user can compare ANY two versions, not just
+  // current vs parent. We exclude the current doc from the picker because
+  // diffing against itself is degenerate.
+  const [siblings, setSiblings] = useState<GeneratedDocument[]>([]);
+  const [compareLeftId, setCompareLeftId] = useState<number | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("preview");
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   // Data fetched lazily for the download-filename feature. We need:
@@ -206,12 +212,49 @@ export default function DocumentEditorPage({
     };
   }, [doc?.tracked_job_id]);
 
-  // Load the parent doc lazily when the user wants the diff view.
+  // When the diff panel opens, hydrate the full sibling-version list so
+  // the user can pick any version to compare against. We list documents
+  // filtered by tracked_job_id + doc_type — same combo the version chain
+  // uses on the API side. Default the left side to the parent version
+  // (so opening the panel matches the old "diff vs N-1" behavior).
   useEffect(() => {
-    if (!showDiff || !doc?.parent_version_id) return;
+    if (!showDiff || !doc) return;
+    let cancelled = false;
+    const params = new URLSearchParams({ doc_type: doc.doc_type });
+    if (doc.tracked_job_id != null) {
+      params.set("tracked_job_id", String(doc.tracked_job_id));
+    }
+    api
+      .get<GeneratedDocument[]>(`/api/v1/documents?${params.toString()}`)
+      .then((rows) => {
+        if (cancelled) return;
+        // Include only rows that share the same chain root — easiest
+        // approximation is doc_type + tracked_job_id, which is exactly
+        // what the backend versioning groups on. Sort by version desc.
+        const sorted = [...rows].sort((a, b) => b.version - a.version);
+        setSiblings(sorted);
+        if (compareLeftId == null) {
+          setCompareLeftId(doc.parent_version_id ?? null);
+        }
+      })
+      .catch(() => {
+        /* non-fatal */
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showDiff, doc?.id, doc?.doc_type, doc?.tracked_job_id]);
+
+  // Whenever the chosen "left" version changes, load that doc's content.
+  useEffect(() => {
+    if (!showDiff || compareLeftId == null) {
+      setParentDoc(null);
+      return;
+    }
     let cancelled = false;
     api
-      .get<GeneratedDocument>(`/api/v1/documents/${doc.parent_version_id}`)
+      .get<GeneratedDocument>(`/api/v1/documents/${compareLeftId}`)
       .then((p) => {
         if (!cancelled) setParentDoc(p);
       })
@@ -221,7 +264,7 @@ export default function DocumentEditorPage({
     return () => {
       cancelled = true;
     };
-  }, [showDiff, doc?.parent_version_id]);
+  }, [showDiff, compareLeftId]);
 
   async function load() {
     try {
@@ -472,13 +515,13 @@ export default function DocumentEditorPage({
               onCreated={(newId) => router.push(`/studio/${newId}`)}
             />
           ) : null}
-          {doc.parent_version_id ? (
+          {doc.parent_version_id || doc.version > 1 ? (
             <button
               className="jsp-btn-ghost text-xs"
               onClick={() => setShowDiff((v) => !v)}
-              title="Compare against the previous version"
+              title="Compare any two versions side-by-side"
             >
-              {showDiff ? "Hide diff" : `Diff vs v${doc.version - 1}`}
+              {showDiff ? "Hide diff" : "Compare versions"}
             </button>
           ) : null}
           <button
@@ -574,13 +617,56 @@ export default function DocumentEditorPage({
           {intentionalMistakes && intentionalMistakes.length > 0 ? (
             <IntentionalMistakesPanel mistakes={intentionalMistakes} />
           ) : null}
-          {showDiff && parentDoc ? (
-            <DiffPanel
-              previous={parentDoc.content_md ?? ""}
-              current={body}
-              previousVersion={parentDoc.version}
-              currentVersion={doc.version}
-            />
+          {showDiff ? (
+            <div className="jsp-card mt-3 p-3">
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="text-corp-muted uppercase tracking-wider text-[10px]">
+                  Compare
+                </span>
+                <select
+                  className="jsp-input w-auto text-xs py-1"
+                  value={compareLeftId ?? ""}
+                  onChange={(e) =>
+                    setCompareLeftId(
+                      e.target.value === "" ? null : Number(e.target.value),
+                    )
+                  }
+                  aria-label="Left side version"
+                >
+                  <option value="">— pick a version —</option>
+                  {siblings
+                    .filter((s) => s.id !== doc.id)
+                    .map((s) => (
+                      <option key={s.id} value={s.id}>
+                        v{s.version}
+                        {s.humanized ? " (humanized)" : ""}
+                        {" · "}
+                        {new Date(s.created_at).toLocaleDateString()}
+                        {s.title && s.title !== doc.title ? ` — ${s.title}` : ""}
+                      </option>
+                    ))}
+                </select>
+                <span className="text-corp-muted">vs</span>
+                <span className="text-corp-text">
+                  v{doc.version}
+                  <span className="text-corp-muted ml-1">(this doc)</span>
+                </span>
+              </div>
+              {parentDoc ? (
+                <DiffPanel
+                  previous={parentDoc.content_md ?? ""}
+                  current={body}
+                  previousVersion={parentDoc.version}
+                  currentVersion={doc.version}
+                />
+              ) : compareLeftId == null ? (
+                <p className="text-corp-muted text-xs mt-3">
+                  Pick a version above to see the diff.
+                </p>
+              ) : (
+                <p className="text-corp-muted text-xs mt-3">Loading…</p>
+              )}
+            </div>
           ) : null}
           {effectiveMode === "preview" ? (
             <div className="jsp-print-root mt-3">

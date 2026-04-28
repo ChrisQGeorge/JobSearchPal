@@ -22,7 +22,13 @@ export default function StudioPage() {
   const [err, setErr] = useState<string | null>(null);
   const [filterType, setFilterType] = useState<DocFilter>("all");
   const [filterJob, setFilterJob] = useState<number | "all">("all");
+  const [filterTag, setFilterTag] = useState<string | "all">("all");
   const [creating, setCreating] = useState(false);
+  // Multi-select state for batch humanize. Keyed by doc id; cleared on
+  // refresh so a stale set never lingers across loads.
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [batchRunning, setBatchRunning] = useState(false);
+  const [batchMsg, setBatchMsg] = useState<string | null>(null);
 
   async function refresh() {
     setLoading(true);
@@ -59,9 +65,10 @@ export default function StudioPage() {
       docs.filter((d) => {
         if (filterType !== "all" && d.doc_type !== filterType) return false;
         if (filterJob !== "all" && d.tracked_job_id !== filterJob) return false;
+        if (filterTag !== "all" && !(d.tags ?? []).includes(filterTag)) return false;
         return true;
       }),
-    [docs, filterType, filterJob],
+    [docs, filterType, filterJob, filterTag],
   );
 
   const countsByType = useMemo(() => {
@@ -69,6 +76,101 @@ export default function StudioPage() {
     for (const d of docs) map.set(d.doc_type, (map.get(d.doc_type) ?? 0) + 1);
     return map;
   }, [docs]);
+
+  const allTags = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const d of docs) {
+      for (const t of d.tags ?? []) {
+        counts.set(t, (counts.get(t) ?? 0) + 1);
+      }
+    }
+    return [...counts.entries()].sort((a, b) =>
+      b[1] - a[1] || a[0].localeCompare(b[0]),
+    );
+  }, [docs]);
+
+  async function setTags(id: number, tags: string[]) {
+    const updated = await api.put<GeneratedDocument>(
+      `/api/v1/documents/${id}`,
+      { tags },
+    );
+    setDocs((prev) => prev.map((d) => (d.id === id ? updated : d)));
+  }
+
+  function toggleSelected(id: number) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleSelectAllVisible() {
+    setSelectedIds((prev) => {
+      const visibleIds = filtered.map((d) => d.id);
+      const allSelected = visibleIds.every((id) => prev.has(id));
+      const next = new Set(prev);
+      if (allSelected) {
+        for (const id of visibleIds) next.delete(id);
+      } else {
+        for (const id of visibleIds) next.add(id);
+      }
+      return next;
+    });
+  }
+
+  // Skip rows that aren't humanizable: uploads with no extracted text, or
+  // already-humanized versions (humanize is idempotent-ish, but the user
+  // probably means "the ones that aren't done yet"). Show a warning if the
+  // selection has skip-eligible rows so the user can adjust if they meant
+  // those too.
+  async function batchHumanize() {
+    const targets = filtered.filter(
+      (d) =>
+        selectedIds.has(d.id) &&
+        !!d.content_md &&
+        d.content_md.trim().length > 0 &&
+        !d.humanized,
+    );
+    const skipped =
+      [...selectedIds].length - targets.length;
+    if (targets.length === 0) {
+      setBatchMsg(
+        skipped > 0
+          ? "Nothing to humanize — all selected rows are uploads with no text or already humanized."
+          : "Nothing selected.",
+      );
+      return;
+    }
+    setBatchRunning(true);
+    setBatchMsg(null);
+    try {
+      const results = await Promise.allSettled(
+        targets.map((d) =>
+          api.post<GeneratedDocument>(`/api/v1/documents/${d.id}/humanize`, {}),
+        ),
+      );
+      const ok = results.filter((r) => r.status === "fulfilled").length;
+      const fail = results.length - ok;
+      const skipNote = skipped > 0 ? `, skipped ${skipped}` : "";
+      setBatchMsg(
+        fail > 0
+          ? `Queued ${ok} of ${results.length} (${fail} failed)${skipNote}. Check Studio in a moment.`
+          : `Queued ${ok} humanize task${ok === 1 ? "" : "s"}${skipNote}. They'll appear here as new versions when done.`,
+      );
+      setSelectedIds(new Set());
+      await refresh();
+    } catch (e) {
+      setBatchMsg(
+        e instanceof ApiError
+          ? `Batch humanize failed (HTTP ${e.status}).`
+          : "Batch humanize failed.",
+      );
+    } finally {
+      setBatchRunning(false);
+    }
+  }
 
   async function removeDoc(id: number) {
     if (!confirm("Delete this document?")) return;
@@ -147,7 +249,68 @@ export default function StudioPage() {
             </select>
           </div>
         </div>
+        {allTags.length > 0 ? (
+          <div className="mt-3">
+            <label className="jsp-label">Filter by tag</label>
+            <div className="flex flex-wrap gap-1.5">
+              <button
+                type="button"
+                onClick={() => setFilterTag("all")}
+                className={`px-2 py-0.5 rounded-md text-[10px] uppercase tracking-wider border ${
+                  filterTag === "all"
+                    ? "bg-corp-accent/25 text-corp-accent border-corp-accent/40"
+                    : "bg-corp-surface2 text-corp-muted border-corp-border hover:text-corp-text"
+                }`}
+              >
+                All
+              </button>
+              {allTags.map(([tag, n]) => (
+                <button
+                  key={tag}
+                  type="button"
+                  onClick={() => setFilterTag(filterTag === tag ? "all" : tag)}
+                  className={`px-2 py-0.5 rounded-md text-[10px] uppercase tracking-wider border ${
+                    filterTag === tag
+                      ? "bg-corp-accent/25 text-corp-accent border-corp-accent/40"
+                      : "bg-corp-surface2 text-corp-muted border-corp-border hover:text-corp-text"
+                  }`}
+                >
+                  #{tag}
+                  <span className="ml-1 opacity-60">{n}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
       </div>
+
+      {selectedIds.size > 0 ? (
+        <div className="jsp-card p-3 mt-3 flex flex-wrap gap-2 items-center">
+          <span className="text-xs text-corp-muted">
+            {selectedIds.size} selected
+          </span>
+          <button
+            type="button"
+            className="jsp-btn-primary text-xs"
+            onClick={batchHumanize}
+            disabled={batchRunning}
+            title="Run humanize against every selected doc that has text and isn't already humanized"
+          >
+            {batchRunning ? "Queuing…" : "Humanize all"}
+          </button>
+          <button
+            type="button"
+            className="jsp-btn-ghost text-xs"
+            onClick={() => setSelectedIds(new Set())}
+            disabled={batchRunning}
+          >
+            Clear
+          </button>
+          {batchMsg ? (
+            <span className="text-[11px] text-corp-muted ml-2">{batchMsg}</span>
+          ) : null}
+        </div>
+      ) : null}
 
       {loading ? (
         <p className="text-corp-muted mt-4">Loading...</p>
@@ -167,6 +330,27 @@ export default function StudioPage() {
         </div>
       ) : (
         <ul className="jsp-card divide-y divide-corp-border mt-4">
+          <li className="flex items-center gap-3 py-2 px-4 bg-corp-surface2 text-[10px] uppercase tracking-wider text-corp-muted">
+            <input
+              type="checkbox"
+              className="accent-corp-accent"
+              aria-label="Select all visible documents"
+              checked={
+                filtered.length > 0 &&
+                filtered.every((d) => selectedIds.has(d.id))
+              }
+              ref={(el) => {
+                if (el) {
+                  const count = filtered.filter((d) =>
+                    selectedIds.has(d.id),
+                  ).length;
+                  el.indeterminate = count > 0 && count < filtered.length;
+                }
+              }}
+              onChange={toggleSelectAllVisible}
+            />
+            <span>Select</span>
+          </li>
           {filtered.map((d) => (
             <StudioListRow
               key={d.id}
@@ -175,6 +359,10 @@ export default function StudioPage() {
                 d.tracked_job_id ? jobById.get(d.tracked_job_id) ?? null : null
               }
               onDelete={() => removeDoc(d.id)}
+              onTagsChange={(next) => setTags(d.id, next)}
+              onTagClick={(t) => setFilterTag(filterTag === t ? "all" : t)}
+              selected={selectedIds.has(d.id)}
+              onToggleSelected={() => toggleSelected(d.id)}
             />
           ))}
         </ul>
@@ -187,11 +375,43 @@ function StudioListRow({
   doc,
   job,
   onDelete,
+  onTagsChange,
+  onTagClick,
+  selected,
+  onToggleSelected,
 }: {
   doc: GeneratedDocument;
   job: TrackedJobSummary | null;
   onDelete: () => void;
+  onTagsChange: (next: string[]) => void | Promise<void>;
+  onTagClick: (tag: string) => void;
+  selected: boolean;
+  onToggleSelected: () => void;
 }) {
+  const [adding, setAdding] = useState(false);
+  const [draft, setDraft] = useState("");
+
+  async function commitAdd() {
+    const t = draft.trim().toLowerCase();
+    setAdding(false);
+    setDraft("");
+    if (!t) return;
+    const next = [...new Set([...(doc.tags ?? []), t])];
+    try {
+      await onTagsChange(next);
+    } catch {
+      /* non-fatal */
+    }
+  }
+
+  async function removeTag(t: string) {
+    try {
+      await onTagsChange((doc.tags ?? []).filter((x) => x !== t));
+    } catch {
+      /* non-fatal */
+    }
+  }
+
   const structured = (doc.content_structured ?? null) as
     | {
         original_filename?: string | null;
@@ -227,7 +447,16 @@ function StudioListRow({
     .join(" · ");
 
   return (
-    <li className="flex items-center gap-3 py-2 px-4">
+    <li
+      className={`flex items-center gap-3 py-2 px-4 ${selected ? "bg-corp-accent/10" : ""}`}
+    >
+      <input
+        type="checkbox"
+        className="accent-corp-accent shrink-0"
+        checked={selected}
+        onChange={onToggleSelected}
+        aria-label={`Select ${doc.title}`}
+      />
       <span className="inline-block px-2 py-0.5 rounded text-[10px] uppercase tracking-wider bg-corp-surface2 text-corp-muted border border-corp-border shrink-0">
         {doc.doc_type.replace(/_/g, " ")}
       </span>
@@ -242,6 +471,60 @@ function StudioListRow({
           {doc.title}
         </a>
         <div className="text-[11px] text-corp-muted truncate">{subline}</div>
+        <div className="flex flex-wrap gap-1 mt-1 items-center">
+          {(doc.tags ?? []).map((t) => (
+            <span
+              key={t}
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider border bg-corp-surface2 text-corp-muted border-corp-border"
+            >
+              <button
+                type="button"
+                onClick={() => onTagClick(t)}
+                className="hover:text-corp-accent"
+                title={`Filter by #${t}`}
+              >
+                #{t}
+              </button>
+              <button
+                type="button"
+                onClick={() => removeTag(t)}
+                className="opacity-50 hover:opacity-100 hover:text-corp-danger"
+                title="Remove tag"
+                aria-label={`Remove tag ${t}`}
+              >
+                ×
+              </button>
+            </span>
+          ))}
+          {adding ? (
+            <input
+              autoFocus
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onBlur={commitAdd}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  commitAdd();
+                } else if (e.key === "Escape") {
+                  setAdding(false);
+                  setDraft("");
+                }
+              }}
+              placeholder="tag"
+              className="text-[10px] px-1.5 py-0.5 bg-corp-surface2 border border-corp-border rounded uppercase tracking-wider text-corp-text outline-none focus:border-corp-accent w-20"
+            />
+          ) : (
+            <button
+              type="button"
+              onClick={() => setAdding(true)}
+              className="text-[10px] px-1.5 py-0.5 rounded border border-dashed border-corp-border text-corp-muted hover:text-corp-accent hover:border-corp-accent uppercase tracking-wider"
+              title="Add tag"
+            >
+              + tag
+            </button>
+          )}
+        </div>
       </div>
       <div className="flex gap-1.5 shrink-0">
         <a className="jsp-btn-ghost text-xs" href={editorHref}>

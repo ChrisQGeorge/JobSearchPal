@@ -105,6 +105,7 @@ class GeneratedDocumentOut(BaseModel):
     model_used: Optional[str] = None
     persona_id: Optional[int] = None
     source_skill: Optional[str] = None
+    tags: Optional[list[str]] = None
     created_at: datetime
     updated_at: datetime
 
@@ -276,6 +277,7 @@ async def get_document(
 class GeneratedDocumentUpdate(BaseModel):
     title: Optional[str] = Field(default=None, max_length=255)
     content_md: Optional[str] = None
+    tags: Optional[list[str]] = None
 
 
 @router.put("/{doc_id:int}", response_model=GeneratedDocumentOut)
@@ -286,7 +288,20 @@ async def update_document(
     user: User = Depends(get_current_user),
 ) -> GeneratedDocument:
     doc = await _get_owned_document(db, doc_id, user.id)
-    for k, v in payload.model_dump(exclude_unset=True).items():
+    data = payload.model_dump(exclude_unset=True)
+    if "tags" in data and data["tags"] is not None:
+        # Normalize: strip, lowercase, dedupe, drop empties. Keeps the list
+        # tidy and the tag-filter pills meaningful.
+        seen: set[str] = set()
+        cleaned: list[str] = []
+        for raw in data["tags"]:
+            t = str(raw).strip().lower()
+            if not t or t in seen:
+                continue
+            seen.add(t)
+            cleaned.append(t[:64])
+        data["tags"] = cleaned
+    for k, v in data.items():
         setattr(doc, k, v)
     await db.commit()
     await db.refresh(doc)

@@ -15,6 +15,56 @@ html, body {
 
 a { color: inherit; text-decoration: none; }
 
+/* Visible keyboard-focus ring for everything that doesn't already define
+   one. Avoids the trap where Tab-navigation goes invisible because a
+   custom focus style elsewhere overrode the browser default to nothing. */
+:focus-visible {
+  outline: 2px solid #c89b3c;
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+/* Inputs / textareas already have an accent border on :focus — suppress
+   the outline-offset glow so we don't double-up. */
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: none;
+}
+
+/* Skip-to-content: visually hidden until focused. Pressing Tab as the
+   first action on any page reveals this and jumps past the sidebar. */
+.jsp-skip-link {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 100;
+  background: #c89b3c;
+  color: #1b1b1b;
+  padding: 0.5rem 1rem;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  border-radius: 0 0 4px 0;
+  transform: translateY(-100%);
+  transition: transform 0.15s ease;
+}
+.jsp-skip-link:focus,
+.jsp-skip-link:focus-visible {
+  transform: translateY(0);
+}
+
+/* kbd elements inline in tooltips — give them a subtle keycap look. */
+kbd {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+  padding: 0 0.3em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+  line-height: 1.4;
+}
+
 .jsp-card {
   @apply bg-corp-surface border border-corp-border rounded-lg;
 }
@@ -119,6 +169,14 @@ a { color: inherit; text-decoration: none; }
 
 /* When printing, hide chrome and let the document fill the page. */
 @media print {
+  /* Standard letter page with consistent .5in margins. The browser's
+     "Print to PDF" + "Save as PDF" dialog uses these unless the user
+     overrides them. Helps cover letters / resumes export with predictable
+     margins instead of whatever the print dialog defaults to. */
+  @page {
+    size: letter;
+    margin: 0.5in;
+  }
   body { background: #ffffff !important; }
   body * { visibility: hidden !important; }
   .jsp-print-root, .jsp-print-root * { visibility: visible !important; }
@@ -135,7 +193,50 @@ a { color: inherit; text-decoration: none; }
     border-radius: 0 !important;
     max-width: none !important;
     margin: 0 !important;
-    padding: 0.6in 0.7in !important;
+    /* Page padding is supplied by @page { margin } above; keep the
+       in-flow document padding minimal so we don't double-margin. */
+    padding: 0 !important;
   }
   .jsp-no-print { display: none !important; }
+
+  /* Page-break hygiene — without these, the browser will happily split a
+     heading from its first paragraph or a single bullet from its list. */
+  .jsp-document h1,
+  .jsp-document h2,
+  .jsp-document h3 {
+    page-break-after: avoid;
+    break-after: avoid;
+  }
+  /* Keep a heading attached to the block right after it (the first job
+     entry under a section title, the job title under a company header). */
+  .jsp-document h2 + *,
+  .jsp-document h3 + *,
+  .jsp-document h1 + * {
+    page-break-before: avoid;
+    break-before: avoid;
+  }
+  /* Don't split a single bullet across two pages. */
+  .jsp-document li,
+  .jsp-document blockquote,
+  .jsp-document table,
+  .jsp-document tr {
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
+  /* Avoid orphan/widow lines in long paragraphs. */
+  .jsp-document p {
+    orphans: 3;
+    widows: 3;
+  }
+  /* Explicit page break helper — author can drop <hr class="jsp-page-break" />
+     into the markdown when they want to force a break (e.g. between a
+     resume's main page and an addendum). */
+  .jsp-document .jsp-page-break {
+    page-break-before: always;
+    break-before: page;
+    border: 0 !important;
+    visibility: hidden !important;
+    height: 0 !important;
+    margin: 0 !important;
+  }
 }
