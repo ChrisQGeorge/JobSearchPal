@@ -15,6 +15,15 @@ type MissingSkill = {
   job_ids: number[];
 };
 
+// A pair of skills that frequently co-occurs in JDs the user has engaged
+// with. Comes from `GET /history/skills/stacks`. Surfaced as
+// "stacks worth learning together" in the gap-audit panel.
+type SkillStack = {
+  skills: string[];
+  job_count: number;
+  job_ids: number[];
+};
+
 // -- Duplicate-detection helpers ---------------------------------------------
 // Two catalog skills are "likely duplicates" when their names normalize to
 // the same alphanumeric key. Catches case variants ("React"/"react"),
@@ -97,6 +106,14 @@ const LINK_ROUTES: Record<string, (id: number) => string> = {
 export function SkillsPanel() {
   const [items, setItems] = useState<Skill[]>([]);
   const [missing, setMissing] = useState<MissingSkill[]>([]);
+  const [stacks, setStacks] = useState<SkillStack[]>([]);
+  // When true, the "missing" list scopes to jobs the user actually
+  // engaged with (applied / interested / interview pipeline). Off by
+  // default to preserve the prior "every tracked JD" behavior.
+  const [auditAppliedOnly, setAuditAppliedOnly] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    return window.localStorage.getItem("jsp:skills:audit_applied_only") === "1";
+  });
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [query, setQuery] = useState("");
@@ -116,14 +133,21 @@ export function SkillsPanel() {
   async function refresh() {
     setLoading(true);
     try {
-      const [skillData, missingData] = await Promise.all([
+      const missingUrl = auditAppliedOnly
+        ? "/api/v1/history/skills/missing-from-jobs?status_in=applied,interested,phone_screen,take_home,onsite,final_round,offer"
+        : "/api/v1/history/skills/missing-from-jobs";
+      const [skillData, missingData, stackData] = await Promise.all([
         api.get<Skill[]>("/api/v1/history/skills"),
         api
-          .get<MissingSkill[]>("/api/v1/history/skills/missing-from-jobs")
+          .get<MissingSkill[]>(missingUrl)
           .catch(() => [] as MissingSkill[]),
+        api
+          .get<SkillStack[]>("/api/v1/history/skills/stacks?min_count=2&limit=12")
+          .catch(() => [] as SkillStack[]),
       ]);
       setItems(skillData);
       setMissing(missingData);
+      setStacks(stackData);
       setErr(null);
     } catch (e) {
       setErr(e instanceof ApiError ? `HTTP ${e.status}` : "Load failed.");
@@ -134,7 +158,20 @@ export function SkillsPanel() {
 
   useEffect(() => {
     refresh();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [auditAppliedOnly]);
+
+  function toggleAuditAppliedOnly(next: boolean) {
+    setAuditAppliedOnly(next);
+    try {
+      window.localStorage.setItem(
+        "jsp:skills:audit_applied_only",
+        next ? "1" : "0",
+      );
+    } catch {
+      /* SSR / storage blocked — non-fatal */
+    }
+  }
 
   async function remove(id: number) {
     if (!confirm("Delete this skill?")) return;
@@ -315,6 +352,8 @@ export function SkillsPanel() {
       />
       <MissingSection
         missing={missing}
+        appliedOnly={auditAppliedOnly}
+        onToggleAppliedOnly={toggleAuditAppliedOnly}
         onQuickAdd={async (name) => {
           try {
             await api.post("/api/v1/history/skills", {
@@ -327,6 +366,20 @@ export function SkillsPanel() {
           }
         }}
         onOpenGroup={(picks) => setGroupMissing(picks)}
+      />
+      <StacksSection
+        stacks={stacks}
+        onQuickAdd={async (name) => {
+          try {
+            await api.post("/api/v1/history/skills", {
+              name,
+              category: "technical",
+            });
+            await refresh();
+          } catch {
+            /* silent */
+          }
+        }}
       />
 
       {creating ? (
@@ -1270,6 +1323,72 @@ function DupeSection({
   );
 }
 
+/** Skill-stack suggestions — pairs of skills that frequently co-occur in
+ * JDs the user has actually engaged with. Useful as a "what stacks are
+ * worth learning together?" pointer instead of picking individual skills
+ * out of the missing-from-jobs list. Hidden when fewer than 2 stacks
+ * are surfaced (a stack of 1 isn't a stack). */
+function StacksSection({
+  stacks,
+  onQuickAdd,
+}: {
+  stacks: SkillStack[];
+  onQuickAdd: (name: string) => Promise<void>;
+}) {
+  const [open, setOpen] = useState<boolean>(stacks.length > 0);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  if (stacks.length === 0) return null;
+  return (
+    <div className="jsp-card p-4">
+      <CollapseHeader
+        open={open}
+        onToggle={() => setOpen((v) => !v)}
+        title="Skill stacks worth learning together"
+        subtitle="Pairs of skills that frequently appear together in JDs you've engaged with — applied / interested / interview-stage. Higher count = stronger signal that learning the stack pays off."
+        count={stacks.length}
+        tone="accent"
+      />
+      {open ? (
+        <ul className="mt-3 flex flex-wrap gap-1.5">
+          {stacks.map((s) => {
+            const key = s.skills.join("+");
+            return (
+              <li
+                key={key}
+                className="inline-flex items-center gap-1 border border-corp-accent/40 text-corp-accent bg-corp-accent/10 rounded px-2 py-0.5 text-xs"
+                title={`Co-occurs in ${s.job_count} job${s.job_count === 1 ? "" : "s"}`}
+              >
+                <span className="font-medium">{s.skills.join(" + ")}</span>
+                <span className="text-[10px] opacity-80">×{s.job_count}</span>
+                {s.skills.map((name) => (
+                  <button
+                    key={`${key}:${name}`}
+                    type="button"
+                    onClick={async () => {
+                      setBusy(`${key}:${name}`);
+                      try {
+                        await onQuickAdd(name);
+                      } finally {
+                        setBusy(null);
+                      }
+                    }}
+                    disabled={busy !== null}
+                    className="bg-corp-accent/25 hover:bg-corp-accent/50 rounded px-1 text-[10px] uppercase tracking-wider"
+                    title={`Add "${name}" to your skills catalog`}
+                  >
+                    {busy === `${key}:${name}` ? "…" : `+${name}`}
+                  </button>
+                ))}
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
 // Skills the user's tracked jobs ask for but aren't in the catalog. Big
 // list sorted by job_count desc. Each row shows the name, the count
 // (N jobs), and the req/nice breakdown. Two actions: "+ Add" to create
@@ -1277,10 +1396,14 @@ function DupeSection({
 // one canonical skill with the selected names as aliases.
 function MissingSection({
   missing,
+  appliedOnly,
+  onToggleAppliedOnly,
   onQuickAdd,
   onOpenGroup,
 }: {
   missing: MissingSkill[];
+  appliedOnly: boolean;
+  onToggleAppliedOnly: (next: boolean) => void;
   onQuickAdd: (name: string) => Promise<void>;
   onOpenGroup: (picks: MissingSkill[]) => void;
 }) {
@@ -1311,14 +1434,23 @@ function MissingSection({
     [missing, picked],
   );
 
-  if (missing.length === 0) return null;
+  // We always render the section so the user can toggle scope even when
+  // the current scope is empty. The header label changes based on scope.
   return (
     <div className="jsp-card p-4">
       <CollapseHeader
         open={open}
         onToggle={() => setOpen((v) => !v)}
-        title="Missing from tracked jobs"
-        subtitle="Skills your tracked jobs mention that you don't have in your catalog yet. Highest job count first — these are the resume gaps the Companion can't match."
+        title={
+          appliedOnly
+            ? "Missing from jobs I engaged with"
+            : "Missing from tracked jobs"
+        }
+        subtitle={
+          appliedOnly
+            ? "Scoped to jobs at applied/interested/interview stages — your highest-signal gap audit. The Companion can't match these on a resume."
+            : "Skills your tracked jobs mention that you don't have in your catalog yet. Highest job count first — these are the resume gaps the Companion can't match."
+        }
         count={missing.length}
         tone="accent"
       />
@@ -1334,6 +1466,15 @@ function MissingSection({
                 onChange={(e) => setQuery(e.target.value)}
               />
             </div>
+            <label className="text-xs flex items-center gap-1.5 text-corp-muted">
+              <input
+                type="checkbox"
+                className="accent-corp-accent"
+                checked={appliedOnly}
+                onChange={(e) => onToggleAppliedOnly(e.target.checked)}
+              />
+              Applied / interview only
+            </label>
             <button
               type="button"
               className="jsp-btn-ghost text-xs"

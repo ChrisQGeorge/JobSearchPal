@@ -9,7 +9,7 @@
 from datetime import date, datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -407,6 +407,14 @@ class MissingSkillOut(BaseModel):
 
 @router.get("/skills/missing-from-jobs", response_model=list[MissingSkillOut])
 async def skills_missing_from_jobs(
+    status_in: Optional[str] = Query(
+        default=None,
+        description=(
+            "Comma-separated tracked-job statuses to include. When set, the "
+            "audit scopes to those jobs only (e.g. status_in=applied,interested "
+            "answers 'what's missing from the JDs I actually engaged with')."
+        ),
+    ),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> list[MissingSkillOut]:
@@ -435,19 +443,24 @@ async def skills_missing_from_jobs(
             if a and a.strip():
                 known.add(str(a).lower().strip())
 
-    # Pull tracked jobs' JD skill lists.
-    tj_rows = (
-        await db.execute(
-            select(
-                _TJ.id,
-                _TJ.required_skills,
-                _TJ.nice_to_have_skills,
-            ).where(
-                _TJ.user_id == user.id,
-                _TJ.deleted_at.is_(None),
-            )
-        )
-    ).all()
+    # Pull tracked jobs' JD skill lists, optionally scoped by status.
+    tj_stmt = select(
+        _TJ.id,
+        _TJ.required_skills,
+        _TJ.nice_to_have_skills,
+    ).where(
+        _TJ.user_id == user.id,
+        _TJ.deleted_at.is_(None),
+    )
+    if status_in:
+        wanted = {
+            s.strip().lower()
+            for s in status_in.split(",")
+            if s.strip()
+        }
+        if wanted:
+            tj_stmt = tj_stmt.where(_TJ.status.in_(wanted))
+    tj_rows = (await db.execute(tj_stmt)).all()
 
     # Aggregate. Key is the lowercased name so "React" and "react" collapse;
     # we keep the most common-cased version as the display name.
@@ -505,6 +518,83 @@ async def skills_missing_from_jobs(
     ]
     out.sort(key=lambda m: (-m.job_count, m.name.lower()))
     return out
+
+
+class SkillStackOut(BaseModel):
+    """A pair of skills that frequently co-occur in JDs the user has
+    engaged with — e.g. ("react", "typescript"). The frontend uses this
+    to suggest "stacks worth learning together" rather than rote
+    individual skills."""
+
+    skills: list[str]
+    job_count: int
+    job_ids: list[int]
+
+
+@router.get("/skills/stacks", response_model=list[SkillStackOut])
+async def skill_stacks(
+    status_in: Optional[str] = Query(
+        default="applied,interested,offer,onsite,phone_screen,take_home,final_round",
+        description=(
+            "Comma-separated tracked-job statuses to include. Default scopes "
+            "to jobs the user actually engaged with so 'stacks' are based on "
+            "real applied roles, not every random listing they cached."
+        ),
+    ),
+    min_count: int = Query(default=2, ge=2, le=20),
+    limit: int = Query(default=20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[SkillStackOut]:
+    """Mine pairs of skills that co-occur in JDs the user engaged with.
+
+    Returns the top N pairs by co-occurrence count. Useful as a "what
+    stacks should I focus on?" suggestion: if `react` + `typescript` show
+    up in 12 of your applied jobs, learning them together is a higher-ROI
+    investment than picking one at random."""
+    from itertools import combinations
+
+    from app.models.jobs import TrackedJob as _TJ
+
+    tj_stmt = select(_TJ.id, _TJ.required_skills, _TJ.nice_to_have_skills).where(
+        _TJ.user_id == user.id,
+        _TJ.deleted_at.is_(None),
+    )
+    if status_in:
+        wanted = {s.strip().lower() for s in status_in.split(",") if s.strip()}
+        if wanted:
+            tj_stmt = tj_stmt.where(_TJ.status.in_(wanted))
+    rows = (await db.execute(tj_stmt)).all()
+
+    pair_counts: dict[tuple[str, str], list[int]] = {}
+    for job_id, req_list, nice_list in rows:
+        skills_in_job: set[str] = set()
+        for raw in (req_list or []) + (nice_list or []):
+            s = str(raw).strip().lower()
+            if s:
+                skills_in_job.add(s)
+        if len(skills_in_job) < 2:
+            continue
+        # itertools.combinations needs a deterministic order so the same
+        # pair always hashes to the same tuple regardless of iteration.
+        sorted_skills = sorted(skills_in_job)
+        for a, b in combinations(sorted_skills, 2):
+            key = (a, b)
+            pair_counts.setdefault(key, []).append(job_id)
+
+    out: list[SkillStackOut] = []
+    for (a, b), job_ids in pair_counts.items():
+        if len(job_ids) < min_count:
+            continue
+        out.append(
+            SkillStackOut(
+                skills=[a, b],
+                job_count=len(job_ids),
+                job_ids=job_ids[:10],
+            )
+        )
+    out.sort(key=lambda s: (-s.job_count, s.skills))
+    return out[:limit]
 
 
 class BulkUpdateSkillsIn(BaseModel):
