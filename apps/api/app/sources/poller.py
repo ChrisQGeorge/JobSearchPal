@@ -185,7 +185,12 @@ async def _expire_old_leads(db: AsyncSession) -> int:
 
 async def _due_sources(db: AsyncSession) -> list[JobSource]:
     """Sources that should be polled this tick: enabled, not soft-deleted,
-    and either never polled or polled longer ago than their interval."""
+    and either never polled or polled longer ago than their interval.
+
+    MySQL DATETIME columns deserialize as naive datetimes via SQLAlchemy
+    even when we wrote tz-aware ones in. We normalize to UTC before
+    comparing against `now` (which is tz-aware) so the subtraction
+    doesn't raise."""
     now = _now()
     rows = (
         await db.execute(
@@ -200,8 +205,11 @@ async def _due_sources(db: AsyncSession) -> list[JobSource]:
         if s.last_polled_at is None:
             due.append(s)
             continue
+        last_polled = s.last_polled_at
+        if last_polled.tzinfo is None:
+            last_polled = last_polled.replace(tzinfo=timezone.utc)
         cutoff = now - timedelta(hours=max(1, s.poll_interval_hours))
-        if s.last_polled_at < cutoff:
+        if last_polled < cutoff:
             due.append(s)
     return due
 
