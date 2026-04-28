@@ -101,21 +101,12 @@ KIND_EXAMPLES: dict[str, list[dict[str, str]]] = {
             "label": "WeWorkRemotely (programming)",
             "value": "https://weworkremotely.com/categories/remote-programming-jobs.rss",
         },
-        {
-            "label": "Stack Overflow Jobs (defunct — example only)",
-            "value": "https://stackoverflow.com/jobs/feed",
-        },
     ],
-    "yc": [
-        {
-            "label": "All YC engineering jobs",
-            "value": "https://www.workatastartup.com/companies/feed.atom?role=engineering",
-        },
-        {
-            "label": "All YC remote jobs",
-            "value": "https://www.workatastartup.com/companies/feed.atom?remote=true",
-        },
-    ],
+    # YC's older /companies/feed.atom URLs returned 404 in testing; until
+    # we verify a current YC feed URL, leave the chips empty so users
+    # don't paste something that 404s. The `yc` kind itself still works
+    # — paste any verified YC RSS / Atom URL by hand.
+    "yc": [],
 }
 
 

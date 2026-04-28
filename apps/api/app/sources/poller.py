@@ -128,6 +128,23 @@ async def poll_source(db: AsyncSession, source: JobSource) -> tuple[int, Optiona
 
     now = _now()
     expires = now + timedelta(hours=max(1, source.lead_ttl_hours))
+
+    # Pre-fetch every external_id we already have for this source. Used to
+    # dedupe in-Python so we never hit the unique constraint and have to
+    # roll back mid-poll. Earlier versions caught IntegrityError per
+    # insert and tried to recover by rolling back the session, which left
+    # the async pool in a bad state and exploded with MissingGreenlet on
+    # the next access.
+    existing_ext = set(
+        (
+            await db.execute(
+                select(JobLead.external_id).where(
+                    JobLead.source_id == source.id,
+                )
+            )
+        ).scalars().all()
+    )
+
     inserted = 0
     for raw in raw_leads:
         if not _matches_filters(raw, source.filters):
@@ -136,35 +153,47 @@ async def poll_source(db: AsyncSession, source: JobSource) -> tuple[int, Optiona
         title = (raw.get("title") or "").strip()
         if not ext_id or not title:
             continue
-        lead = JobLead(
-            user_id=source.user_id,
-            source_id=source.id,
-            external_id=ext_id[:255],
-            title=title[:500],
-            organization_name=(raw.get("organization_name") or None),
-            location=(raw.get("location") or None),
-            remote_policy=(raw.get("remote_policy") or None),
-            source_url=(raw.get("source_url") or None),
-            description_md=raw.get("description_md") or None,
-            posted_at=raw.get("posted_at"),
-            first_seen_at=now,
-            expires_at=expires,
-            state="new",
-            raw_payload=raw.get("raw"),
+        ext_id = ext_id[:255]
+        if ext_id in existing_ext:
+            continue
+        existing_ext.add(ext_id)
+        db.add(
+            JobLead(
+                user_id=source.user_id,
+                source_id=source.id,
+                external_id=ext_id,
+                title=title[:500],
+                organization_name=(raw.get("organization_name") or None),
+                location=(raw.get("location") or None),
+                remote_policy=(raw.get("remote_policy") or None),
+                source_url=(raw.get("source_url") or None),
+                description_md=raw.get("description_md") or None,
+                posted_at=raw.get("posted_at"),
+                first_seen_at=now,
+                expires_at=expires,
+                state="new",
+                raw_payload=raw.get("raw"),
+            )
         )
-        db.add(lead)
+        inserted += 1
+
+    # Flush once so any unrelated FK / type errors surface here while we
+    # still have a clean session (and the caller's commit can proceed).
+    if inserted:
         try:
-            # Flush so the unique-constraint violation surfaces NOW, per
-            # row, instead of poisoning the whole transaction.
             await db.flush()
-            inserted += 1
-        except IntegrityError:
-            # Duplicate — already saw this posting on a previous poll.
+        except IntegrityError as exc:
+            # Two concurrent polls can race — pre-fetch said "no row"
+            # but the other tick committed before our flush. Rolling
+            # back drops everything; the next tick will pick the rest
+            # up so we just bail out gracefully.
             await db.rollback()
-            # We need to re-attach `source` because rollback expires it.
-            source = await db.get(JobSource, source.id)
-            if source is None:
-                return inserted, None
+            log.info(
+                "source %s/%s flush hit a race; deferring to next tick",
+                source.kind,
+                source.slug_or_url,
+            )
+            return 0, str(exc)
 
     source.last_polled_at = now
     source.last_lead_count = inserted

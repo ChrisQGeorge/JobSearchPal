@@ -104,25 +104,24 @@ DEFAULT_SEEDS: list[dict] = [
         "lead_ttl_hours": 168,
     },
     {
-        "kind": "yc",
-        "slug_or_url": "https://www.workatastartup.com/companies/feed.atom?role=engineering",
-        "label": "Y Combinator — engineering, remote-only",
-        # YC's feed mixes posting and re-postings; remote_only tightens
-        # the firehose down a lot.
+        "kind": "rss",
+        "slug_or_url": "https://weworkremotely.com/categories/remote-programming-jobs.rss",
+        "label": "We Work Remotely — programming, senior+",
         "filters": {
-            "remote_only": True,
-            "title_exclude": r"(?i)\b(intern|sales|founding designer)\b",
+            # Quick way to filter to senior+ specifically.
+            "title_include": r"(?i)\b(senior|staff|principal|lead)\b",
         },
-        "poll_interval_hours": 24,
+        "poll_interval_hours": 12,
         "lead_ttl_hours": 168,
     },
     {
         "kind": "rss",
-        "slug_or_url": "https://weworkremotely.com/categories/remote-programming-jobs.rss",
-        "label": "We Work Remotely — programming feed",
+        "slug_or_url": "https://remoteok.com/remote-jobs.rss",
+        "label": "RemoteOK — backend / fullstack",
         "filters": {
-            # Quick way to filter to senior+ specifically.
-            "title_include": r"(?i)\b(senior|staff|principal|lead)\b",
+            # Multi-keyword OR with word boundaries.
+            "title_include": r"(?i)\b(backend|full[\s-]?stack|software engineer|sre|infrastructure)\b",
+            "title_exclude": r"(?i)\b(intern|junior|sales|marketing|recruiter)\b",
         },
         "poll_interval_hours": 12,
         "lead_ttl_hours": 168,
