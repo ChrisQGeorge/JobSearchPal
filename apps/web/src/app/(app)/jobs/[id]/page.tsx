@@ -437,6 +437,56 @@ function ReviewAction({
     }
   }
 
+  function prevTarget(): string {
+    if (ids.length === 0) return "/jobs/review";
+    const idx = ids.indexOf(jobId);
+    if (idx > 0) return `/jobs/${ids[idx - 1]}?from=review`;
+    return `/jobs/${ids[ids.length - 1]}?from=review`;
+  }
+
+  // Keyboard shortcuts on the review-flow detail page:
+  //   1 = interested, 2 = not_interested, 3 = skip (status=reviewed)
+  //   j = next, k = previous
+  // Only active when the user arrived via /jobs/review, the row is still
+  // to_review (for 1/2/3), and focus isn't in an input. j/k always work
+  // in the review flow regardless of status so the user can scroll past
+  // already-triaged rows without losing their place.
+  useEffect(() => {
+    if (!inReviewFlow) return;
+    function isTextish(el: EventTarget | null): boolean {
+      if (!(el instanceof HTMLElement)) return false;
+      const tag = el.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+      if (el.isContentEditable) return true;
+      return false;
+    }
+    function onKey(e: KeyboardEvent) {
+      if (isTextish(e.target)) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === "1" && status === "to_review" && busy === null) {
+        e.preventDefault();
+        void triage("interested", "interested");
+      } else if (e.key === "2" && status === "to_review" && busy === null) {
+        e.preventDefault();
+        void triage("not_interested", "not_interested");
+      } else if (e.key === "3" && status === "to_review" && busy === null) {
+        e.preventDefault();
+        void triage("reviewed", "skip");
+      } else if (e.key === "j") {
+        if (ids.length === 0) return;
+        e.preventDefault();
+        router.push(nextTarget());
+      } else if (e.key === "k") {
+        if (ids.length === 0) return;
+        e.preventDefault();
+        router.push(prevTarget());
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inReviewFlow, status, busy, ids, jobId]);
+
   const counter =
     remaining > 0 ? (
       <span className="text-[10px] text-corp-muted ml-1">
@@ -452,18 +502,20 @@ function ReviewAction({
           className="jsp-btn-primary text-xs"
           onClick={() => triage("interested", "interested")}
           disabled={busy !== null}
-          title="Mark this job as interested and jump to the next to-review row"
+          title="Mark this job as interested and jump to the next to-review row (key: 1)"
         >
           {busy === "interested" ? "…" : "Interested"}
+          {inReviewFlow ? <kbd className="ml-1 opacity-60 text-[10px]">1</kbd> : null}
         </button>
         <button
           type="button"
           className="jsp-btn-ghost text-xs text-corp-danger border-corp-danger/40"
           onClick={() => triage("not_interested", "not_interested")}
           disabled={busy !== null}
-          title="Mark this job as not interested and jump to the next to-review row"
+          title="Mark this job as not interested and jump to the next to-review row (key: 2)"
         >
           {busy === "not_interested" ? "…" : "Not interested"}
+          {inReviewFlow ? <kbd className="ml-1 opacity-60 text-[10px]">2</kbd> : null}
         </button>
         <button
           type="button"
@@ -472,12 +524,18 @@ function ReviewAction({
           disabled={busy !== null}
           title={
             'Mark as reviewed without a decision yet — "I\'ve seen it, will come back later" ' +
-            "— and jump to the next to-review row"
+            "— and jump to the next to-review row (key: 3)"
           }
         >
           {busy === "skip" ? "…" : "Skip"}
+          {inReviewFlow ? <kbd className="ml-1 opacity-60 text-[10px]">3</kbd> : null}
         </button>
         {counter}
+        {inReviewFlow && ids.length > 0 ? (
+          <span className="text-[10px] text-corp-muted ml-2">
+            <kbd>j</kbd>/<kbd>k</kbd> next/prev
+          </span>
+        ) : null}
       </div>
     );
   }
@@ -575,6 +633,52 @@ function ApplyAction({
     }
   }
 
+  function prevTarget(): string {
+    if (ids.length === 0) return "/jobs/apply";
+    const idx = ids.indexOf(jobId);
+    if (idx > 0) return `/jobs/${ids[idx - 1]}?from=apply`;
+    return `/jobs/${ids[ids.length - 1]}?from=apply`;
+  }
+
+  // Apply-flow keyboard shortcuts mirror the review-flow ones:
+  //   1 = applied, 2 = not_interested, 3 = skip (keep status)
+  //   j = next, k = previous
+  useEffect(() => {
+    if (!inApplyFlow) return;
+    function isTextish(el: EventTarget | null): boolean {
+      if (!(el instanceof HTMLElement)) return false;
+      const tag = el.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+      if (el.isContentEditable) return true;
+      return false;
+    }
+    function onKey(e: KeyboardEvent) {
+      if (isTextish(e.target)) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === "1" && status === "interested" && busy === null) {
+        e.preventDefault();
+        void triage("applied", "applied", false);
+      } else if (e.key === "2" && status === "interested" && busy === null) {
+        e.preventDefault();
+        void triage("not_interested", "not_interested", false);
+      } else if (e.key === "3" && status === "interested" && busy === null) {
+        e.preventDefault();
+        void triage(status, "skip", true);
+      } else if (e.key === "j") {
+        if (ids.length === 0) return;
+        e.preventDefault();
+        router.push(nextTarget());
+      } else if (e.key === "k") {
+        if (ids.length === 0) return;
+        e.preventDefault();
+        router.push(prevTarget());
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inApplyFlow, status, busy, ids, jobId]);
+
   if (!active) return null;
 
   const counter =
@@ -592,29 +696,37 @@ function ApplyAction({
           className="jsp-btn-primary text-xs"
           onClick={() => triage("applied", "applied", false)}
           disabled={busy !== null}
-          title="Mark as applied and jump to the next interested row"
+          title="Mark as applied and jump to the next interested row (key: 1)"
         >
           {busy === "applied" ? "…" : "Applied"}
+          {inApplyFlow ? <kbd className="ml-1 opacity-60 text-[10px]">1</kbd> : null}
         </button>
         <button
           type="button"
           className="jsp-btn-ghost text-xs text-corp-danger border-corp-danger/40"
           onClick={() => triage("not_interested", "not_interested", false)}
           disabled={busy !== null}
-          title="Changed your mind — mark as not interested and jump to the next"
+          title="Changed your mind — mark as not interested and jump to the next (key: 2)"
         >
           {busy === "not_interested" ? "…" : "Not interested"}
+          {inApplyFlow ? <kbd className="ml-1 opacity-60 text-[10px]">2</kbd> : null}
         </button>
         <button
           type="button"
           className="jsp-btn-ghost text-xs"
           onClick={() => triage(status, "skip", true)}
           disabled={busy !== null}
-          title="Leave this one as interested for now and jump to the next"
+          title="Leave this one as interested for now and jump to the next (key: 3)"
         >
           {busy === "skip" ? "…" : "Skip"}
+          {inApplyFlow ? <kbd className="ml-1 opacity-60 text-[10px]">3</kbd> : null}
         </button>
         {counter}
+        {inApplyFlow && ids.length > 0 ? (
+          <span className="text-[10px] text-corp-muted ml-2">
+            <kbd>j</kbd>/<kbd>k</kbd> next/prev
+          </span>
+        ) : null}
       </div>
     );
   }
