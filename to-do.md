@@ -140,6 +140,85 @@ Project skill definitions already exist at `/skills/<name>/SKILL.md`. Wire them 
 - ✅ **Circular link reverse view** — `GET /history/links?either_type=X&either_id=N` returns links where the entity is on either side, normalized so the queried entity is always the `from_*` side. `RelatedItemsPanel` now uses it so entity B shows inbound links from A without extra bookkeeping.
 - ✅ **OAuth debug-file cleanup** — new `_prune_old_debug_files` helper runs at the start of every `claude setup-token` session; deletes `.bin` files older than 7 days while always keeping the most recent 10 for active investigation. Cleans up the `claude_config` volume automatically.
 
+## Approved feature requests (in flight / queued)
+
+Migrated from `feature-requests.md` after review. ✅ = shipped this turn,
+[ ] = approved but not yet built.
+
+### Workflow & triage
+- ✅ **Search jobs on the tracker page** (Chris note on global search) —
+  free-text filter input above the table. Matches title, organization
+  name, location, notes. Client-side, no backend change.
+- ✅ **Bulk status change on tracker** — multi-select bar gains a
+  "Change status to…" dropdown that PUTs every selected row's status.
+- ✅ **Keyboard shortcuts on the review queue** — on `/jobs/{id}?from=review`,
+  `1` = interested, `2` = not interested, `3` = skip, `j` = next.
+  Ignored when focus is in an input/textarea.
+
+### JD analysis & matching
+- ✅ **Salary expectation vs. listing comparison** — tracker rows show
+  green/amber/red salary badge when JD has a salary range, derived from
+  `JobPreferences.salary_acceptable_min` / `salary_preferred_target`.
+- ✅ **Commute / location fit badge** — tracker rows badge "fit" / "remote ok"
+  / "outside radius" based on `preferred_locations` + JD location +
+  remote_policy + willing_to_relocate.
+- ✅ **Skill-match heatmap on tracker** — sortable Skills column shows a
+  thin bar + N/total + %, fed by `TrackedJobSummary.skill_match_pct`
+  computed against the user's catalog (name + alias normalize).
+
+### Document workflow
+- ✅ **Document tags** (migration 0017) — `tags` JSON array on
+  `GeneratedDocument`. Editable in the Studio per-doc; filter the Studio
+  list by tag chip.
+- ✅ **Resume version comparison view** — Studio editor's diff panel now
+  has a left-side version picker; default = parent_version_id, the
+  user can pick any sibling version. Old "Diff vs v{N-1}" still works.
+- ✅ **Batch humanize on Studio** — multi-select bar + "Humanize all".
+  Skips uploads with no text and already-humanized rows; queues each
+  through the existing `kind: humanize` queue worker.
+- ✅ **PDF export with proper page breaks** — `@page { size: letter;
+  margin: 0.5in }` plus `page-break-after: avoid` on headings,
+  `page-break-inside: avoid` on bullets/blockquotes/tables, `orphans`
+  and `widows` on paragraphs. New `.jsp-page-break` helper class for
+  forced breaks.
+- ✅ **Cover letter library** (migration 0018) — `cover_letter_snippets`
+  table + CRUD at `/api/v1/cover-letter-library` + new
+  `/cover-letter-library` page, filterable by kind (hook/bridge/close/
+  anecdote/value_prop/other). Tags + content_md per snippet.
+
+### Companion & data
+- ✅ **Periodic gap audit + skill-stack suggestions** — Skills page now
+  has an "Applied / interview only" toggle on the missing-from-jobs
+  audit (status_in scopes to applied + interview-pipeline statuses)
+  and a new "Skill stacks worth learning together" section showing
+  pairs of skills that co-occur in JDs the user actually engaged with
+  (`/api/v1/history/skills/stacks`).
+- ✅ **Tracked-job archiving** — `POST /api/v1/jobs/auto-archive` (with
+  preview) flips stale rows to `status=archived`: pre-application
+  states ≥60d, in-flight ≥90d, ghosted/lost/withdrawn ≥30d. Tracker
+  toolbar now has an "Auto-archive stale" button that previews
+  candidates first.
+
+### Analytics
+- ✅ **Application-to-response funnel by source** — new
+  `GET /api/v1/metrics/funnel-by-source` and a Dashboard table that
+  renders applied → phone screen → onsite → offer → hired counts +
+  rate-from-applied per `source_platform`, sorted by total.
+
+### Integrations & polish
+- ✅ **Browser extension stub** — Chromium MV3 scaffold under
+  `apps/extension/`. Popup extracts JD via best-effort selectors,
+  POSTs to `/api/v1/jobs` as a `to_review` row, options page sets
+  the API base. README documents known gaps (no real icons, no
+  organization resolver, cookie-only auth).
+- ✅ **Accessibility pass** — global `:focus-visible` ring, skip-to-content
+  link in `(app)/layout.tsx`, `aria-current="page"` and `aria-label`
+  on the sidebar nav, `aria-modal` on the command palette, real `<kbd>`
+  styling. Charts and combobox ARIA polish still deferred.
+- ✅ **Cmd-K search across everything** — `CommandPalette` mounted at the
+  app layout. ⌘/Ctrl+K opens. Hydrates jobs / orgs / docs / skills on
+  first open, ranks substring + fuzzy matches, ↑/↓/Enter navigation.
+
 ## Non-code housekeeping
 
 - [ ] Update the README's "What works" section to match reality.
