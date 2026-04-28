@@ -20,7 +20,7 @@ from app.core.deps import get_current_user
 from app.models.jobs import JobFetchQueue, TrackedJob
 from app.models.sources import JobLead, JobSource
 from app.models.user import User
-from app.sources import KIND_HINTS, KIND_LABELS
+from app.sources import KIND_EXAMPLES, KIND_HINTS, KIND_LABELS
 from app.sources.poller import poll_source
 
 router = APIRouter(prefix="/job-sources", tags=["job-sources"])
@@ -81,10 +81,16 @@ class SourceOut(BaseModel):
     total_lead_count: Optional[int] = None
 
 
+class SourceKindExample(BaseModel):
+    label: str
+    value: str
+
+
 class SourceKindOut(BaseModel):
     kind: str
     label: str
     hint: str
+    examples: list[SourceKindExample] = []
 
 
 class LeadOut(BaseModel):
@@ -143,7 +149,14 @@ async def _owned_source(
 @router.get("/kinds", response_model=list[SourceKindOut])
 async def list_kinds() -> list[SourceKindOut]:
     return [
-        SourceKindOut(kind=k, label=KIND_LABELS[k], hint=KIND_HINTS[k])
+        SourceKindOut(
+            kind=k,
+            label=KIND_LABELS[k],
+            hint=KIND_HINTS[k],
+            examples=[
+                SourceKindExample(**ex) for ex in KIND_EXAMPLES.get(k, [])
+            ],
+        )
         for k in sorted(SOURCE_KINDS)
     ]
 
@@ -190,6 +203,37 @@ async def list_sources(
     return out
 
 
+def _validate_slug_or_url(kind: str, raw: str) -> str:
+    """Reject empty / whitespace-only values, and enforce that URL kinds
+    actually got a URL. Returns the cleaned value."""
+    cleaned = (raw or "").strip()
+    if not cleaned:
+        raise HTTPException(
+            status_code=422,
+            detail="Slug or URL is required.",
+        )
+    if kind in {"rss", "yc"}:
+        if not cleaned.lower().startswith(("http://", "https://")):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"{kind} sources need a full feed URL "
+                    "starting with http:// or https://."
+                ),
+            )
+    else:
+        # ATS slugs are short alphanumerics with optional dashes / dots /
+        # underscores. If the user pasted a full URL, the per-adapter
+        # regexes will pull the slug out — but a bare protocol or empty
+        # path means there's nothing usable.
+        if cleaned in {"http://", "https://", "/"}:
+            raise HTTPException(
+                status_code=422,
+                detail="Slug looks empty. Paste the company slug or its full board URL.",
+            )
+    return cleaned
+
+
 @router.post("", response_model=SourceOut, status_code=status.HTTP_201_CREATED)
 async def create_source(
     payload: SourceIn,
@@ -201,10 +245,11 @@ async def create_source(
             status_code=422,
             detail=f"Unknown source kind '{payload.kind}'. Allowed: {sorted(SOURCE_KINDS)}",
         )
+    cleaned_slug = _validate_slug_or_url(payload.kind, payload.slug_or_url)
     src = JobSource(
         user_id=user.id,
         kind=payload.kind,
-        slug_or_url=payload.slug_or_url.strip(),
+        slug_or_url=cleaned_slug,
         label=(payload.label or "").strip() or None,
         enabled=payload.enabled,
         filters=payload.filters.model_dump(exclude_none=True) if payload.filters else None,

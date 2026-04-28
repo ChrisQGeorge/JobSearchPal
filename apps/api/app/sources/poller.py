@@ -90,15 +90,41 @@ async def poll_source(db: AsyncSession, source: JobSource) -> tuple[int, Optiona
     try:
         raw_leads = await _adapter_fetch(source.kind, source.slug_or_url)
     except Exception as exc:  # noqa: BLE001
+        # Format a more actionable message for the most common failure
+        # mode (HTTP 404 — wrong slug or company isn't on this ATS).
+        msg = str(exc)
+        try:
+            import httpx  # local import keeps adapters loosely coupled
+
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+                code = exc.response.status_code
+                if code == 404:
+                    msg = (
+                        f"{source.kind} returned 404 for slug "
+                        f"'{source.slug_or_url}'. Either the slug is wrong "
+                        f"or that company isn't on {source.kind}."
+                    )
+                elif code in (401, 403):
+                    msg = (
+                        f"{source.kind} returned {code} for slug "
+                        f"'{source.slug_or_url}' — feed appears private."
+                    )
+                elif code == 429:
+                    msg = (
+                        f"{source.kind} rate-limited us. Increase the "
+                        "poll interval and try again later."
+                    )
+        except Exception:
+            pass
         log.warning(
             "source %s/%s fetch failed: %s",
             source.kind,
             source.slug_or_url,
-            exc,
+            msg,
         )
         source.last_polled_at = _now()
-        source.last_error = str(exc)[:1000]
-        return 0, str(exc)
+        source.last_error = msg[:1000]
+        return 0, msg
 
     now = _now()
     expires = now + timedelta(hours=max(1, source.lead_ttl_hours))

@@ -46,13 +46,84 @@ KIND_LABELS: dict[str, str] = {
 }
 
 KIND_HINTS: dict[str, str] = {
-    "greenhouse": "Company slug (e.g. `airbnb` from boards.greenhouse.io/airbnb).",
-    "lever": "Company slug (e.g. `netflix` from jobs.lever.co/netflix).",
-    "ashby": "Job-board slug (e.g. `ramp` from jobs.ashbyhq.com/ramp).",
-    "workable": "Account subdomain (e.g. `loom` from apply.workable.com/loom).",
-    "rss": "Full RSS / Atom feed URL.",
-    "yc": "Full URL to a Y Combinator jobs RSS feed.",
+    "greenhouse": "Company slug from boards.greenhouse.io/<slug>.",
+    "lever": "Company slug from jobs.lever.co/<slug>.",
+    "ashby": "Job-board slug from jobs.ashbyhq.com/<slug>.",
+    "workable": "Account subdomain from apply.workable.com/<slug>.",
+    "rss": "Full RSS / Atom feed URL (https://…).",
+    "yc": "Full Y Combinator Atom feed URL (e.g. https://www.workatastartup.com/companies/feed.atom).",
+}
+
+# Curated known-good slugs / URLs the UI can offer as click-to-fill
+# examples. The list is intentionally small — these were verified
+# reachable when the feature shipped, but ATS choices change, so we
+# treat the list as a starting point, not a guarantee.
+KIND_EXAMPLES: dict[str, list[dict[str, str]]] = {
+    "greenhouse": [
+        {"label": "Airbnb", "value": "airbnb"},
+        {"label": "Stripe", "value": "stripe"},
+        {"label": "DoorDash", "value": "doordash"},
+        {"label": "Discord", "value": "discord"},
+        {"label": "Robinhood", "value": "robinhood"},
+        {"label": "Anthropic", "value": "anthropic"},
+        {"label": "Reddit", "value": "reddit"},
+        {"label": "Coinbase", "value": "coinbase"},
+        {"label": "Figma", "value": "figma"},
+    ],
+    "lever": [
+        {"label": "Netflix", "value": "netflix"},
+        {"label": "Spotify", "value": "spotify"},
+        {"label": "Twitch", "value": "twitch"},
+        {"label": "Brex", "value": "brex"},
+        {"label": "Plaid", "value": "plaid"},
+        {"label": "Mistral AI", "value": "mistral"},
+        {"label": "KeepTruckin (Motive)", "value": "gomotive"},
+    ],
+    "ashby": [
+        {"label": "Ramp", "value": "ramp"},
+        {"label": "Notion", "value": "notion"},
+        {"label": "Linear", "value": "Linear"},
+        {"label": "Vercel", "value": "Vercel"},
+        {"label": "Replit", "value": "replit"},
+        {"label": "Posthog", "value": "posthog"},
+    ],
+    "workable": [
+        {"label": "Persona", "value": "persona"},
+        {"label": "Lokalise", "value": "lokalise"},
+        {"label": "Pipedrive", "value": "pipedrive"},
+    ],
+    "rss": [
+        {
+            "label": "RemoteOK (all jobs)",
+            "value": "https://remoteok.com/remote-jobs.rss",
+        },
+        {
+            "label": "WeWorkRemotely (programming)",
+            "value": "https://weworkremotely.com/categories/remote-programming-jobs.rss",
+        },
+        {
+            "label": "Stack Overflow Jobs (defunct — example only)",
+            "value": "https://stackoverflow.com/jobs/feed",
+        },
+    ],
+    "yc": [
+        {
+            "label": "All YC engineering jobs",
+            "value": "https://www.workatastartup.com/companies/feed.atom?role=engineering",
+        },
+        {
+            "label": "All YC remote jobs",
+            "value": "https://www.workatastartup.com/companies/feed.atom?remote=true",
+        },
+    ],
 }
 
 
-__all__ = ["ADAPTERS", "KIND_LABELS", "KIND_HINTS", "RawLead", "Adapter"]
+__all__ = [
+    "ADAPTERS",
+    "KIND_LABELS",
+    "KIND_HINTS",
+    "KIND_EXAMPLES",
+    "RawLead",
+    "Adapter",
+]

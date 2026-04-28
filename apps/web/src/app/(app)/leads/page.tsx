@@ -12,10 +12,13 @@ import { useEffect, useMemo, useState } from "react";
 import { PageShell } from "@/components/PageShell";
 import { api, ApiError } from "@/lib/api";
 
+type SourceKindExample = { label: string; value: string };
+
 type SourceKind = {
   kind: string;
   label: string;
   hint: string;
+  examples?: SourceKindExample[];
 };
 
 type Source = {
@@ -665,8 +668,9 @@ function SourceEditor({
   onChange: (next: SourceForm) => void;
   onSave: () => void;
 }) {
-  const hint =
-    kinds.find((k) => k.kind === form.kind)?.hint ?? "";
+  const activeKind = kinds.find((k) => k.kind === form.kind);
+  const hint = activeKind?.hint ?? "";
+  const examples = activeKind?.examples ?? [];
   return (
     <div className="jsp-card p-4 mb-3 space-y-3">
       <h3 className="text-sm uppercase tracking-wider text-corp-muted">
@@ -699,6 +703,25 @@ function SourceEditor({
           />
           {hint ? (
             <p className="text-[11px] text-corp-muted mt-1">{hint}</p>
+          ) : null}
+          {examples.length > 0 ? (
+            <div className="flex flex-wrap gap-1 mt-1.5">
+              <span className="text-[10px] text-corp-muted uppercase tracking-wider mr-1 self-center">
+                Try
+              </span>
+              {examples.map((ex) => (
+                <button
+                  key={ex.value}
+                  type="button"
+                  onClick={() => onChange({ ...form, slug_or_url: ex.value })}
+                  className="text-[10px] px-1.5 py-0.5 rounded border border-corp-border bg-corp-surface2 text-corp-muted hover:text-corp-accent hover:border-corp-accent uppercase tracking-wider"
+                  title={`Use ${ex.value}`}
+                  disabled={saving}
+                >
+                  {ex.label}
+                </button>
+              ))}
+            </div>
           ) : null}
         </div>
       </div>
