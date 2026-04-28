@@ -22,8 +22,10 @@ from app.api.v1 import data_io as data_io_router
 from app.api.v1 import metrics as metrics_router
 from app.api.v1 import autofill as autofill_router
 from app.api.v1 import resume_ingest as resume_ingest_router
+from app.api.v1 import sources as sources_router
 from app.core.config import settings
 from app.skills.queue_worker import run_forever as run_queue_worker
+from app.sources.poller import run_forever as run_source_poller
 
 log = logging.getLogger(__name__)
 
@@ -33,15 +35,18 @@ async def lifespan(app: FastAPI):
     # Launch the background JobFetchQueue worker. Single task, single
     # container — if we ever scale out we'll need real coordination.
     task = asyncio.create_task(run_queue_worker(), name="job-fetch-queue")
-    log.info("Started job-fetch-queue background worker")
+    poller_task = asyncio.create_task(run_source_poller(), name="source-poller")
+    log.info("Started job-fetch-queue + source-poller background workers")
     try:
         yield
     finally:
-        task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
+        for t in (task, poller_task):
+            t.cancel()
+        for t in (task, poller_task):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 app = FastAPI(
@@ -136,3 +141,4 @@ app.include_router(autofill_router.router, prefix="/api/v1")
 app.include_router(resume_ingest_router.router, prefix="/api/v1")
 app.include_router(companion_router.router, prefix="/api/v1")
 app.include_router(cover_letter_library_router.router, prefix="/api/v1")
+sources_router.register(app)

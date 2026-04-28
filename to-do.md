@@ -140,6 +140,20 @@ Project skill definitions already exist at `/skills/<name>/SKILL.md`. Wire them 
 - ✅ **Circular link reverse view** — `GET /history/links?either_type=X&either_id=N` returns links where the entity is on either side, normalized so the queried entity is always the `from_*` side. `RelatedItemsPanel` now uses it so entity B shows inbound links from A without extra bookkeeping.
 - ✅ **OAuth debug-file cleanup** — new `_prune_old_debug_files` helper runs at the start of every `claude setup-token` session; deletes `.bin` files older than 7 days while always keeping the most recent 10 for active investigation. Cleans up the `claude_config` volume automatically.
 
+## R7 — Job Leads ingest (new milestone, scope amendment)
+
+- ✅ **Job sources + leads inbox** (migration 0019). New `job_sources`
+  and `job_leads` tables. Adapters for Greenhouse / Lever / Ashby /
+  Workable / generic RSS / YC. Background poller fans out on a
+  per-source schedule (`poll_interval_hours`) and writes deduped
+  `JobLead` rows; leads expire after `lead_ttl_hours` if untouched.
+  Bulk inbox UI at `/leads` lets the user mark leads
+  interested / watching / dismissed; interested + watching auto-create
+  a TrackedJob and queue a `score` task. Filters (title regex, location
+  regex, remote-only) apply at ingest so the inbox doesn't drown.
+- [ ] Per-user spend cap on `score` tasks triggered by lead promotion
+  (defer until R5 spend-cap landing).
+
 ## Approved feature requests (in flight / queued)
 
 Migrated from `feature-requests.md` after review. ✅ = shipped this turn,

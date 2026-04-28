@@ -45,6 +45,7 @@ from app.models.documents import (
 from app.models.companion import CompanionConversation, ConversationMessage, Task
 from app.models.links import EntityLink
 from app.models.operational import AuditLog, AutofillLog, MetricSnapshot
+from app.models.sources import JobLead, JobSource
 
 __all__ = [
     "Base",
@@ -90,4 +91,6 @@ __all__ = [
     "AuditLog",
     "AutofillLog",
     "MetricSnapshot",
+    "JobSource",
+    "JobLead",
 ]
