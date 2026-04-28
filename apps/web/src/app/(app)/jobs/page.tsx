@@ -51,12 +51,33 @@ export default function JobTrackerPage() {
     return window.localStorage.getItem("jsp:jobs:show_closed") === "1";
   });
   const [creating, setCreating] = useState(false);
+  // Free-text search — applied client-side so the backend doesn't have to
+  // implement full-text. Matches title, organization name, location, notes.
+  const [search, setSearch] = useState("");
   // Multi-select on the tracker table. Selection survives filter-pill
   // switches (so the user can stage a bulk action across statuses) but
   // resets when a bulk action completes or Clear is clicked.
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [bulkRunning, setBulkRunning] = useState(false);
   const [bulkMsg, setBulkMsg] = useState<string | null>(null);
+  const [bulkStatusTarget, setBulkStatusTarget] = useState<JobStatus | "">("");
+  // User's job preferences — hydrated lazily for the salary + location
+  // badges. We only need a small subset, so the failure case is fine
+  // (badges just don't render).
+  const [prefs, setPrefs] = useState<{
+    salary_acceptable_min?: number | null;
+    salary_preferred_target?: number | null;
+    salary_currency?: string | null;
+    willing_to_relocate?: boolean;
+    preferred_locations?: { name: string; max_distance_miles: number | null }[] | null;
+    remote_policies_acceptable?: string[] | null;
+  } | null>(null);
+  useEffect(() => {
+    api
+      .get<typeof prefs>("/api/v1/preferences/job")
+      .then((p) => setPrefs(p ?? {}))
+      .catch(() => setPrefs({}));
+  }, []);
 
   function toggleShowNegative(next: boolean) {
     setShowNegative(next);
@@ -97,6 +118,42 @@ export default function JobTrackerPage() {
     refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [statusFilter, showNegative]);
+
+  // Sort key for the tracker table. "none" keeps the backend's
+  // updated_at-desc ordering; "skill_match_pct" is the heatmap sort the
+  // user can toggle from the Skills column header. The persisted-state
+  // here is intentionally session-only — refreshing the page resets to
+  // the natural recency order.
+  const [sortKey, setSortKey] = useState<"none" | "skill_match_pct">("none");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+
+  // Apply the search filter on top of whatever the backend returned.
+  // Matches case-insensitively across title / org / location / notes.
+  const visibleItems = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    let arr = q
+      ? items.filter((j) => {
+          if (j.title?.toLowerCase().includes(q)) return true;
+          if (j.organization_name?.toLowerCase().includes(q)) return true;
+          if (j.location?.toLowerCase().includes(q)) return true;
+          if ((j.notes ?? "").toLowerCase().includes(q)) return true;
+          return false;
+        })
+      : items;
+    if (sortKey === "skill_match_pct") {
+      arr = [...arr].sort((a, b) => {
+        const av = a.skill_match_pct;
+        const bv = b.skill_match_pct;
+        // Push nulls to the bottom regardless of direction so they don't
+        // dominate the top of the list with "no analysis yet".
+        if (av == null && bv == null) return 0;
+        if (av == null) return 1;
+        if (bv == null) return -1;
+        return sortDir === "desc" ? bv - av : av - bv;
+      });
+    }
+    return arr;
+  }, [items, search, sortKey, sortDir]);
 
   // Status counts across the full set (unfiltered). Quick-nav to each bucket.
   const [counts, setCounts] = useState<Partial<Record<JobStatus, number>>>({});
@@ -171,6 +228,30 @@ export default function JobTrackerPage() {
       return next;
     });
     setBulkMsg(null);
+  }
+
+  async function bulkChangeStatus(target: JobStatus) {
+    const ids = [...selectedIds];
+    if (ids.length === 0 || !target) return;
+    setBulkRunning(true);
+    setBulkMsg(null);
+    const results = await Promise.allSettled(
+      ids.map((id) =>
+        api.put(`/api/v1/jobs/${id}`, { status: target }),
+      ),
+    );
+    const ok = results.filter((r) => r.status === "fulfilled").length;
+    const fail = results.length - ok;
+    setBulkRunning(false);
+    setBulkStatusTarget("");
+    setSelectedIds(new Set());
+    setBulkMsg(
+      fail === 0
+        ? `Updated ${ok} job${ok === 1 ? "" : "s"} to "${target}".`
+        : `Updated ${ok} of ${results.length}; ${fail} failed.`,
+    );
+    setTimeout(() => setBulkMsg(null), 12000);
+    await refresh();
   }
 
   /**
@@ -340,6 +421,7 @@ export default function JobTrackerPage() {
           />
           Show closed / rejected
         </label>
+        <AutoArchiveButton onArchived={() => refresh()} />
       </div>
 
       {creating ? (
@@ -368,6 +450,24 @@ export default function JobTrackerPage() {
             <strong>{selectedIds.size}</strong> selected
           </span>
           <div className="flex-1" />
+          <select
+            className="jsp-input text-xs w-44"
+            value={bulkStatusTarget}
+            onChange={(e) => {
+              const v = e.target.value as JobStatus | "";
+              setBulkStatusTarget(v);
+              if (v) bulkChangeStatus(v);
+            }}
+            disabled={bulkRunning}
+            title="Apply this status to every selected job"
+          >
+            <option value="">Change status to…</option>
+            {JOB_STATUSES.map((s) => (
+              <option key={s} value={s}>
+                {s.replace(/_/g, " ")}
+              </option>
+            ))}
+          </select>
           <button
             type="button"
             className="jsp-btn-ghost text-xs"
@@ -409,13 +509,25 @@ export default function JobTrackerPage() {
         </div>
       ) : null}
 
+      <div className="mt-3 mb-2">
+        <input
+          type="text"
+          className="jsp-input"
+          placeholder="Search jobs by title, organization, location, or notes…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
+      </div>
+
       {loading ? (
         <p className="text-corp-muted mt-4">Loading...</p>
-      ) : items.length === 0 ? (
+      ) : visibleItems.length === 0 ? (
         <div className="jsp-card p-6 text-corp-muted text-sm mt-4">
-          {statusFilter
-            ? `No jobs with status "${statusFilter}".`
-            : "No jobs tracked yet. Add one above — paste a URL, a title, and Claude will fill in the rest as you go."}
+          {search.trim()
+            ? `No jobs match "${search.trim()}".`
+            : statusFilter
+              ? `No jobs with status "${statusFilter}".`
+              : "No jobs tracked yet. Add one above — paste a URL, a title, and Claude will fill in the rest as you go."}
         </div>
       ) : (
         <div className="jsp-card mt-4 overflow-hidden">
@@ -428,23 +540,23 @@ export default function JobTrackerPage() {
                     className="accent-corp-accent"
                     aria-label="Select all visible rows"
                     checked={
-                      items.length > 0 &&
-                      items.every((j) => selectedIds.has(j.id))
+                      visibleItems.length > 0 &&
+                      visibleItems.every((j) => selectedIds.has(j.id))
                     }
                     // Indeterminate state when some but not all visible rows
                     // are selected — React doesn't expose it as a prop, so
                     // set via ref on the DOM element.
                     ref={(el) => {
                       if (el) {
-                        const count = items.filter((j) =>
+                        const count = visibleItems.filter((j) =>
                           selectedIds.has(j.id),
                         ).length;
                         el.indeterminate =
-                          count > 0 && count < items.length;
+                          count > 0 && count < visibleItems.length;
                       }
                     }}
                     onChange={() =>
-                      toggleSelectAllVisible(items.map((j) => j.id))
+                      toggleSelectAllVisible(visibleItems.map((j) => j.id))
                     }
                     onClick={(e) => e.stopPropagation()}
                   />
@@ -453,13 +565,34 @@ export default function JobTrackerPage() {
                 <th className="py-2 px-4">Organization</th>
                 <th className="py-2 px-4">Status</th>
                 <th className="py-2 px-4">Fit</th>
+                <th
+                  className="py-2 px-4 cursor-pointer select-none hover:text-corp-text"
+                  onClick={() => {
+                    if (sortKey !== "skill_match_pct") {
+                      setSortKey("skill_match_pct");
+                      setSortDir("desc");
+                    } else if (sortDir === "desc") {
+                      setSortDir("asc");
+                    } else {
+                      setSortKey("none");
+                    }
+                  }}
+                  title="Sort by % of required skills matched. Click again to flip, again to clear."
+                >
+                  Skills
+                  {sortKey === "skill_match_pct" ? (
+                    <span className="ml-1 text-corp-accent">
+                      {sortDir === "desc" ? "↓" : "↑"}
+                    </span>
+                  ) : null}
+                </th>
                 <th className="py-2 px-4">Rounds</th>
                 <th className="py-2 px-4">Applied</th>
                 <th className="py-2 px-4 text-right">Updated</th>
               </tr>
             </thead>
             <tbody>
-              {items.map((j) => (
+              {visibleItems.map((j) => (
                 <tr
                   key={j.id}
                   className={`border-t border-corp-border hover:bg-corp-surface2 cursor-pointer ${
@@ -506,9 +639,20 @@ export default function JobTrackerPage() {
                     />
                   </td>
                   <td className="py-2 px-4">
-                    <FitPill
-                      score={j.fit_score ?? null}
-                      redFlagCount={j.red_flag_count ?? 0}
+                    <div className="flex flex-wrap gap-1 items-center">
+                      <FitPill
+                        score={j.fit_score ?? null}
+                        redFlagCount={j.red_flag_count ?? 0}
+                      />
+                      <SalaryBadge job={j} prefs={prefs} />
+                      <LocationFitBadge job={j} prefs={prefs} />
+                    </div>
+                  </td>
+                  <td className="py-2 px-4">
+                    <SkillMatchHeatmap
+                      pct={j.skill_match_pct ?? null}
+                      have={j.skill_match_have ?? null}
+                      total={j.skill_match_total ?? null}
                     />
                   </td>
                   <td className="py-2 px-4 text-corp-muted">
@@ -534,6 +678,296 @@ export default function JobTrackerPage() {
     </PageShell>
   );
 }
+
+/** Render a green/amber/red salary badge derived from the job's posted
+ * range vs. the user's preferences. Returns null when there's nothing
+ * to compare (no posted range or no preferences yet). */
+function SalaryBadge({
+  job,
+  prefs,
+}: {
+  job: TrackedJobSummary;
+  prefs: {
+    salary_acceptable_min?: number | null;
+    salary_preferred_target?: number | null;
+  } | null;
+}) {
+  if (!prefs) return null;
+  const min = job.salary_min ?? null;
+  const max = job.salary_max ?? null;
+  if (min == null && max == null) return null;
+  const accept = prefs.salary_acceptable_min ?? null;
+  const target = prefs.salary_preferred_target ?? null;
+  const ceiling = max ?? min;
+  const floor = min ?? max;
+  if (ceiling == null || floor == null) return null;
+  let tone: "good" | "warn" | "danger" = "warn";
+  let label = "salary";
+  if (accept != null && ceiling < accept) {
+    tone = "danger";
+    label = "below acceptable";
+  } else if (target != null && ceiling >= target) {
+    tone = "good";
+    label = "≥ target";
+  } else if (accept != null && floor >= accept) {
+    tone = "good";
+    label = "in range";
+  } else {
+    tone = "warn";
+    label = "below preferred";
+  }
+  const tone_class =
+    tone === "good"
+      ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
+      : tone === "danger"
+        ? "bg-corp-danger/20 text-corp-danger border-corp-danger/40"
+        : "bg-corp-accent2/20 text-corp-accent2 border-corp-accent2/40";
+  return (
+    <span
+      className={`inline-block px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider border ${tone_class}`}
+      title={`Listed ${min ?? "?"}–${max ?? "?"} vs. preferred target ${target ?? "?"} / acceptable min ${accept ?? "?"}`}
+    >
+      💰 {label}
+    </span>
+  );
+}
+
+/** Location-fit badge derived from `preferred_locations` + remote policy.
+ * Naive substring match on city name (no geocoding). Returns null if
+ * there's nothing useful to say. */
+function LocationFitBadge({
+  job,
+  prefs,
+}: {
+  job: TrackedJobSummary;
+  prefs: {
+    willing_to_relocate?: boolean;
+    preferred_locations?: { name: string; max_distance_miles: number | null }[] | null;
+    remote_policies_acceptable?: string[] | null;
+  } | null;
+}) {
+  if (!prefs) return null;
+  const remote = job.remote_policy ?? null;
+  const loc = (job.location ?? "").trim();
+  // Remote-friendly job + user accepts remote → green and we're done.
+  if (remote && (prefs.remote_policies_acceptable ?? []).includes(remote)) {
+    return (
+      <span className="inline-block px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider border bg-emerald-500/20 text-emerald-300 border-emerald-500/40">
+        🏠 remote ok
+      </span>
+    );
+  }
+  if (!loc) return null;
+  const locLower = loc.toLowerCase();
+  const prefList = prefs.preferred_locations ?? [];
+  // Substring match in either direction so "Seattle, WA" matches "Seattle".
+  const hit = prefList.find((p) => {
+    const a = p.name.toLowerCase();
+    return a && (locLower.includes(a) || a.includes(locLower));
+  });
+  if (hit) {
+    const radius = hit.max_distance_miles
+      ? `${hit.max_distance_miles} mi of ${hit.name}`
+      : hit.name;
+    return (
+      <span
+        className="inline-block px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider border bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
+        title={`Within preferred radius — ${radius}`}
+      >
+        📍 fit
+      </span>
+    );
+  }
+  if (prefs.willing_to_relocate) {
+    return (
+      <span
+        className="inline-block px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider border bg-corp-accent2/20 text-corp-accent2 border-corp-accent2/40"
+        title="Outside any preferred location, but you marked yourself open to relocating"
+      >
+        📍 relocate
+      </span>
+    );
+  }
+  if (prefList.length === 0) return null;
+  return (
+    <span
+      className="inline-block px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider border bg-corp-danger/20 text-corp-danger border-corp-danger/40"
+      title={`Posting at ${loc} doesn't match any of your preferred_locations`}
+    >
+      📍 outside
+    </span>
+  );
+}
+
+
+/** Skill-match heatmap cell — a thin colored bar plus "have/total"
+ * caption. Renders an em-dash when the JD didn't surface required_skills
+ * (no analysis yet) so the column doesn't lie about a 0% match. */
+function SkillMatchHeatmap({
+  pct,
+  have,
+  total,
+}: {
+  pct: number | null;
+  have: number | null;
+  total: number | null;
+}) {
+  if (pct == null || total == null || total === 0) {
+    return <span className="text-corp-muted text-[11px]">—</span>;
+  }
+  const tone =
+    pct >= 75
+      ? "bg-emerald-500"
+      : pct >= 50
+        ? "bg-corp-accent"
+        : pct >= 25
+          ? "bg-corp-accent2"
+          : "bg-corp-danger";
+  return (
+    <div
+      className="flex flex-col gap-1"
+      title={`${have ?? 0} of ${total} required skills matched`}
+    >
+      <div className="h-1.5 w-16 rounded bg-corp-surface2 overflow-hidden border border-corp-border">
+        <div
+          className={`h-full ${tone}`}
+          style={{ width: `${Math.max(2, Math.min(100, pct))}%` }}
+        />
+      </div>
+      <span className="text-[10px] text-corp-muted">
+        {pct}% · {have}/{total}
+      </span>
+    </div>
+  );
+}
+
+
+/** Run the auto-archive sweep. Shows a preview confirmation first so
+ * the user always sees what's about to move; clicking through actually
+ * archives the rows. Inert when there's nothing stale. */
+function AutoArchiveButton({ onArchived }: { onArchived: () => void }) {
+  const [busy, setBusy] = useState<"idle" | "preview" | "running">("idle");
+  const [preview, setPreview] = useState<{
+    candidates_by_bucket: Record<string, number>;
+    total: number;
+    sample_titles: string[];
+  } | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function loadPreview() {
+    setErr(null);
+    setBusy("preview");
+    try {
+      const p = await api.get<{
+        candidates_by_bucket: Record<string, number>;
+        total: number;
+        sample_titles: string[];
+      }>("/api/v1/jobs/auto-archive/preview");
+      setPreview(p);
+    } catch (e) {
+      setErr(
+        e instanceof ApiError
+          ? `Preview failed (HTTP ${e.status}).`
+          : "Preview failed.",
+      );
+    } finally {
+      setBusy("idle");
+    }
+  }
+
+  async function execute() {
+    setErr(null);
+    setBusy("running");
+    try {
+      const out = await api.post<{ archived: number }>(
+        "/api/v1/jobs/auto-archive",
+        {},
+      );
+      setPreview(null);
+      onArchived();
+      alert(`Archived ${out.archived} stale job${out.archived === 1 ? "" : "s"}.`);
+    } catch (e) {
+      setErr(
+        e instanceof ApiError
+          ? `Archive failed (HTTP ${e.status}).`
+          : "Archive failed.",
+      );
+    } finally {
+      setBusy("idle");
+    }
+  }
+
+  if (preview) {
+    return (
+      <div className="jsp-card p-3 ml-2 max-w-sm text-[11px]">
+        <div className="font-medium mb-1">
+          Auto-archive: {preview.total} job{preview.total === 1 ? "" : "s"}
+        </div>
+        {preview.total > 0 ? (
+          <>
+            <ul className="space-y-0.5 text-corp-muted">
+              {Object.entries(preview.candidates_by_bucket).map(
+                ([k, n]) =>
+                  n > 0 ? (
+                    <li key={k}>
+                      {k}: <span className="text-corp-text">{n}</span>
+                    </li>
+                  ) : null,
+              )}
+            </ul>
+            {preview.sample_titles.length > 0 ? (
+              <div className="mt-1 text-corp-muted truncate">
+                e.g. {preview.sample_titles.slice(0, 3).join(", ")}
+                {preview.sample_titles.length > 3 ? "…" : ""}
+              </div>
+            ) : null}
+          </>
+        ) : (
+          <div className="text-corp-muted">
+            Nothing stale right now — every job is recent.
+          </div>
+        )}
+        <div className="flex gap-1.5 mt-2 justify-end">
+          <button
+            type="button"
+            className="jsp-btn-ghost text-xs"
+            onClick={() => setPreview(null)}
+          >
+            Cancel
+          </button>
+          {preview.total > 0 ? (
+            <button
+              type="button"
+              className="jsp-btn-primary text-xs"
+              onClick={execute}
+              disabled={busy === "running"}
+            >
+              {busy === "running" ? "…" : "Archive"}
+            </button>
+          ) : null}
+        </div>
+        {err ? <div className="text-corp-danger mt-1">{err}</div> : null}
+      </div>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      className="jsp-btn-ghost text-xs"
+      onClick={loadPreview}
+      disabled={busy !== "idle"}
+      title={
+        "Move stale rows to status=archived: pre-application ≥60 days, " +
+        "in-flight ≥90 days, ghosted/lost/withdrawn ≥30 days. " +
+        "Always shows a preview first."
+      }
+    >
+      {busy === "preview" ? "…" : "Auto-archive stale"}
+    </button>
+  );
+}
+
 
 function StatusFilterPills({
   current,

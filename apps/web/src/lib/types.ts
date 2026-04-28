@@ -234,6 +234,9 @@ export type TrackedJobSummary = {
   employment_type?: EmploymentType | null;
   fit_score?: number | null;
   red_flag_count?: number | null;
+  skill_match_pct?: number | null;
+  skill_match_have?: number | null;
+  skill_match_total?: number | null;
 };
 
 export type TrackedJob = {
@@ -408,6 +411,7 @@ export type GeneratedDocument = {
   model_used?: string | null;
   persona_id?: number | null;
   source_skill?: string | null;
+  tags?: string[] | null;
   created_at: string;
   updated_at: string;
 };

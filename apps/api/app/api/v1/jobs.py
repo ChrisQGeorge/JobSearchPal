@@ -7,7 +7,7 @@ always emit an ApplicationEvent so the audit/history is preserved.
 import json
 import logging
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import (
@@ -29,6 +29,7 @@ log = logging.getLogger(__name__)
 
 from app.core.database import get_db
 from app.core.deps import get_current_user
+from app.models.history import Skill
 from app.models.jobs import (
     ApplicationEvent,
     InterviewArtifact,
@@ -139,6 +140,36 @@ async def list_jobs(
         db, {j.organization_id for j in jobs if j.organization_id}
     )
 
+    # Build a single normalized set of skill names + aliases the user knows.
+    # Used below to compute skill_match_pct for each job's required_skills
+    # without N+1 querying. We normalize lower-case and strip simple
+    # punctuation so "Node.js" matches "node js".
+    user_skill_terms: set[str] = set()
+    if jobs:
+        skill_rows = (
+            await db.execute(
+                select(Skill.name, Skill.aliases).where(
+                    Skill.user_id == user.id, Skill.deleted_at.is_(None)
+                )
+            )
+        ).all()
+
+        def _norm(s: object) -> str:
+            return re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip()
+
+        for name, aliases in skill_rows:
+            t = _norm(name)
+            if t:
+                user_skill_terms.add(t)
+            if isinstance(aliases, list):
+                for a in aliases:
+                    ta = _norm(a)
+                    if ta:
+                        user_skill_terms.add(ta)
+    else:
+        def _norm(s: object) -> str:  # noqa: E306
+            return re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip()
+
     # Rounds aggregate: count + latest outcome per job.
     if jobs:
         job_ids = [j.id for j in jobs]
@@ -193,6 +224,33 @@ async def list_jobs(
             rfs = jda.get("red_flags")
             if isinstance(rfs, list):
                 red_flag_count = len(rfs)
+
+        # Skill-match heatmap: % of this JD's required_skills that the user
+        # has on file. We do a normalized substring check in either
+        # direction so "AWS" matches "AWS (ECS, Lambda)" and "Node.js"
+        # matches "node js". Null when there's nothing to match against.
+        skill_match_pct: Optional[int] = None
+        skill_match_have: Optional[int] = None
+        skill_match_total: Optional[int] = None
+        req = j.required_skills if isinstance(j.required_skills, list) else None
+        if req:
+            normalized = [_norm(s) for s in req if str(s).strip()]
+            normalized = [n for n in normalized if n]
+            if normalized:
+                have = 0
+                for n in normalized:
+                    if n in user_skill_terms:
+                        have += 1
+                        continue
+                    if any(n in t or t in n for t in user_skill_terms):
+                        have += 1
+                skill_match_total = len(normalized)
+                skill_match_have = have
+                skill_match_pct = (
+                    int(round(100 * have / skill_match_total))
+                    if skill_match_total
+                    else None
+                )
         out.append(
             TrackedJobSummary(
                 id=j.id,
@@ -219,9 +277,142 @@ async def list_jobs(
                 employment_type=j.employment_type,
                 fit_score=fit_score,
                 red_flag_count=red_flag_count,
+                skill_match_pct=skill_match_pct,
+                skill_match_have=skill_match_have,
+                skill_match_total=skill_match_total,
             )
         )
     return out
+
+
+# --- Tracked-job archiving --------------------------------------------------
+#
+# Three buckets, each with its own staleness window:
+#   - "open" pre-application states (to_review, watching, interested) —
+#     stale fast (60 days) because the job posting itself usually expires.
+#   - "in-flight" application states (applied, phone_screen, take_home,
+#     onsite, final_round) — stale at 90 days; no response in 3 months
+#     means the listing is dead even if the user never saw a rejection.
+#   - terminal-but-not-yet-archived (ghosted, lost, withdrawn) — stale at
+#     30 days because they're already done; archiving is just tidying.
+#
+# Statuses we explicitly never auto-archive: offer, hired, archived (already
+# archived), and `not_interested` (the user chose that — let them keep the
+# row visible if they want with the closed-jobs toggle).
+_AUTO_ARCHIVE_BUCKETS: dict[int, tuple[str, ...]] = {
+    60: ("to_review", "watching", "interested"),
+    90: ("applied", "phone_screen", "take_home", "onsite", "final_round"),
+    30: ("ghosted", "lost", "withdrawn"),
+}
+
+
+class AutoArchivePreviewOut(BaseModel):
+    """How many jobs each staleness rule would catch, plus a small sample
+    of titles for confirmation. Returned by both preview and execute so
+    the UI can re-render the same shape after the action completes."""
+
+    candidates_by_bucket: dict[str, int]
+    total: int
+    sample_titles: list[str]
+    archived: int = 0  # 0 on preview, actual count on execute
+
+
+def _auto_archive_cutoff(days: int) -> datetime:
+    return datetime.now(tz=timezone.utc) - timedelta(days=days)
+
+
+async def _collect_auto_archive_candidates(
+    db: AsyncSession, user_id: int
+) -> dict[str, list[TrackedJob]]:
+    """Returns {bucket_label: [jobs…]} for every staleness rule, where
+    bucket_label is e.g. "open ≥60d". Respects soft-delete and skips
+    rows already at status=archived."""
+    out: dict[str, list[TrackedJob]] = {}
+    for days, statuses in _AUTO_ARCHIVE_BUCKETS.items():
+        label_states = {
+            (60, ("to_review", "watching", "interested")): "open ≥60d",
+            (90, ("applied", "phone_screen", "take_home", "onsite", "final_round")): "in-flight ≥90d",
+            (30, ("ghosted", "lost", "withdrawn")): "closed ≥30d",
+        }.get((days, statuses), f"≥{days}d")
+        rows = (
+            await db.execute(
+                select(TrackedJob).where(
+                    TrackedJob.user_id == user_id,
+                    TrackedJob.deleted_at.is_(None),
+                    TrackedJob.status.in_(statuses),
+                    TrackedJob.updated_at < _auto_archive_cutoff(days),
+                )
+            )
+        ).scalars().all()
+        out[label_states] = list(rows)
+    return out
+
+
+@router.get("/auto-archive/preview", response_model=AutoArchivePreviewOut)
+async def auto_archive_preview(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> AutoArchivePreviewOut:
+    """Read-only preview — how many jobs would be archived right now."""
+    by_bucket = await _collect_auto_archive_candidates(db, user.id)
+    counts = {label: len(rows) for label, rows in by_bucket.items()}
+    total = sum(counts.values())
+    sample: list[str] = []
+    for rows in by_bucket.values():
+        for j in rows[:5]:
+            sample.append(j.title)
+            if len(sample) >= 10:
+                break
+        if len(sample) >= 10:
+            break
+    return AutoArchivePreviewOut(
+        candidates_by_bucket=counts,
+        total=total,
+        sample_titles=sample,
+        archived=0,
+    )
+
+
+@router.post("/auto-archive", response_model=AutoArchivePreviewOut)
+async def auto_archive_execute(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> AutoArchivePreviewOut:
+    """Execute the archive sweep — flip every stale row to status=archived
+    and emit a status-change ApplicationEvent so the activity feed reflects
+    why the row went archived ("auto-archive: stale ≥60d")."""
+    by_bucket = await _collect_auto_archive_candidates(db, user.id)
+    counts = {label: len(rows) for label, rows in by_bucket.items()}
+    total = sum(counts.values())
+    sample: list[str] = []
+    archived = 0
+    now = datetime.now(tz=timezone.utc)
+    for label, rows in by_bucket.items():
+        for j in rows:
+            prev_status = j.status
+            j.status = "archived"
+            db.add(
+                ApplicationEvent(
+                    tracked_job_id=j.id,
+                    event_type="status_change",
+                    event_date=now,
+                    details_md=(
+                        f"Auto-archived from `{prev_status}` ({label}) — "
+                        "no activity within the staleness window."
+                    ),
+                )
+            )
+            archived += 1
+            if len(sample) < 10:
+                sample.append(j.title)
+    if archived:
+        await db.commit()
+    return AutoArchivePreviewOut(
+        candidates_by_bucket=counts,
+        total=total,
+        sample_titles=sample,
+        archived=archived,
+    )
 
 
 @router.post(

@@ -118,6 +118,14 @@ class TrackedJobSummary(BaseModel):
     # Count of red-flag items from jd_analysis.red_flags. Tracker row flags a
     # warning icon when > 0.
     red_flag_count: int = 0
+    # Skill-match heatmap. `skill_match_pct` is the share of this job's
+    # required_skills that the user has in their catalog (0-100, integer).
+    # `skill_match_have` / `skill_match_total` show the raw fraction so the
+    # tooltip can read "5 of 8 required skills". Null means the JD didn't
+    # surface required_skills (no analysis yet, or an unparsed listing).
+    skill_match_pct: Optional[int] = None
+    skill_match_have: Optional[int] = None
+    skill_match_total: Optional[int] = None
 
 
 # --------- InterviewRound ----------------------------------------------------
