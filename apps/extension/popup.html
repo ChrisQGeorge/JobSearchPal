@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Save to Job Search Pal</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+        background: #16140e;
+        color: #e7e2cf;
+        margin: 0;
+        padding: 12px;
+        width: 280px;
+      }
+      h1 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: #c0b896; margin: 0 0 8px; }
+      label { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: #918a72; margin: 8px 0 2px; }
+      input, textarea, select {
+        width: 100%;
+        background: #1f1c14;
+        color: #e7e2cf;
+        border: 1px solid #3a3325;
+        border-radius: 3px;
+        padding: 6px 8px;
+        font-size: 12px;
+        box-sizing: border-box;
+        font-family: inherit;
+      }
+      textarea { min-height: 80px; resize: vertical; }
+      button {
+        background: #c89b3c;
+        color: #1b1b1b;
+        border: 0;
+        border-radius: 3px;
+        padding: 6px 10px;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        margin-top: 10px;
+      }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      button.secondary { background: transparent; color: #c0b896; border: 1px solid #3a3325; }
+      .row { display: flex; gap: 6px; }
+      .row > * { flex: 1; }
+      #status { font-size: 11px; color: #918a72; margin-top: 8px; min-height: 1em; }
+      .ok { color: #6ec078; }
+      .err { color: #d97a7a; }
+    </style>
+  </head>
+  <body>
+    <h1>Save to Job Search Pal</h1>
+    <label for="title">Title</label>
+    <input id="title" />
+    <label for="org">Organization</label>
+    <input id="org" />
+    <label for="location">Location</label>
+    <input id="location" />
+    <label for="url">Source URL</label>
+    <input id="url" readonly />
+    <label for="jd">Job description (auto-extracted)</label>
+    <textarea id="jd"></textarea>
+    <div class="row">
+      <button id="save">Save</button>
+      <button id="open-options" class="secondary" type="button">Settings</button>
+    </div>
+    <div id="status"></div>
+    <script src="popup.js"></script>
+  </body>
+</html>
