@@ -130,6 +130,89 @@ async def create_snapshot(
     return snap
 
 
+class FunnelStageOut(BaseModel):
+    stage: str
+    count: int
+    rate_from_applied: Optional[float] = None  # % of `applied` that reached this stage
+
+
+class FunnelBySourceRowOut(BaseModel):
+    source: str  # source_platform name, or "(unknown)" for null
+    total: int
+    stages: list[FunnelStageOut]
+
+
+# The funnel stages, in order, plus the set of TrackedJob statuses that
+# count as "having reached" that stage. A row "reaches" a later stage if
+# its current status OR any historical event has been at that stage; we
+# approximate via current-status-or-later because we don't track full
+# status history (yet).
+_FUNNEL_STAGES: list[tuple[str, set[str]]] = [
+    ("applied", {"applied", "phone_screen", "take_home", "onsite", "final_round", "offer", "hired"}),
+    ("phone_screen", {"phone_screen", "take_home", "onsite", "final_round", "offer", "hired"}),
+    ("onsite", {"onsite", "final_round", "offer", "hired"}),
+    ("offer", {"offer", "hired"}),
+    ("hired", {"hired"}),
+]
+
+
+@router.get("/funnel-by-source", response_model=list[FunnelBySourceRowOut])
+async def funnel_by_source(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[FunnelBySourceRowOut]:
+    """Application-to-response funnel grouped by source_platform.
+
+    Useful for "where am I getting traction?" — you might find that 80% of
+    your interviews come from referrals while LinkedIn applies are mostly
+    ghosted. Returned rows are sorted by total applications descending so
+    the heaviest channels show first.
+
+    The "reached stage X" rule treats current status as monotonic: a job
+    at status=onsite has reached applied + phone_screen + onsite. The
+    funnel doesn't count jobs that bypassed `applied` (e.g. recruiter
+    inbound that skipped straight to interest)."""
+    rows = (
+        await db.execute(
+            select(TrackedJob).where(
+                TrackedJob.user_id == user.id,
+                TrackedJob.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+
+    # Bucket by source_platform. Empty / None collapses to "(unknown)" so
+    # the user can see how much of their pipeline is unattributed.
+    by_source: dict[str, list[TrackedJob]] = {}
+    for j in rows:
+        key = (j.source_platform or "").strip() or "(unknown)"
+        by_source.setdefault(key, []).append(j)
+
+    out: list[FunnelBySourceRowOut] = []
+    for source, items in by_source.items():
+        applied_count = sum(
+            1 for j in items if j.status in _FUNNEL_STAGES[0][1]
+        )
+        stages: list[FunnelStageOut] = []
+        for stage, accepted in _FUNNEL_STAGES:
+            n = sum(1 for j in items if j.status in accepted)
+            rate = (
+                round(100 * n / applied_count, 1) if applied_count else None
+            )
+            stages.append(
+                FunnelStageOut(stage=stage, count=n, rate_from_applied=rate)
+            )
+        out.append(
+            FunnelBySourceRowOut(
+                source=source,
+                total=len(items),
+                stages=stages,
+            )
+        )
+    out.sort(key=lambda r: -r.total)
+    return out
+
+
 @router.get("/snapshots", response_model=list[SnapshotOut])
 async def list_snapshots(
     db: AsyncSession = Depends(get_db),

@@ -168,6 +168,13 @@ export default function DashboardPage() {
             </h2>
             <ActivitySparkline series={metrics.activitySeries} />
           </section>
+
+          <section className="jsp-card p-5 md:col-span-2">
+            <h2 className="text-sm uppercase tracking-wider text-corp-muted mb-3">
+              Application-to-response funnel by source
+            </h2>
+            <SourceFunnelPanel />
+          </section>
         </div>
       ) : (
         <section className="jsp-card p-5">
@@ -479,6 +486,118 @@ type StrategyResult = {
   risks: string[];
   warning?: string | null;
 };
+
+/** Application-to-response funnel grouped by source_platform — answers
+ * "where am I getting traction?" Shows a tiny per-source bar chart with
+ * absolute counts and rate-from-applied (so a source with 80 applies and
+ * 1 onsite reads weaker than a source with 4 applies and 2 onsites). */
+type FunnelStage = { stage: string; count: number; rate_from_applied: number | null };
+type FunnelRow = { source: string; total: number; stages: FunnelStage[] };
+
+function SourceFunnelPanel() {
+  const [rows, setRows] = useState<FunnelRow[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    api
+      .get<FunnelRow[]>("/api/v1/metrics/funnel-by-source")
+      .then((r) => setRows(r))
+      .catch((e) =>
+        setErr(
+          e instanceof ApiError
+            ? `Funnel load failed (HTTP ${e.status}).`
+            : "Funnel load failed.",
+        ),
+      );
+  }, []);
+
+  if (err) {
+    return <p className="text-sm text-corp-danger">{err}</p>;
+  }
+  if (rows === null) {
+    return <p className="text-sm text-corp-muted">Loading…</p>;
+  }
+  // Filter out sources that never reached `applied` — they clutter the
+  // table without adding signal (those are jobs you tracked but didn't
+  // actually apply to).
+  const nonZero = rows.filter((r) => r.stages[0]?.count > 0);
+  if (nonZero.length === 0) {
+    return (
+      <p className="text-sm text-corp-muted">
+        No applications yet — funnel populates once you mark a job as applied.
+      </p>
+    );
+  }
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-left text-[11px] uppercase tracking-wider text-corp-muted border-b border-corp-border">
+            <th className="py-2 pr-4">Source</th>
+            <th className="py-2 px-2 text-right">Tracked</th>
+            {nonZero[0].stages.map((s) => (
+              <th key={s.stage} className="py-2 px-2 text-right">
+                {s.stage.replace(/_/g, " ")}
+              </th>
+            ))}
+            <th className="py-2 pl-2 text-right">→ offer</th>
+          </tr>
+        </thead>
+        <tbody>
+          {nonZero.map((r) => {
+            const offerRate =
+              r.stages.find((s) => s.stage === "offer")?.rate_from_applied ?? null;
+            return (
+              <tr key={r.source} className="border-b border-corp-border/50">
+                <td className="py-1.5 pr-4 truncate max-w-[180px]" title={r.source}>
+                  {r.source}
+                </td>
+                <td className="py-1.5 px-2 text-right text-corp-muted tabular-nums">
+                  {r.total}
+                </td>
+                {r.stages.map((s) => (
+                  <td
+                    key={s.stage}
+                    className="py-1.5 px-2 text-right tabular-nums"
+                    title={
+                      s.rate_from_applied !== null
+                        ? `${s.rate_from_applied}% of applied`
+                        : undefined
+                    }
+                  >
+                    {s.count}
+                    {s.rate_from_applied !== null && s.stage !== "applied" ? (
+                      <span className="ml-1 text-[10px] text-corp-muted">
+                        ({s.rate_from_applied}%)
+                      </span>
+                    ) : null}
+                  </td>
+                ))}
+                <td
+                  className={`py-1.5 pl-2 text-right tabular-nums ${
+                    offerRate != null && offerRate >= 10
+                      ? "text-emerald-300"
+                      : offerRate != null && offerRate > 0
+                        ? "text-corp-accent"
+                        : "text-corp-muted"
+                  }`}
+                >
+                  {offerRate !== null ? `${offerRate}%` : "—"}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <p className="text-[11px] text-corp-muted mt-2">
+        Rate-from-applied per stage in parentheses. Source “(unknown)” means
+        the job didn't have a source_platform set — fill that in on the
+        tracker for cleaner attribution.
+      </p>
+    </div>
+  );
+}
+
 
 function StrategyPanel() {
   const [result, setResult] = useState<StrategyResult | null>(null);
