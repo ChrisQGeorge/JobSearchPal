@@ -13,6 +13,7 @@ from app.api.v1 import auth_claude as auth_claude_router
 from app.api.v1 import companion as companion_router
 from app.api.v1 import cover_letter_library as cover_letter_library_router
 from app.api.v1 import documents as documents_router
+from app.api.v1 import email_ingest as email_ingest_router
 from app.api.v1 import history as history_router
 from app.api.v1 import jobs as jobs_router
 from app.api.v1 import organizations as organizations_router
@@ -141,4 +142,5 @@ app.include_router(autofill_router.router, prefix="/api/v1")
 app.include_router(resume_ingest_router.router, prefix="/api/v1")
 app.include_router(companion_router.router, prefix="/api/v1")
 app.include_router(cover_letter_library_router.router, prefix="/api/v1")
+app.include_router(email_ingest_router.router, prefix="/api/v1")
 sources_router.register(app)

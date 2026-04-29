@@ -140,6 +140,36 @@ Project skill definitions already exist at `/skills/<name>/SKILL.md`. Wire them 
 - ✅ **Circular link reverse view** — `GET /history/links?either_type=X&either_id=N` returns links where the entity is on either side, normalized so the queried entity is always the `from_*` side. `RelatedItemsPanel` now uses it so entity B shows inbound links from A without extra bookkeeping.
 - ✅ **OAuth debug-file cleanup** — new `_prune_old_debug_files` helper runs at the start of every `claude setup-token` session; deletes `.bin` files older than 7 days while always keeping the most recent 10 for active investigation. Cleans up the `claude_config` volume automatically.
 
+## R9 — Email ingest (new milestone, Chris feature)
+
+- ✅ **Paste-an-email → classify → suggest status change** (migration 0021).
+  New `parsed_emails` table logs every email run through the classifier,
+  with the Claude output, the matched tracked job (if any), and whether
+  the suggestion was applied.
+  - Endpoints: `POST /api/v1/email-ingest/parse` (one-shot classify),
+    `POST /api/v1/email-ingest/{id}/reparse` (re-run classifier),
+    `POST /api/v1/email-ingest/{id}/apply` (confirm with optional
+    overrides — flips tracked-job status + logs an ApplicationEvent),
+    `POST /api/v1/email-ingest/{id}/dismiss`,
+    `DELETE /api/v1/email-ingest/{id}`,
+    `GET /api/v1/email-ingest`.
+  - Classifier prompt produces a strict JSON shape: `intent` (one of
+    rejection / interview_invite / take_home_assigned / offer / withdrew /
+    status_update / ghosted / unrelated), confidence, matched_job_id
+    (verified to belong to the user before persist), suggested_status
+    + suggested_event_type, key_dates extracted from body, summary.
+  - Dedupes re-pasted emails via SHA-1 of from + subject + received_at +
+    body so an accidental Ctrl-V doesn't double up.
+  - New `/inbox` page: paste form on top, list of parsed emails below
+    with state filters (new / applied / dismissed / errored / all).
+    Selecting a row opens the review panel — user can override the
+    matched job, target status, event type, and activity-feed note
+    before clicking Apply. Body is collapsible.
+  - Apply persists an ApplicationEvent with the email's from / subject
+    + a quoted-thread-stripped body snippet, then re-runs the
+    deterministic fit-score so the row stays fresh.
+  - Sidebar gains an "Email Inbox" entry under the queues.
+
 ## R8 — Deterministic fit-score (new milestone, scope amendment)
 
 - ✅ **Replace the Companion-driven `fit_score` with a pure-Python
@@ -188,8 +218,6 @@ Project skill definitions already exist at `/skills/<name>/SKILL.md`. Wire them 
   interested / watching / dismissed; interested + watching auto-create
   a TrackedJob and queue a `score` task. Filters (title regex, location
   regex, remote-only) apply at ingest so the inbox doesn't drown.
-- [ ] Per-user spend cap on `score` tasks triggered by lead promotion
-  (defer until R5 spend-cap landing).
 
 ## Approved feature requests (in flight / queued)
 

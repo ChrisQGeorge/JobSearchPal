@@ -13,6 +13,7 @@ const NAV = [
   { href: "/leads", label: "Job Leads" },
   { href: "/jobs/review", label: "Review Queue" },
   { href: "/jobs/apply", label: "Apply Queue" },
+  { href: "/inbox", label: "Email Inbox" },
   { href: "/queue", label: "Companion Activity" },
   { href: "/studio", label: "Document Studio" },
   { href: "/samples", label: "Writing Samples" },
