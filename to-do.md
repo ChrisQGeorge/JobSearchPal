@@ -140,6 +140,43 @@ Project skill definitions already exist at `/skills/<name>/SKILL.md`. Wire them 
 - ✅ **Circular link reverse view** — `GET /history/links?either_type=X&either_id=N` returns links where the entity is on either side, normalized so the queried entity is always the `from_*` side. `RelatedItemsPanel` now uses it so entity B shows inbound links from A without extra bookkeeping.
 - ✅ **OAuth debug-file cleanup** — new `_prune_old_debug_files` helper runs at the start of every `claude setup-token` session; deletes `.bin` files older than 7 days while always keeping the most recent 10 for active investigation. Cleans up the `claude_config` volume automatically.
 
+## R8 — Deterministic fit-score (new milestone, scope amendment)
+
+- ✅ **Replace the Companion-driven `fit_score` with a pure-Python
+  weighted average** (migration 0020). Score is reproducible, free, and
+  recomputed on every job create / update / JD-analyze. No more Claude
+  calls in the scoring path.
+  - New `app/scoring/fit.py` produces a `FitResult` with a per-component
+    breakdown (verdict ∈ match / partial / miss / veto / unknown /
+    informational, weight 0-100, matched_pct, human-readable detail).
+  - Seven **built-in components**: salary, remote_policy, location,
+    experience_level, employment_type, travel, hours. Each has a default
+    weight (70 / 60 / 50 / 60 / 50 / 30 / 30) editable per-user via
+    `JobPreferences.builtin_weights` (new JSON column).
+  - **JobCriterion.weight** is now first-class 0-100. Weight 0 =
+    informational only. Weight 100 + tier=unacceptable + JD match = hard
+    veto (forces score=0 with a stamped `veto_reason`). Other tiers
+    contribute weight proportionally to numerator / denominator of a
+    weighted average.
+  - Built-in components also produce vetoes when the JD's value lands
+    in the user's `..._unacceptable` lists (remote_policy,
+    experience_level, employment_type, salary_unacceptable_below).
+  - Persisted onto `tracked_jobs.fit_summary` as `{score, vetoed,
+    veto_reason, breakdown[], summary, scored_by:"deterministic"}`. The
+    qualitative `summary` from the JD-analyzer is preserved alongside.
+  - Endpoints: `POST /jobs/{id}/recompute-fit-score` (single),
+    `POST /jobs/recompute-fit-score-all` (every row).
+  - **Preferences page**: new `BuiltinWeightsCard` with sliders +
+    number inputs for the seven built-ins; criteria list rows now have
+    inline tier dropdown + 0-100 weight slider with a 🚫 indicator
+    when veto-eligible. "Recompute fit scores" button on both the
+    Criteria tab and the Tracker toolbar.
+  - **Job detail**: new `FitScoreBreakdownPanel` shows the score, veto
+    reason if any, and a per-component table (verdict / label /
+    weight / matched%). Refresh button hits the recompute endpoint.
+    JD-Analysis panel no longer displays a number — that lives in the
+    breakdown panel.
+
 ## R7 — Job Leads ingest (new milestone, scope amendment)
 
 - ✅ **Job sources + leads inbox** (migration 0019). New `job_sources`

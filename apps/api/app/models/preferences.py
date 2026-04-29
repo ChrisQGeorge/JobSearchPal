@@ -82,6 +82,12 @@ class JobPreferences(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     dealbreakers_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     dream_job_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # Per-user weight overrides for the deterministic fit-score's
+    # built-in components (salary, remote_policy, location, etc.).
+    # Defaults live in `app/scoring/fit.py`; this column only stores
+    # the user's overrides as a {component_key: int 0-100} map.
+    builtin_weights: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
 
 class JobCriterion(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     __tablename__ = "job_criteria"

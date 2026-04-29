@@ -39,6 +39,7 @@ from app.models.jobs import (
     TrackedJob,
 )
 from app.models.user import User
+from app.scoring import apply_fit_score_to_job, compute_fit_score
 from app.schemas.jobs import (
     ApplicationEventIn,
     ApplicationEventOut,
@@ -449,6 +450,10 @@ async def create_job(
             details_md=f"Created with status `{job.status}`.",
         )
     )
+    # Compute the deterministic fit score before commit so the row is
+    # surfaced with a real number on first list-jobs.
+    result = await compute_fit_score(db, user, job)
+    apply_fit_score_to_job(job, result)
     await db.commit()
     await db.refresh(job)
 
@@ -513,6 +518,20 @@ async def update_job(
             and job.date_closed is None
         ):
             job.date_closed = date.today()
+
+    # Recompute deterministic fit_score on every update — the cost is a
+    # few small selects, and stale scores were a regular foot-gun before.
+    # Skip when the only change is a status transition (no scoring inputs
+    # changed) for a tiny perf win.
+    scoring_fields = {
+        "title", "job_description", "location", "remote_policy",
+        "salary_min", "salary_max", "experience_level", "experience_years_min",
+        "experience_years_max", "employment_type", "education_required",
+        "required_skills", "nice_to_have_skills", "organization_id",
+    }
+    if scoring_fields & set(data.keys()):
+        result = await compute_fit_score(db, user, job)
+        apply_fit_score_to_job(job, result)
 
     await db.commit()
     await db.refresh(job)
@@ -1363,11 +1382,20 @@ def _build_jd_analyze_prompt(job: TrackedJob, org_name: Optional[str] = None) ->
 
 def _apply_jd_analysis_to_job(job: TrackedJob, data: dict) -> None:
     """Normalize Claude's response and persist it onto the TrackedJob. Shared
-    between the single-job endpoint and the batch queue handler."""
+    between the single-job endpoint and the batch queue handler.
+
+    The numeric `fit_score` is NOT taken from Claude any more — that comes
+    from the deterministic scoring engine in `app/scoring/fit.py`. We
+    only persist the qualitative summary here. Caller is responsible for
+    invoking `compute_fit_score` + `apply_fit_score_to_job` separately
+    so the score reflects the new analysis-derived skills lists."""
     analysis = JdAnalysis(**{k: v for k, v in data.items() if k in JdAnalysis.model_fields})
     job.jd_analysis = analysis.model_dump()
+    prior = job.fit_summary if isinstance(job.fit_summary, dict) else {}
+    out = dict(prior)
     if analysis.fit_summary:
-        job.fit_summary = {"summary": analysis.fit_summary, "score": analysis.fit_score}
+        out["summary"] = analysis.fit_summary
+    job.fit_summary = out
 
 
 async def _resolve_org_name(db: AsyncSession, org_id: Optional[int]) -> Optional[str]:
@@ -1441,9 +1469,80 @@ async def analyze_jd(
 
     data = _extract_json_object(final_text) or {}
     _apply_jd_analysis_to_job(job, data)
+    # JD analysis usually populates required_skills / nice_to_have_skills
+    # which the deterministic scorer reads — recompute to reflect them.
+    result = await compute_fit_score(db, user, job)
+    apply_fit_score_to_job(job, result)
     await db.commit()
     await db.refresh(job)
     return job
+
+
+# --- Deterministic fit-score recompute --------------------------------------
+
+
+class FitBreakdownOut(BaseModel):
+    """Mirror of the FitResult.to_dict() shape so the frontend can read
+    the breakdown without poking at fit_summary directly."""
+
+    score: Optional[int] = None
+    vetoed: bool = False
+    veto_reason: Optional[str] = None
+    components: list[dict] = []
+
+
+@router.post("/{job_id:int}/recompute-fit-score", response_model=FitBreakdownOut)
+async def recompute_fit_score(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> FitBreakdownOut:
+    """Manual recompute for one job. Used by the breakdown panel's
+    Refresh button. Persists the new score + breakdown to fit_summary."""
+    job = await _get_owned_job(db, job_id, user.id)
+    result = await compute_fit_score(db, user, job)
+    apply_fit_score_to_job(job, result)
+    await db.commit()
+    return FitBreakdownOut(**result.to_dict())
+
+
+class RecomputeAllOut(BaseModel):
+    rescored: int
+    vetoed: int
+    unknown: int
+
+
+@router.post("/recompute-fit-score-all", response_model=RecomputeAllOut)
+async def recompute_all_fit_scores(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> RecomputeAllOut:
+    """Recompute the deterministic fit score for every tracked job.
+    Used after the user changes preferences / criteria / weights so all
+    rows reflect the new rules. Cheap — no Claude calls."""
+    rows = (
+        await db.execute(
+            select(TrackedJob).where(
+                TrackedJob.user_id == user.id,
+                TrackedJob.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    rescored = 0
+    vetoed = 0
+    unknown = 0
+    for job in rows:
+        result = await compute_fit_score(db, user, job)
+        apply_fit_score_to_job(job, result)
+        if result.vetoed:
+            vetoed += 1
+        elif result.score is None:
+            unknown += 1
+        else:
+            rescored += 1
+    if rows:
+        await db.commit()
+    return RecomputeAllOut(rescored=rescored, vetoed=vetoed, unknown=unknown)
 
 
 class BatchAnalyzeOut(BaseModel):

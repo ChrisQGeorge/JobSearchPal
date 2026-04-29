@@ -83,6 +83,11 @@ class JobPreferencesIn(BaseModel):
     notice_period_weeks: Optional[int] = None
     dealbreakers_notes: Optional[str] = None
     dream_job_notes: Optional[str] = None
+    # Per-user weight overrides for the deterministic fit-score's
+    # built-in components. Keys: salary, remote_policy, location,
+    # experience_level, employment_type, travel, hours. Values 0-100.
+    # Unset keys fall back to DEFAULT_BUILTIN_WEIGHTS in app/scoring/fit.py.
+    builtin_weights: Optional[dict[str, int]] = None
 
 
 class JobPreferencesOut(JobPreferencesIn):
@@ -358,7 +363,10 @@ class JobCriterionIn(BaseModel):
     category: str = Field(min_length=1, max_length=32)
     value: str = Field(min_length=1, max_length=255)
     tier: str = Field(default="preferred")  # preferred / acceptable / unacceptable
-    weight: Optional[int] = None
+    # 0-100. The deterministic fit-score reads this directly:
+    # 0 = informational only (excluded from numerator + denominator).
+    # 100 + tier=unacceptable + matched JD = hard veto (score = 0).
+    weight: Optional[int] = Field(default=None, ge=0, le=100)
     notes: Optional[str] = None
 
 

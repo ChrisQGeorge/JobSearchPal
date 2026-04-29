@@ -421,6 +421,7 @@ export default function JobTrackerPage() {
           />
           Show closed / rejected
         </label>
+        <RecomputeFitButton onDone={() => refresh()} />
         <AutoArchiveButton onArchived={() => refresh()} />
       </div>
 
@@ -845,6 +846,57 @@ function SkillMatchHeatmap({
 /** Run the auto-archive sweep. Shows a preview confirmation first so
  * the user always sees what's about to move; clicking through actually
  * archives the rows. Inert when there's nothing stale. */
+/** Re-run the deterministic fit-score across every tracked job. Cheap
+ * (pure-Python) so we can offer a one-click button instead of a queue
+ * task. Used after the user changes preferences / criteria / weights. */
+function RecomputeFitButton({ onDone }: { onDone: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  async function run() {
+    setBusy(true);
+    setMsg(null);
+    try {
+      const out = await api.post<{
+        rescored: number;
+        vetoed: number;
+        unknown: number;
+      }>("/api/v1/jobs/recompute-fit-score-all", {});
+      setMsg(
+        `${out.rescored} rescored · ${out.vetoed} vetoed · ${out.unknown} unscored.`,
+      );
+      onDone();
+      setTimeout(() => setMsg(null), 4000);
+    } catch (e) {
+      setMsg(
+        e instanceof ApiError
+          ? `Recompute failed (HTTP ${e.status}).`
+          : "Recompute failed.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <span className="inline-flex items-center gap-2">
+      <button
+        type="button"
+        className="jsp-btn-ghost text-xs"
+        onClick={run}
+        disabled={busy}
+        title="Recompute the deterministic fit score for every tracked job using your current preferences + criteria + weights."
+      >
+        {busy ? "Recomputing…" : "Recompute fit"}
+      </button>
+      {msg ? (
+        <span className="text-[11px] text-corp-muted">{msg}</span>
+      ) : null}
+    </span>
+  );
+}
+
+
 function AutoArchiveButton({ onArchived }: { onArchived: () => void }) {
   const [busy, setBusy] = useState<"idle" | "preview" | "running">("idle");
   const [preview, setPreview] = useState<{

@@ -1328,11 +1328,43 @@ type Criterion = {
   notes?: string | null;
 };
 
+const BUILTIN_KEYS = [
+  "salary",
+  "remote_policy",
+  "location",
+  "experience_level",
+  "employment_type",
+  "travel",
+  "hours",
+] as const;
+
+const BUILTIN_DEFAULTS: Record<string, number> = {
+  salary: 70,
+  remote_policy: 60,
+  location: 50,
+  experience_level: 60,
+  employment_type: 50,
+  travel: 30,
+  hours: 30,
+};
+
+const BUILTIN_LABELS: Record<string, string> = {
+  salary: "Salary",
+  remote_policy: "Remote policy",
+  location: "Location",
+  experience_level: "Experience level",
+  employment_type: "Employment type",
+  travel: "Travel",
+  hours: "Hours / week",
+};
+
 function CriteriaPanel() {
   const [items, setItems] = useState<Criterion[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
+  const [recomputing, setRecomputing] = useState(false);
+  const [recomputeMsg, setRecomputeMsg] = useState<string | null>(null);
 
   async function refresh() {
     setLoading(true);
@@ -1354,72 +1386,331 @@ function CriteriaPanel() {
     await refresh();
   }
 
+  async function updateRow(c: Criterion, patch: Partial<Criterion>) {
+    const next = { ...c, ...patch };
+    setItems((prev) => prev.map((row) => (row.id === c.id ? next : row)));
+    try {
+      await api.put(`/api/v1/preferences/criteria/${c.id}`, {
+        category: next.category,
+        value: next.value,
+        tier: next.tier,
+        weight: next.weight ?? null,
+        notes: next.notes ?? null,
+      });
+    } catch (e) {
+      setErr(
+        e instanceof ApiError
+          ? `Save failed (HTTP ${e.status}).`
+          : "Save failed.",
+      );
+      // Refetch on failure to recover state.
+      await refresh();
+    }
+  }
+
+  async function recomputeAll() {
+    setRecomputing(true);
+    setRecomputeMsg(null);
+    try {
+      const out = await api.post<{
+        rescored: number;
+        vetoed: number;
+        unknown: number;
+      }>("/api/v1/jobs/recompute-fit-score-all", {});
+      setRecomputeMsg(
+        `${out.rescored} rescored · ${out.vetoed} vetoed · ${out.unknown} unscored (no data).`,
+      );
+    } catch (e) {
+      setRecomputeMsg(
+        e instanceof ApiError
+          ? `Recompute failed (HTTP ${e.status}).`
+          : "Recompute failed.",
+      );
+    } finally {
+      setRecomputing(false);
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <BuiltinWeightsCard />
+
+      <div className="jsp-card p-5 space-y-3">
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <div>
+            <h3 className="text-sm uppercase tracking-wider text-corp-muted">
+              Criteria list
+            </h3>
+            <p className="text-[11px] text-corp-muted mt-1">
+              Free-form preferred / acceptable / unacceptable tags. The
+              deterministic fit-score reads them directly: <b>weight 0</b> is
+              informational only, <b>weight 100</b> on an
+              <i> unacceptable</i> criterion is a hard veto (matched job
+              scores 0).
+            </p>
+          </div>
+          <div className="flex gap-2 items-center flex-wrap">
+            <button
+              className="jsp-btn-ghost text-xs"
+              type="button"
+              onClick={recomputeAll}
+              disabled={recomputing}
+              title="Recompute the fit score for every tracked job using your current preferences + criteria + weights."
+            >
+              {recomputing ? "Recomputing…" : "Recompute fit scores"}
+            </button>
+            <button
+              className="jsp-btn-primary"
+              type="button"
+              onClick={() => setAdding(true)}
+            >
+              + New criterion
+            </button>
+          </div>
+        </div>
+        {recomputeMsg ? (
+          <div className="text-[11px] text-corp-muted">{recomputeMsg}</div>
+        ) : null}
+        {err ? <div className="text-xs text-corp-danger">{err}</div> : null}
+        {adding ? (
+          <CriterionForm
+            onCancel={() => setAdding(false)}
+            onSaved={async () => {
+              setAdding(false);
+              await refresh();
+            }}
+          />
+        ) : null}
+        {loading ? (
+          <p className="text-sm text-corp-muted">Loading...</p>
+        ) : items.length === 0 ? (
+          <p className="text-sm text-corp-muted">No criteria yet.</p>
+        ) : (
+          <ul className="divide-y divide-corp-border">
+            {items.map((c) => (
+              <li key={c.id} className="flex items-center gap-3 py-2">
+                <span className="text-[10px] uppercase tracking-wider text-corp-muted w-20 shrink-0">
+                  {c.category}
+                </span>
+                <span className="text-sm flex-1 truncate" title={c.value}>
+                  {c.value}
+                </span>
+                <select
+                  className="jsp-input w-32 py-1 text-xs"
+                  value={c.tier}
+                  onChange={(e) =>
+                    updateRow(c, {
+                      tier: e.target.value as Criterion["tier"],
+                    })
+                  }
+                  aria-label="Tier"
+                >
+                  <option value="preferred">preferred</option>
+                  <option value="acceptable">acceptable</option>
+                  <option value="unacceptable">unacceptable</option>
+                </select>
+                <div className="flex items-center gap-1">
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    value={c.weight ?? 50}
+                    onChange={(e) =>
+                      setItems((prev) =>
+                        prev.map((row) =>
+                          row.id === c.id
+                            ? { ...row, weight: Number(e.target.value) }
+                            : row,
+                        ),
+                      )
+                    }
+                    onMouseUp={(e) =>
+                      updateRow(c, {
+                        weight: Number(
+                          (e.target as HTMLInputElement).value,
+                        ),
+                      })
+                    }
+                    onTouchEnd={(e) =>
+                      updateRow(c, {
+                        weight: Number(
+                          (e.target as HTMLInputElement).value,
+                        ),
+                      })
+                    }
+                    className="w-24"
+                    aria-label="Weight 0-100"
+                    title={
+                      c.tier === "unacceptable"
+                        ? "Weight 100 + match = hard veto (score 0)"
+                        : "0 = informational only · 100 = strongest weight"
+                    }
+                  />
+                  <span
+                    className={`text-[10px] tabular-nums w-9 text-right ${
+                      c.tier === "unacceptable" && (c.weight ?? 0) >= 100
+                        ? "text-corp-danger font-semibold"
+                        : "text-corp-muted"
+                    }`}
+                  >
+                    {c.weight ?? 50}
+                    {c.tier === "unacceptable" && (c.weight ?? 0) >= 100
+                      ? "🚫"
+                      : ""}
+                  </span>
+                </div>
+                {c.notes ? (
+                  <span
+                    className="text-[11px] text-corp-muted truncate max-w-[16ch]"
+                    title={c.notes}
+                  >
+                    {c.notes}
+                  </span>
+                ) : null}
+                <button
+                  className="jsp-btn-ghost text-xs text-corp-danger border-corp-danger/40"
+                  onClick={() => remove(c.id)}
+                >
+                  Delete
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function BuiltinWeightsCard() {
+  const [weights, setWeights] = useState<Record<string, number>>(
+    BUILTIN_DEFAULTS,
+  );
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [savedMsg, setSavedMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    api
+      .get<{ builtin_weights?: Record<string, number> | null } | null>(
+        "/api/v1/preferences/job",
+      )
+      .then((p) => {
+        const merged = { ...BUILTIN_DEFAULTS };
+        const stored = p?.builtin_weights ?? {};
+        for (const k of BUILTIN_KEYS) {
+          if (typeof stored[k] === "number") merged[k] = stored[k];
+        }
+        setWeights(merged);
+      })
+      .catch(() => {
+        /* leave defaults — first save will create the row */
+      })
+      .finally(() => setLoading(false));
+  }, []);
+
+  async function save(next: Record<string, number>) {
+    setSaving(true);
+    setSavedMsg(null);
+    try {
+      const current =
+        (await api.get<Record<string, unknown> | null>(
+          "/api/v1/preferences/job",
+        )) ?? {};
+      const payload = { ...current, builtin_weights: next } as Record<
+        string,
+        unknown
+      >;
+      // Prune server-only fields the PUT shouldn't accept back.
+      delete payload.id;
+      delete payload.created_at;
+      delete payload.updated_at;
+      await api.put("/api/v1/preferences/job", payload);
+      setSavedMsg("Saved.");
+      setTimeout(() => setSavedMsg(null), 1500);
+    } catch (e) {
+      setSavedMsg(
+        e instanceof ApiError
+          ? `Save failed (HTTP ${e.status}).`
+          : "Save failed.",
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function setOne(key: string, val: number) {
+    const clamped = Math.max(0, Math.min(100, Math.round(val)));
+    const next = { ...weights, [key]: clamped };
+    setWeights(next);
+    void save(next);
+  }
+
   return (
     <div className="jsp-card p-5 space-y-3">
-      <div className="flex items-center justify-between">
-        <div>
-          <h3 className="text-sm uppercase tracking-wider text-corp-muted">Criteria list</h3>
-          <p className="text-[11px] text-corp-muted mt-1">
-            Granular preferred / acceptable / unacceptable tags across industry,
-            role, technology, company size, mission, anything else. The Companion
-            and job-fit-scorer weight these into its reads of each posting.
-          </p>
-        </div>
-        <button className="jsp-btn-primary" type="button" onClick={() => setAdding(true)}>
-          + New criterion
-        </button>
+      <div>
+        <h3 className="text-sm uppercase tracking-wider text-corp-muted">
+          Built-in fit-score weights
+        </h3>
+        <p className="text-[11px] text-corp-muted mt-1">
+          The deterministic scoring engine has seven built-in components that
+          run against every job. Weights are 0–100 — set a component to{" "}
+          <b>0</b> to ignore it entirely, or crank it up to dominate the
+          score. Defaults are sane; tune as needed.
+        </p>
       </div>
-      {err ? <div className="text-xs text-corp-danger">{err}</div> : null}
-      {adding ? (
-        <CriterionForm
-          onCancel={() => setAdding(false)}
-          onSaved={async () => {
-            setAdding(false);
-            await refresh();
-          }}
-        />
-      ) : null}
       {loading ? (
-        <p className="text-sm text-corp-muted">Loading...</p>
-      ) : items.length === 0 ? (
-        <p className="text-sm text-corp-muted">No criteria yet.</p>
+        <p className="text-sm text-corp-muted">Loading…</p>
       ) : (
-        <ul className="divide-y divide-corp-border">
-          {items.map((c) => (
-            <li key={c.id} className="flex items-center gap-3 py-1.5">
-              <span className="text-[10px] uppercase tracking-wider text-corp-muted w-20 shrink-0">
-                {c.category}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {BUILTIN_KEYS.map((k) => (
+            <div key={k} className="flex items-center gap-2">
+              <span className="text-xs text-corp-muted w-32 shrink-0">
+                {BUILTIN_LABELS[k]}
               </span>
-              <span className="text-sm flex-1 truncate">{c.value}</span>
-              <span
-                className={`text-[10px] uppercase tracking-wider px-2 py-0.5 rounded border ${
-                  c.tier === "preferred"
-                    ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
-                    : c.tier === "acceptable"
-                      ? "bg-corp-surface2 text-corp-muted border-corp-border"
-                      : "bg-corp-danger/20 text-corp-danger border-corp-danger/40"
-                }`}
-              >
-                {c.tier}
-              </span>
-              {c.notes ? (
-                <span
-                  className="text-[11px] text-corp-muted truncate max-w-[16ch]"
-                  title={c.notes}
-                >
-                  {c.notes}
-                </span>
-              ) : null}
-              <button
-                className="jsp-btn-ghost text-xs text-corp-danger border-corp-danger/40"
-                onClick={() => remove(c.id)}
-              >
-                Delete
-              </button>
-            </li>
+              <input
+                type="range"
+                min={0}
+                max={100}
+                value={weights[k]}
+                onChange={(e) =>
+                  setWeights((prev) => ({
+                    ...prev,
+                    [k]: Number(e.target.value),
+                  }))
+                }
+                onMouseUp={(e) =>
+                  setOne(k, Number((e.target as HTMLInputElement).value))
+                }
+                onTouchEnd={(e) =>
+                  setOne(k, Number((e.target as HTMLInputElement).value))
+                }
+                className="flex-1"
+                aria-label={`${BUILTIN_LABELS[k]} weight 0-100`}
+                disabled={saving}
+              />
+              <input
+                type="number"
+                className="jsp-input w-16 py-1 text-xs"
+                min={0}
+                max={100}
+                value={weights[k]}
+                onChange={(e) =>
+                  setWeights((prev) => ({
+                    ...prev,
+                    [k]: Number(e.target.value),
+                  }))
+                }
+                onBlur={(e) => setOne(k, Number(e.target.value))}
+                disabled={saving}
+              />
+            </div>
           ))}
-        </ul>
+        </div>
       )}
+      {savedMsg ? (
+        <div className="text-[11px] text-corp-muted">{savedMsg}</div>
+      ) : null}
     </div>
   );
 }
@@ -1499,13 +1790,16 @@ function CriterionForm({
         </select>
       </div>
       <div>
-        <label className="jsp-label">Weight</label>
+        <label className="jsp-label">Weight (0–100)</label>
         <input
           type="number"
+          min={0}
+          max={100}
           className="jsp-input"
           value={weight}
           onChange={(e) => setWeight(e.target.value)}
-          placeholder="1-5"
+          placeholder="50"
+          title="0 = informational only · 100 + tier=unacceptable + match = hard veto"
         />
       </div>
       <div className="flex gap-2">

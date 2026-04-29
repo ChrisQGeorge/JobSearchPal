@@ -817,6 +817,7 @@ function OverviewTab({
         job={job}
         onAnalyzed={onSaved}
       />
+      <FitScoreBreakdownPanel job={job} onRecomputed={onSaved} />
       <AutofillPanel jobId={job.id} />
       {(job.required_skills && job.required_skills.length > 0) ||
       (job.nice_to_have_skills && job.nice_to_have_skills.length > 0) ? (
@@ -2514,6 +2515,178 @@ function ContactsTab({ jobId }: { jobId: number }) {
   );
 }
 
+// ---------- Fit-score breakdown panel ---------------------------------------
+// Surfaces the deterministic scoring components from
+// fit_summary.breakdown so the user can see exactly why a row got the
+// score it did. Refresh button hits POST /jobs/{id}/recompute-fit-score.
+
+type FitComponent = {
+  key: string;
+  label: string;
+  weight: number;
+  verdict: string;
+  matched_pct: number;
+  detail: string;
+  tier?: string | null;
+};
+
+type FitSummaryShape = {
+  score?: number | null;
+  vetoed?: boolean;
+  veto_reason?: string | null;
+  breakdown?: FitComponent[] | null;
+  summary?: string | null;
+};
+
+function FitScoreBreakdownPanel({
+  job,
+  onRecomputed,
+}: {
+  job: TrackedJob;
+  onRecomputed: (j: TrackedJob) => void;
+}) {
+  const [recomputing, setRecomputing] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    const saved = window.localStorage.getItem("jsp:fit_breakdown:expanded");
+    return saved === null ? false : saved === "1";
+  });
+  function toggleExpanded() {
+    setExpanded((prev) => {
+      const next = !prev;
+      try {
+        window.localStorage.setItem(
+          "jsp:fit_breakdown:expanded",
+          next ? "1" : "0",
+        );
+      } catch {
+        /* non-fatal */
+      }
+      return next;
+    });
+  }
+
+  const fs = (job.fit_summary ?? null) as FitSummaryShape | null;
+  const breakdown = fs?.breakdown ?? [];
+  const score = fs?.score ?? null;
+  const vetoed = !!fs?.vetoed;
+  const vetoReason = fs?.veto_reason ?? null;
+
+  async function recompute() {
+    setRecomputing(true);
+    setErr(null);
+    try {
+      await api.post(`/api/v1/jobs/${job.id}/recompute-fit-score`, {});
+      // Re-pull the job to get the fresh fit_summary.
+      const refreshed = await api.get<TrackedJob>(`/api/v1/jobs/${job.id}`);
+      onRecomputed(refreshed);
+    } catch (e) {
+      setErr(
+        e instanceof ApiError
+          ? `Recompute failed (HTTP ${e.status}).`
+          : "Recompute failed.",
+      );
+    } finally {
+      setRecomputing(false);
+    }
+  }
+
+  const scoreToneClass =
+    vetoed
+      ? "text-corp-danger"
+      : score == null
+        ? "text-corp-muted"
+        : score >= 75
+          ? "text-emerald-300"
+          : score >= 50
+            ? "text-corp-accent"
+            : score >= 25
+              ? "text-corp-accent2"
+              : "text-corp-danger";
+
+  return (
+    <div className="jsp-card p-5">
+      <div className="flex items-center gap-3">
+        <button
+          type="button"
+          onClick={toggleExpanded}
+          className="text-corp-muted hover:text-corp-text"
+          aria-label={expanded ? "Collapse" : "Expand"}
+        >
+          {expanded ? "▼" : "▶"}
+        </button>
+        <h3 className="text-sm uppercase tracking-wider text-corp-muted">
+          Fit score
+        </h3>
+        <span className={`text-2xl font-semibold tabular-nums ${scoreToneClass}`}>
+          {vetoed ? "0" : score ?? "—"}
+        </span>
+        {vetoed ? (
+          <span className="text-[10px] uppercase tracking-wider text-corp-danger px-2 py-0.5 rounded border border-corp-danger/40 bg-corp-danger/10">
+            vetoed
+          </span>
+        ) : null}
+        <button
+          type="button"
+          className="jsp-btn-ghost text-xs ml-auto"
+          onClick={recompute}
+          disabled={recomputing}
+          title="Re-run the deterministic scoring against your current preferences."
+        >
+          {recomputing ? "Recomputing…" : "Recompute"}
+        </button>
+      </div>
+      {err ? <div className="text-xs text-corp-danger mt-1">{err}</div> : null}
+      {vetoed && vetoReason ? (
+        <p className="text-[12px] text-corp-danger mt-2">{vetoReason}</p>
+      ) : null}
+      {expanded ? (
+        breakdown.length === 0 ? (
+          <p className="text-sm text-corp-muted mt-3">
+            No breakdown yet — click <b>Recompute</b> to score this job
+            against your current preferences and criteria.
+          </p>
+        ) : (
+          <ul className="mt-3 divide-y divide-corp-border">
+            {breakdown.map((c) => (
+              <li key={c.key} className="py-1.5 flex items-center gap-2 text-xs">
+                <span
+                  className={`inline-block w-16 shrink-0 uppercase tracking-wider text-[10px] ${
+                    c.verdict === "match"
+                      ? "text-emerald-300"
+                      : c.verdict === "partial"
+                        ? "text-corp-accent"
+                        : c.verdict === "veto"
+                          ? "text-corp-danger"
+                          : c.verdict === "miss"
+                            ? "text-corp-accent2"
+                            : "text-corp-muted"
+                  }`}
+                >
+                  {c.verdict}
+                </span>
+                <span className="flex-1 truncate" title={c.detail}>
+                  {c.label}
+                </span>
+                <span className="text-corp-muted text-[10px] tabular-nums w-12 text-right">
+                  {c.weight === 0 ? "info" : `w ${c.weight}`}
+                </span>
+                <span className="text-corp-muted text-[10px] tabular-nums w-10 text-right">
+                  {c.weight === 0 || c.verdict === "unknown" || c.verdict === "informational"
+                    ? "—"
+                    : `${Math.round(c.matched_pct * 100)}%`}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )
+      ) : null}
+    </div>
+  );
+}
+
+
 // ---------- JD Analysis panel (shown on Overview) ---------------------------
 
 function JdAnalysisPanel({
@@ -2595,16 +2768,6 @@ function JdAnalysisPanel({
     );
   }
 
-  const score = analysis.fit_score ?? null;
-  const scoreColor =
-    score === null
-      ? "text-corp-muted"
-      : score >= 75
-        ? "text-emerald-300"
-        : score >= 50
-          ? "text-corp-accent2"
-          : "text-corp-danger";
-
   return (
     <div className="jsp-card p-5 space-y-4">
       <div className="flex items-start justify-between gap-4">
@@ -2623,14 +2786,11 @@ function JdAnalysisPanel({
           {analysis.fit_summary ? (
             <p className="text-sm mt-1">{analysis.fit_summary}</p>
           ) : null}
+          {/* The numeric fit-score is now computed deterministically and
+              shown in the Fit-score panel below. JD Analysis is purely
+              qualitative — strengths, gaps, red/green flags, prep focus. */}
         </div>
         <div className="flex flex-col items-end gap-2">
-          {score !== null ? (
-            <div className={`text-3xl font-semibold ${scoreColor}`}>
-              {score}
-              <span className="text-sm text-corp-muted">/100</span>
-            </div>
-          ) : null}
           <button className="jsp-btn-ghost text-xs" onClick={run} disabled={running}>
             {running ? "..." : "Re-analyze"}
           </button>
