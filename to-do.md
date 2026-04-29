@@ -300,7 +300,13 @@ Migrated from `feature-requests.md` after review. ✅ = shipped this turn,
 
 ## Non-code housekeeping
 
-- [ ] Update the README's "What works" section to match reality.
-- [ ] Add a proper `CHANGELOG.md` (SRS §3.5.10).
-- [ ] Commit + tag `v0.1.0` once R3 skill wiring lands.
-- [ ] Remove or rotate the seeded test user (`chris@example.com`) before first real use.
+- ✅ **Update the README's "What works" section** to match reality —
+  rewritten through R9, with links to `to-do.md` + `CHANGELOG.md`.
+- ✅ **Add a proper `CHANGELOG.md`** (SRS §3.5.10) — at the repo root,
+  organized by R-tag, conventional-commits style.
+- [ ] Commit + tag `v0.1.0` after the next stable build cycle. (Holding
+  off until the user has cycled through a real job-search session and
+  flagged the rough edges they hit.)
+- [ ] Remove or rotate the seeded test user (`chris@example.com`)
+  before first real use. Setup.sh prompts for a real account on first
+  run, but the seed user lingers if you skipped that.

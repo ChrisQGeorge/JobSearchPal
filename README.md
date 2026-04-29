@@ -101,26 +101,72 @@ docker compose down        # stop, keep data
 
 ## What works in this build
 
-This is the **R0–R1 slice** from the SRS release plan.
+R0–R6 of the SRS plus three out-of-band milestones (R7 leads ingest,
+R8 deterministic fit-score, R9 email inbox). See [`to-do.md`](to-do.md)
+for the granular punch-list and [`CHANGELOG.md`](CHANGELOG.md) for the
+release history.
 
-- ✅ Docker stack (`db`, `api`, `web`) with healthy startup ordering and setup.sh bootstrap.
-- ✅ All 36 SQLAlchemy models from SRS §1.2 Schemas, grouped by domain. An initial Alembic migration creates every table on first boot.
-- ✅ Auth: register, login, logout, `GET /auth/me`. Argon2id password hashing, HTTP-only session cookie, JWT payload signed with `SESSION_SECRET`.
-- ✅ Encryption helpers: `encrypt_secret` / `decrypt_secret` using AES-256-GCM with a key derived from `MASTER_SECRET` via HKDF-SHA256 (for the `ApiCredential` table, per SRS 3.3.2 DATA-002).
-- ✅ Claude Code CLI installed in the API container (Node 20 + `@anthropic-ai/claude-code`), with `/health/claude` for reachability checks and `apps/api/app/skills/runner.py` as the subprocess wrapper.
-- ✅ History CRUD endpoints for **WorkExperience, Education, Skill, Achievement**, plus a unified `GET /history/timeline` endpoint that feeds the Career Timeline page.
-- ✅ Frontend: login / register flows, authenticated dashboard, Career Timeline, and a working **History Editor** with tabs for Work / Education / Skills / Achievements (create, edit, soft-delete).
-- ✅ All navigation pages scaffolded — Job Tracker, Document Studio, Writing Samples, Companion, Preferences & Identity, Settings — with "Pending Corporate Approval" placeholders flagged by release wave.
-- ✅ All 15 skills have a `SKILL.md` skeleton with frontmatter, inputs/outputs, and hard guardrails from the SRS.
+### Core foundations (R0–R1)
+- Docker stack (`db` + `api` + `web`) with healthy startup ordering and a one-shot `setup.sh` bootstrap.
+- 36+ SQLAlchemy models, all migrations idempotent through `0021_parsed_emails`.
+- Auth: register / login / logout, Argon2id passwords, HTTP-only JWT session cookie, bearer-token path for skills, in-UI Claude Code OAuth flow with `claude setup-token`.
+- AES-256-GCM at-rest encryption for `ApiCredential` rows; HKDF-SHA256 key derivation from `MASTER_SECRET`.
+- All 13 history entity types (Work / Education / Course / Skill / Cert / Language / Project / Publication / Presentation / Achievement / VolunteerWork / Contact / CustomEvent) with full CRUD.
+- Polymorphic `entity_links` graph + dedicated skill-link tables with `usage_notes`.
+- Career Timeline (greedy lane assignment, by-org + by-kind grouping, gap warnings).
+- Resume profile + Demographics + Job Preferences + Work Authorization + Job Criteria, all with full UI.
 
-## What is intentionally stubbed (future releases)
+### Job lifecycle (R2)
+- Job Tracker with status pills, inline status change, multi-select bulk-status + bulk-tailor + auto-archive.
+- Salary / location-fit / skill-match heatmap badges per row.
+- Review Queue + Apply Queue with `1`/`2`/`3` and `j`/`k` keyboard shortcuts.
+- Job detail tabs: Overview, Interview Rounds, Artifacts, Contacts, Documents, Activity.
+- Excel bulk-import + URL-fetch (Claude WebFetch + WebSearch) → 30-field autofill.
+- Background `job_fetch_queue` worker with rate-limit-aware backoff.
 
-Following the SRS §2.6 apportioning table:
+### Companion + skills (R3)
+- Companion chat with Claude Code subprocess + `--resume`-based threading, SSE streaming, attachment uploads, cost / duration / turns metadata, persona gallery + active persona injection.
+- 15 project skills mounted at `/app/skills/` and discovered by the CLI.
+- jd-analyzer, resume-tailor, cover-letter-tailor, email-drafter, company-researcher, application-autofiller, interview-prep, interview-retrospective, job-strategy-advisor wired end-to-end.
 
-- **R2 – Job Tracking**: Job Tracker list, Job Detail view with InterviewRound + InterviewArtifact management, inline action buttons for skill invocation, JD paste-import.
-- **R3 – AI Skills MVP**: Claude Code subprocess runner in `apps/api/app/skills/`, Companion Chat UI, resume-tailor, cover-letter-tailor, jd-analyzer, application-tracker, companion-persona wired end-to-end.
-- **R4 – Humanization & Studio**: Document Studio, Writing Samples library, writing-humanizer, selection-rewriter, in-editor "Send to Companion" flow.
-- **R5 – Analytics & Polish**: Dashboard charts against MetricSnapshot, persona gallery and custom persona editor, interview-prep + interview-retrospective, job-fit-scorer, application-autofiller, full Preferences & Identity forms.
+### Document Studio (R4)
+- `/studio` Studio editor with selection-based AI (rewrite / answer / new doc), parent-version threading, any-vs-any version diff, batch humanize, free-text tags, PDF page-break aware print stylesheet.
+- Writing Samples Library (paste / .txt / .md upload, tags, full editor).
+- Cover Letter Library (reusable hooks / bridges / closes / anecdotes / value-props).
+
+### Analytics (R5)
+- Dashboard with KPI tiles, status distribution, pipeline funnel, 30-day activity sparkline, application-to-response funnel by source, job-strategy-advisor.
+- MetricSnapshot materialization, on-demand strategy briefings.
+
+### Source ingest (R7)
+- `/leads` page polls Greenhouse / Lever / Ashby / Workable / RSS / YC feeds on a per-source schedule, dedupes leads, surfaces them as a triage inbox. Bulk-promote interesting leads to TrackedJob (auto-queues a fit-score task).
+- Per-source regex filters at ingest (title include / exclude, location include / exclude, remote-only).
+- `/cover-letter-library` and the browser extension stub (`apps/extension/`, MV3) cover the offline ingest paths.
+
+### Deterministic fit-score (R8)
+- Pure-Python scoring engine in `app/scoring/fit.py` produces a 0-100 score with a per-component breakdown — no Claude call in the score path.
+- Seven built-in components (salary, remote_policy, location, experience_level, employment_type, travel, hours) with default weights editable per-user.
+- `JobCriterion.weight` is first-class 0-100; weight 100 + tier=unacceptable + matched JD = hard veto.
+- Job detail surfaces a `FitScoreBreakdownPanel` showing why each row got the score it did.
+
+### Email inbox (R9)
+- `/inbox` page: paste an email body, the Companion classifies it (rejection / interview_invite / offer / take_home / status_update / unrelated), matches it to one of the user's tracked jobs, and proposes a status change + ApplicationEvent.
+- User confirms (or overrides) before anything mutates a TrackedJob.
+- Dedupes re-pastes via SHA-1 of from + subject + received + body.
+
+### Cross-cutting
+- Cmd-K command palette across jobs / orgs / docs / skills.
+- Auto-memory: jobs / leads / emails recompute fit-score on any input change.
+- Accessibility pass: skip-to-content, focus rings, sidebar `aria-current`, keyboard shortcuts on the queues.
+
+## What's still on the punch list
+
+Tracked in [`to-do.md`](to-do.md). Highlights:
+
+- **Spend cap** (SRS REQ-COST-002) — gated on API-key billing; not needed for OAuth Pro sessions.
+- **Observability** (SRS §3.3.5) — `/metrics` Prometheus endpoint, structured JSON logs with PII scrubbing.
+- **Org soft-delete reassign workflow** — currently soft-deleted orgs leave dangling references in the timeline / history.
+- README / CHANGELOG / `v0.1.0` tag — being chipped at; this paragraph itself was the README update.
 
 ## Development
 
