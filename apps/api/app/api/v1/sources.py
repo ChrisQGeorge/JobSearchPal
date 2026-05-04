@@ -20,6 +20,7 @@ from app.core.deps import get_current_user
 from app.models.jobs import JobFetchQueue, TrackedJob
 from app.models.sources import JobLead, JobSource
 from app.models.user import User
+from app.scoring import apply_fit_score_to_job, compute_fit_score
 from app.sources import KIND_EXAMPLES, KIND_HINTS, KIND_LABELS
 from app.sources.poller import poll_source
 
@@ -530,12 +531,14 @@ async def _promote_lead(
     db: AsyncSession,
     lead: JobLead,
     target_status: str,
-    user_id: int,
+    user: User,
 ) -> Optional[int]:
-    """Create a TrackedJob from the lead and queue a score task. Returns
-    the new tracked_job id."""
+    """Create a TrackedJob from the lead, run the deterministic fit-score
+    against it so the row lands with a real number, and queue a Claude
+    JD-analysis task for the qualitative side. Returns the new
+    tracked_job id."""
     tj = TrackedJob(
-        user_id=user_id,
+        user_id=user.id,
         title=lead.title[:255],
         job_description=lead.description_md or None,
         source_url=lead.source_url or None,
@@ -549,16 +552,20 @@ async def _promote_lead(
     await db.flush()
     lead.state = "promoted"
     lead.tracked_job_id = tj.id
-    # Auto-queue a score task so the new row gets a fit_score without
-    # the user having to click. Uses the same generalized queue the
-    # tracker's "Score all" button drives.
+    # Deterministic score — cheap, reads from the user's prefs/criteria.
+    result = await compute_fit_score(db, user, tj)
+    apply_fit_score_to_job(tj, result)
+    # Queue a JD-analysis task so the qualitative fields (red flags,
+    # strengths, etc.) get filled in by the queue worker. Best-effort —
+    # if the user doesn't have a Claude session live, the task waits.
     db.add(
         JobFetchQueue(
-            user_id=user_id,
+            user_id=user.id,
             kind="score",
-            label=f"Score lead → {tj.title[:80]}",
-            payload={"job_id": tj.id},
-            status="queued",
+            label=f"Score lead → {tj.title[:80]}"[:512],
+            url="",  # legacy NOT-NULL column; empty for non-fetch kinds
+            payload={"tracked_job_id": tj.id},
+            state="queued",
         )
     )
     return tj.id
@@ -600,7 +607,7 @@ async def lead_bulk_action(
         if lead.state == "promoted" and lead.tracked_job_id:
             # Already promoted — nothing to do, treat as success.
             continue
-        await _promote_lead(db, lead, action, user.id)
+        await _promote_lead(db, lead, action, user)
         promoted += 1
     await db.commit()
     return LeadActionOut(
