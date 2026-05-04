@@ -30,6 +30,7 @@ type Source = {
   filters: Record<string, unknown> | null;
   poll_interval_hours: number;
   lead_ttl_hours: number;
+  max_leads_per_poll: number;
   last_polled_at: string | null;
   last_error: string | null;
   last_lead_count: number | null;
@@ -66,6 +67,7 @@ type SourceForm = {
   enabled: boolean;
   poll_interval_hours: number;
   lead_ttl_hours: number;
+  max_leads_per_poll: number;
   title_include: string;
   title_exclude: string;
   location_include: string;
@@ -81,6 +83,7 @@ function emptyForm(kinds: SourceKind[]): SourceForm {
     enabled: true,
     poll_interval_hours: 24,
     lead_ttl_hours: 168,
+    max_leads_per_poll: 100,
     title_include: "",
     title_exclude: "",
     location_include: "",
@@ -99,6 +102,7 @@ function formFromSource(s: Source): SourceForm {
     enabled: s.enabled,
     poll_interval_hours: s.poll_interval_hours,
     lead_ttl_hours: s.lead_ttl_hours,
+    max_leads_per_poll: s.max_leads_per_poll ?? 100,
     title_include: (f.title_include as string) ?? "",
     title_exclude: (f.title_exclude as string) ?? "",
     location_include: (f.location_include as string) ?? "",
@@ -124,6 +128,7 @@ function formPayload(f: SourceForm) {
     filters: Object.keys(filters).length ? filters : null,
     poll_interval_hours: f.poll_interval_hours,
     lead_ttl_hours: f.lead_ttl_hours,
+    max_leads_per_poll: f.max_leads_per_poll,
   };
 }
 
@@ -421,7 +426,7 @@ export default function LeadsPage() {
                   {s.label ? s.slug_or_url : ""}
                 </span>
                 <span className="ml-auto text-[11px] text-corp-muted">
-                  every {s.poll_interval_hours}h · TTL {s.lead_ttl_hours}h
+                  every {s.poll_interval_hours}h · TTL {s.lead_ttl_hours}h · top {s.max_leads_per_poll ?? 100}
                 </span>
                 {s.new_lead_count != null && s.new_lead_count > 0 ? (
                   <span className="text-[11px] text-corp-accent">
@@ -779,7 +784,7 @@ function SourceEditor({
           ) : null}
         </div>
       </div>
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <div>
           <label className="jsp-label">Label (optional)</label>
           <input
@@ -819,6 +824,31 @@ function SourceEditor({
               onChange({
                 ...form,
                 lead_ttl_hours: Math.max(1, Number(e.target.value) || 168),
+              })
+            }
+            disabled={saving}
+          />
+        </div>
+        <div>
+          <label
+            className="jsp-label"
+            title="Cap on how many NEW leads any single poll will create. Counts after dedupe and filters. For Bright Data sources this is also passed as the API's limit_per_input to cap spend."
+          >
+            Top # per poll
+          </label>
+          <input
+            className="jsp-input"
+            type="number"
+            min={1}
+            max={10000}
+            value={form.max_leads_per_poll}
+            onChange={(e) =>
+              onChange({
+                ...form,
+                max_leads_per_poll: Math.max(
+                  1,
+                  Number(e.target.value) || 100,
+                ),
               })
             }
             disabled={saving}

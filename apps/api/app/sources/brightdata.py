@@ -51,10 +51,22 @@ async def _trigger(
     api_key: str,
     dataset_id: str,
     inputs: list[dict[str, Any]],
+    limit_per_input: Optional[int] = None,
 ) -> str:
     """Kick off a snapshot, return the snapshot_id. Raises RuntimeError
-    on transport / 4xx / 5xx errors with an actionable message."""
+    on transport / 4xx / 5xx errors with an actionable message.
+
+    `limit_per_input` is forwarded to Bright Data's trigger so we cap
+    spend at the API level, not just at ingest. If Bright Data rejects
+    the param for a particular dataset, the trigger still succeeds and
+    we fall back to client-side capping in the poller."""
     url = f"{BRIGHTDATA_API_BASE}/datasets/v3/trigger"
+    params: dict[str, Any] = {
+        "dataset_id": dataset_id,
+        "include_errors": "true",
+    }
+    if limit_per_input is not None and limit_per_input > 0:
+        params["limit_per_input"] = limit_per_input
     async with httpx.AsyncClient(
         timeout=TRIGGER_TIMEOUT_SECONDS,
         headers={
@@ -64,11 +76,7 @@ async def _trigger(
         },
     ) as client:
         try:
-            resp = await client.post(
-                url,
-                params={"dataset_id": dataset_id, "include_errors": "true"},
-                json=inputs,
-            )
+            resp = await client.post(url, params=params, json=inputs)
         except httpx.HTTPError as exc:
             raise RuntimeError(f"Bright Data trigger failed: {exc}") from exc
     if resp.status_code in (401, 403):
@@ -252,13 +260,18 @@ def _build_input(slug_or_url: str, filters: Optional[dict]) -> dict[str, Any]:
     """The Bright Data trigger body is a JSON array of input objects.
     For a single search we send one. We pull keyword from
     `slug_or_url` (free text) and location from the source's
-    `filters.location_include` if present."""
+    `filters.location_include`, or "Remote" when `filters.remote_only`
+    is set so the user can scope a query to remote roles directly at
+    the API level (LinkedIn / Glassdoor both treat "Remote" as a
+    valid pseudo-location)."""
     keyword = slug_or_url.strip()
     inp: dict[str, Any] = {"keyword": keyword}
     if filters and isinstance(filters, dict):
         loc = filters.get("location_include") or filters.get("location")
         if isinstance(loc, str) and loc.strip():
             inp["location"] = loc.strip()
+        elif filters.get("remote_only"):
+            inp["location"] = "Remote"
         # Bright Data accepts country codes for some datasets.
         country = filters.get("country")
         if isinstance(country, str) and country.strip():
@@ -273,12 +286,15 @@ async def _run_brightdata(
     slug_or_url: str,
     filters: Optional[dict],
     record_to_lead,
+    limit: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     inputs = [_build_input(slug_or_url, filters)]
-    snapshot_id = await _trigger(api_key, dataset_id, inputs)
+    snapshot_id = await _trigger(
+        api_key, dataset_id, inputs, limit_per_input=limit
+    )
     log.info(
-        "Bright Data trigger ok dataset=%s snapshot=%s",
-        dataset_id, snapshot_id,
+        "Bright Data trigger ok dataset=%s snapshot=%s limit=%s",
+        dataset_id, snapshot_id, limit,
     )
     records = await _poll_snapshot(api_key, snapshot_id)
     out: list[dict[str, Any]] = []
@@ -295,6 +311,7 @@ async def fetch_linkedin(
     api_key: Optional[str] = None,
     filters: Optional[dict] = None,
     dataset_id: Optional[str] = None,
+    limit: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     if not api_key:
         raise RuntimeError(
@@ -307,6 +324,7 @@ async def fetch_linkedin(
         slug_or_url=slug_or_url,
         filters=filters,
         record_to_lead=_to_lead_linkedin,
+        limit=limit,
     )
 
 
@@ -316,6 +334,7 @@ async def fetch_glassdoor(
     api_key: Optional[str] = None,
     filters: Optional[dict] = None,
     dataset_id: Optional[str] = None,
+    limit: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     if not api_key:
         raise RuntimeError(
@@ -328,4 +347,5 @@ async def fetch_glassdoor(
         slug_or_url=slug_or_url,
         filters=filters,
         record_to_lead=_to_lead_glassdoor,
+        limit=limit,
     )

@@ -49,6 +49,7 @@ async def _brightdata_linkedin_adapter(
         api_key=ctx.get("api_key"),
         filters=ctx.get("filters"),
         dataset_id=ctx.get("dataset_id"),
+        limit=ctx.get("max_leads_per_poll"),
     )
 
 
@@ -60,6 +61,7 @@ async def _brightdata_glassdoor_adapter(
         api_key=ctx.get("api_key"),
         filters=ctx.get("filters"),
         dataset_id=ctx.get("dataset_id"),
+        limit=ctx.get("max_leads_per_poll"),
     )
 
 

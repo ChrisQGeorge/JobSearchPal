@@ -43,6 +43,10 @@ class JobSource(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     filters: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     poll_interval_hours: Mapped[int] = mapped_column(Integer, nullable=False, default=24)
     lead_ttl_hours: Mapped[int] = mapped_column(Integer, nullable=False, default=168)
+    # Cap on how many NEW leads any single poll will insert. Counts
+    # post-dedupe + post-filter, so a re-poll of an unchanged feed
+    # never trips it. Defaults to 100 across all kinds.
+    max_leads_per_poll: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
     last_polled_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

@@ -149,6 +149,7 @@ class SourceIn(BaseModel):
     filters: Optional[SourceFiltersIn] = None
     poll_interval_hours: int = Field(default=24, ge=1, le=720)
     lead_ttl_hours: int = Field(default=168, ge=1, le=4320)
+    max_leads_per_poll: int = Field(default=100, ge=1, le=10000)
 
 
 class SourceUpdate(BaseModel):
@@ -157,6 +158,7 @@ class SourceUpdate(BaseModel):
     filters: Optional[SourceFiltersIn] = None
     poll_interval_hours: Optional[int] = Field(default=None, ge=1, le=720)
     lead_ttl_hours: Optional[int] = Field(default=None, ge=1, le=4320)
+    max_leads_per_poll: Optional[int] = Field(default=None, ge=1, le=10000)
 
 
 class SourceOut(BaseModel):
@@ -169,6 +171,7 @@ class SourceOut(BaseModel):
     filters: Optional[dict] = None
     poll_interval_hours: int
     lead_ttl_hours: int
+    max_leads_per_poll: int = 100
     last_polled_at: Optional[datetime] = None
     last_error: Optional[str] = None
     last_lead_count: Optional[int] = None
@@ -353,6 +356,7 @@ async def create_source(
         filters=payload.filters.model_dump(exclude_none=True) if payload.filters else None,
         poll_interval_hours=payload.poll_interval_hours,
         lead_ttl_hours=payload.lead_ttl_hours,
+        max_leads_per_poll=payload.max_leads_per_poll,
     )
     db.add(src)
     await db.commit()

@@ -94,7 +94,10 @@ async def _build_ctx(
     """Per-kind context dict — credentials for paid sources, filter
     pass-through for everything. Adapters that don't need any of this
     just ignore it."""
-    ctx: dict[str, Any] = {"filters": source.filters}
+    ctx: dict[str, Any] = {
+        "filters": source.filters,
+        "max_leads_per_poll": max(1, int(source.max_leads_per_poll or 100)),
+    }
     if source.kind in ("brightdata_linkedin", "brightdata_glassdoor"):
         from app.api.v1.api_credentials import get_user_secret
 
@@ -171,8 +174,13 @@ async def poll_source(db: AsyncSession, source: JobSource) -> tuple[int, Optiona
         ).scalars().all()
     )
 
+    cap = max(1, int(source.max_leads_per_poll or 100))
     inserted = 0
     for raw in raw_leads:
+        if inserted >= cap:
+            # Hit the per-poll cap. Remaining raws stay on upstream;
+            # next poll will pick up whatever's still un-dedup'd.
+            break
         if not _matches_filters(raw, source.filters):
             continue
         ext_id = (raw.get("external_id") or "").strip()
