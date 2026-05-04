@@ -6,7 +6,13 @@ from typing import Optional
 
 import httpx
 
-USER_AGENT = "JobSearchPal/0.1 (+https://github.com/yourusername/jobsearchpal)"
+# Mozilla-prefixed UA so Cloudflare-fronted RSS feeds (WeWorkRemotely,
+# Substack, etc.) don't 403 us. Still self-identifies as JobSearchPal so
+# operators can spot us in their logs.
+USER_AGENT = (
+    "Mozilla/5.0 (compatible; JobSearchPal/0.1; "
+    "+https://github.com/yourusername/jobsearchpal)"
+)
 
 # Cap how much HTML we round-trip per posting. Most JDs are under 50KB;
 # anything larger is usually an over-stuffed careers-page wrapper that
