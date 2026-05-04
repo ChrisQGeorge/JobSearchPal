@@ -468,11 +468,37 @@ async def _handle_fetch(item: JobFetchQueue) -> None:
         db.add(job)
         await db.flush()
 
+        # If this fetch was triggered by a lead promotion, back-link
+        # the new TrackedJob onto the originating JobLead row so the
+        # leads inbox reflects the promotion target.
+        lead_id: Optional[int] = None
+        if isinstance(row.payload, dict):
+            lid = row.payload.get("lead_id")
+            if isinstance(lid, int):
+                lead_id = lid
+        if lead_id is not None:
+            from app.models.sources import JobLead
+
+            lead = (
+                await db.execute(
+                    select(JobLead).where(
+                        JobLead.id == lead_id,
+                        JobLead.user_id == row.user_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if lead is not None:
+                lead.tracked_job_id = job.id
+
         db.add(ApplicationEvent(
             tracked_job_id=job.id,
             event_type="note",
             event_date=datetime.now(tz=timezone.utc),
-            details_md=f"Created from fetch-queue URL `{row.url}`.",
+            details_md=(
+                f"Created from lead → fetched `{row.url}`."
+                if lead_id is not None
+                else f"Created from fetch-queue URL `{row.url}`."
+            ),
         ))
 
         row.state = "done"

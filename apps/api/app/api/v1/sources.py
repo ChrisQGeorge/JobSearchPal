@@ -533,56 +533,58 @@ async def _promote_lead(
     target_status: str,
     user: User,
 ) -> Optional[int]:
-    """Create a TrackedJob from the lead, run the deterministic fit-score
-    against it so the row lands with a real number, and queue a Claude
-    JD-analysis task for the qualitative side. Returns the new
-    tracked_job id."""
-    tj = TrackedJob(
-        user_id=user.id,
-        title=lead.title[:255],
-        job_description=lead.description_md or None,
-        source_url=lead.source_url or None,
-        source_platform=f"source:{lead.source_id}",
-        location=lead.location or None,
-        remote_policy=lead.remote_policy if lead.remote_policy in {"onsite", "hybrid", "remote"} else None,
-        status=target_status,
-        date_discovered=date.today(),
-    )
-    db.add(tj)
-    await db.flush()
-    lead.state = "promoted"
-    lead.tracked_job_id = tj.id
-    # Deterministic score — cheap, reads from the user's prefs/criteria.
-    result = await compute_fit_score(db, user, tj)
-    apply_fit_score_to_job(tj, result)
-    # Enqueue an enrich-fetch (so the URL flow's organization-context +
-    # full skill-list extraction runs against this row, not just the
-    # cached lead body) and a JD-analysis task (qualitative strengths
-    # / gaps / red flags). The fetch handler runs in update mode when
-    # given `tracked_job_id` and only fills empty fields, so the
-    # user's lead-promotion choices (status etc.) survive.
-    if tj.source_url:
-        db.add(
-            JobFetchQueue(
-                user_id=user.id,
-                kind="fetch",
-                label=f"Enrich lead → {tj.title[:80]}"[:512],
-                url=tj.source_url,
-                payload={"tracked_job_id": tj.id},
-                state="queued",
-            )
+    """Promote a lead by enqueueing a fetch task on its source_url with
+    `desired_status=target_status`. Same flow as pasting a URL on the
+    tracker — the fetch worker creates the TrackedJob, runs the JD
+    analyzer / fit scoring downstream, and the lead's tracked_job_id
+    is back-filled when the worker finishes (via `lead_id` in the
+    queue row's payload).
+
+    Fallback: if the lead has no source_url (rare for ATS adapters but
+    possible for some RSS feeds), we create a TrackedJob immediately
+    from the cached body since there's nothing to fetch.
+    """
+    if not lead.source_url:
+        # No URL to fetch — fall back to immediate-create from the
+        # cached body. Mirrors the behavior the user had before, just
+        # for this edge case.
+        tj = TrackedJob(
+            user_id=user.id,
+            title=lead.title[:255],
+            job_description=lead.description_md or None,
+            source_platform=f"source:{lead.source_id}",
+            location=lead.location or None,
+            remote_policy=lead.remote_policy if lead.remote_policy in {"onsite", "hybrid", "remote"} else None,
+            status=target_status,
+            date_discovered=date.today(),
         )
+        db.add(tj)
+        await db.flush()
+        lead.state = "promoted"
+        lead.tracked_job_id = tj.id
+        result = await compute_fit_score(db, user, tj)
+        apply_fit_score_to_job(tj, result)
+        return tj.id
+
+    # Standard path — queue a fetch task and let the worker handle
+    # everything (TrackedJob creation, org-context extraction, skill
+    # lists, JD analysis). lead_id in the payload tells the fetch
+    # handler to back-link the new TrackedJob onto this lead row.
     db.add(
         JobFetchQueue(
             user_id=user.id,
-            kind="score",
-            label=f"Score lead → {tj.title[:80]}"[:512],
-            url="",  # legacy NOT-NULL column; empty for non-fetch kinds
-            payload={"tracked_job_id": tj.id},
+            kind="fetch",
+            label=f"Lead → {lead.title[:80]}"[:512],
+            url=lead.source_url,
+            desired_status=target_status,
+            payload={"lead_id": lead.id},
             state="queued",
         )
     )
-    return tj.id
+    lead.state = "promoted"
+    # tracked_job_id stays null until the fetch worker creates the row
+    # and back-links via lead_id in the payload.
+    return None
 
 
 @leads_router.post("/action", response_model=LeadActionOut)
