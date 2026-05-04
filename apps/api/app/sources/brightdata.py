@@ -30,6 +30,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
+from urllib.parse import quote_plus
 
 import httpx
 
@@ -256,45 +257,68 @@ def _to_lead_glassdoor(rec: dict[str, Any]) -> Optional[dict[str, Any]]:
 # ---------- Public adapters --------------------------------------------------
 
 
-def _build_input(slug_or_url: str, filters: Optional[dict]) -> dict[str, Any]:
-    """The Bright Data trigger body is a JSON array of input objects.
-    For a single search we send one. We pull keyword from
-    `slug_or_url` (free text) and location from the source's
-    `filters.location_include`, or "Remote" when `filters.remote_only`
-    is set so the user can scope a query to remote roles directly at
-    the API level (LinkedIn / Glassdoor both treat "Remote" as a
-    valid pseudo-location)."""
-    keyword = slug_or_url.strip()
-    inp: dict[str, Any] = {"keyword": keyword}
-    if filters and isinstance(filters, dict):
-        loc = filters.get("location_include") or filters.get("location")
-        if isinstance(loc, str) and loc.strip():
-            inp["location"] = loc.strip()
-        elif filters.get("remote_only"):
-            inp["location"] = "Remote"
-        # Bright Data accepts country codes for some datasets.
-        country = filters.get("country")
-        if isinstance(country, str) and country.strip():
-            inp["country"] = country.strip()
-    return inp
+def _resolve_location(filters: Optional[dict]) -> Optional[str]:
+    if not isinstance(filters, dict):
+        return None
+    loc = filters.get("location_include") or filters.get("location")
+    if isinstance(loc, str) and loc.strip():
+        return loc.strip()
+    if filters.get("remote_only"):
+        return "Remote"
+    return None
+
+
+def _build_linkedin_input(
+    slug_or_url: str, filters: Optional[dict]
+) -> dict[str, Any]:
+    """LinkedIn input: if the user pasted a search URL, send it
+    verbatim; otherwise build a search URL from the keyword + location.
+    The Bright Data LinkedIn dataset is URL-based — keyword/location
+    fields are rejected with a validation error."""
+    raw = slug_or_url.strip()
+    if raw.lower().startswith(("http://", "https://")):
+        return {"url": raw}
+    keyword = raw
+    location = _resolve_location(filters)
+    qs = f"keywords={quote_plus(keyword)}"
+    if location:
+        qs += f"&location={quote_plus(location)}"
+    return {"url": f"https://www.linkedin.com/jobs/search/?{qs}"}
+
+
+def _build_glassdoor_input(
+    slug_or_url: str, filters: Optional[dict]
+) -> dict[str, Any]:
+    """Glassdoor input: same shape as LinkedIn — URL-based.
+
+    The error you'll see otherwise is:
+      "This input should not contain a keyword field" + "url: Required field"
+    """
+    raw = slug_or_url.strip()
+    if raw.lower().startswith(("http://", "https://")):
+        return {"url": raw}
+    keyword = raw
+    location = _resolve_location(filters)
+    qs = f"sc.keyword={quote_plus(keyword)}"
+    if location:
+        qs += f"&locKeyword={quote_plus(location)}&locT=N"
+    return {"url": f"https://www.glassdoor.com/Job/jobs.htm?{qs}"}
 
 
 async def _run_brightdata(
     *,
     dataset_id: str,
     api_key: str,
-    slug_or_url: str,
-    filters: Optional[dict],
+    inputs: list[dict[str, Any]],
     record_to_lead,
     limit: Optional[int] = None,
 ) -> list[dict[str, Any]]:
-    inputs = [_build_input(slug_or_url, filters)]
     snapshot_id = await _trigger(
         api_key, dataset_id, inputs, limit_per_input=limit
     )
     log.info(
-        "Bright Data trigger ok dataset=%s snapshot=%s limit=%s",
-        dataset_id, snapshot_id, limit,
+        "Bright Data trigger ok dataset=%s snapshot=%s limit=%s input=%s",
+        dataset_id, snapshot_id, limit, inputs[0] if inputs else None,
     )
     records = await _poll_snapshot(api_key, snapshot_id)
     out: list[dict[str, Any]] = []
@@ -321,8 +345,7 @@ async def fetch_linkedin(
     return await _run_brightdata(
         dataset_id=dataset_id or DEFAULT_DATASET_LINKEDIN,
         api_key=api_key,
-        slug_or_url=slug_or_url,
-        filters=filters,
+        inputs=[_build_linkedin_input(slug_or_url, filters)],
         record_to_lead=_to_lead_linkedin,
         limit=limit,
     )
@@ -344,8 +367,7 @@ async def fetch_glassdoor(
     return await _run_brightdata(
         dataset_id=dataset_id or DEFAULT_DATASET_GLASSDOOR,
         api_key=api_key,
-        slug_or_url=slug_or_url,
-        filters=filters,
+        inputs=[_build_glassdoor_input(slug_or_url, filters)],
         record_to_lead=_to_lead_glassdoor,
         limit=limit,
     )

@@ -95,14 +95,16 @@ KIND_HINTS: dict[str, str] = {
     "rss": "Full RSS / Atom feed URL (https://…).",
     "yc": "Full Y Combinator Atom feed URL (e.g. https://www.workatastartup.com/companies/feed.atom).",
     "brightdata_linkedin": (
-        "Search keyword (e.g. 'senior backend engineer'). Set "
-        "filters.location_include for a city / country. Requires a "
-        "Bright Data API key on the Settings page."
+        "Either a LinkedIn jobs search URL (linkedin.com/jobs/search/…) "
+        "or a search keyword (e.g. 'senior backend engineer'). "
+        "Set filters.location_include for a city / country, or check "
+        "remote_only. Requires a Bright Data API key on the Settings page."
     ),
     "brightdata_glassdoor": (
-        "Search keyword (e.g. 'data scientist'). Set "
-        "filters.location_include for a city / country. Requires a "
-        "Bright Data API key on the Settings page."
+        "Either a Glassdoor jobs search URL (glassdoor.com/Job/jobs.htm…) "
+        "or a search keyword (e.g. 'data scientist'). Set "
+        "filters.location_include for a city / country, or check "
+        "remote_only. Requires a Bright Data API key on the Settings page."
     ),
 }
 
