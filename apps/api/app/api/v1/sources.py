@@ -555,9 +555,23 @@ async def _promote_lead(
     # Deterministic score — cheap, reads from the user's prefs/criteria.
     result = await compute_fit_score(db, user, tj)
     apply_fit_score_to_job(tj, result)
-    # Queue a JD-analysis task so the qualitative fields (red flags,
-    # strengths, etc.) get filled in by the queue worker. Best-effort —
-    # if the user doesn't have a Claude session live, the task waits.
+    # Enqueue an enrich-fetch (so the URL flow's organization-context +
+    # full skill-list extraction runs against this row, not just the
+    # cached lead body) and a JD-analysis task (qualitative strengths
+    # / gaps / red flags). The fetch handler runs in update mode when
+    # given `tracked_job_id` and only fills empty fields, so the
+    # user's lead-promotion choices (status etc.) survive.
+    if tj.source_url:
+        db.add(
+            JobFetchQueue(
+                user_id=user.id,
+                kind="fetch",
+                label=f"Enrich lead → {tj.title[:80]}"[:512],
+                url=tj.source_url,
+                payload={"tracked_job_id": tj.id},
+                state="queued",
+            )
+        )
     db.add(
         JobFetchQueue(
             user_id=user.id,

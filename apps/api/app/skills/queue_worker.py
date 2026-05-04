@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from typing import Optional
 from datetime import datetime, time as _dt_time, timedelta, timezone
 
 from sqlalchemy import and_, or_, select, update
@@ -324,7 +325,19 @@ async def _fail(db: AsyncSession, row: JobFetchQueue, err: str) -> None:
 
 
 async def _handle_fetch(item: JobFetchQueue) -> None:
-    """Claim-a-URL → fetch → create TrackedJob."""
+    """Claim-a-URL → fetch → create OR enrich a TrackedJob.
+
+    Two modes:
+    - Default ("create"): inserts a new TrackedJob from the fetched
+      fields. Used by the URL-paste flow on the tracker.
+    - Enrich ("update existing"): when payload carries
+      `{"tracked_job_id": N}`, the handler updates that row instead of
+      creating a new one. Only fills in fields that are currently
+      empty on the row, so user-edited values are never trampled.
+      Used by lead promotion — the lead seeded the row from the
+      cached body; the fetch then upgrades it with the
+      organization-context + skill-list extraction the URL flow does.
+    """
     from app.api.v1.jobs import build_tracked_job_payload, perform_fetch
     from app.skills.runner import ClaudeCodeError
     from app.skills import queue_bus
@@ -338,6 +351,11 @@ async def _handle_fetch(item: JobFetchQueue) -> None:
         item_id = row.id
         item_url = row.url
         label = row.label or row.url or f"Fetch #{row.id}"
+        existing_job_id: Optional[int] = None
+        if isinstance(row.payload, dict):
+            tj_id = row.payload.get("tracked_job_id")
+            if isinstance(tj_id, int):
+                existing_job_id = tj_id
 
         def _on_event(ev: dict) -> None:
             p = dict(ev)
@@ -381,11 +399,75 @@ async def _handle_fetch(item: JobFetchQueue) -> None:
         if row.desired_notes: overrides["notes"] = row.desired_notes
         payload = build_tracked_job_payload(fetched, overrides=overrides)
 
+        from app.models.jobs import ApplicationEvent
+
+        if existing_job_id is not None:
+            # Enrich path — update an existing row. Only overwrite
+            # fields that are currently empty so user / lead-seed
+            # values aren't trampled.
+            existing = (
+                await db.execute(
+                    select(TrackedJob).where(
+                        TrackedJob.id == existing_job_id,
+                        TrackedJob.user_id == row.user_id,
+                        TrackedJob.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing is None:
+                # Row was deleted out from under us — fall back to create.
+                existing_job_id = None
+            else:
+                changed = []
+                # Drop status from overrides — never overwrite the
+                # user's chosen lead-promotion target with the URL's
+                # default. Same for priority / date_applied if the
+                # promote path didn't set them.
+                payload.pop("status", None)
+                for field, value in payload.items():
+                    if value is None or value == "" or value == []:
+                        continue
+                    current = getattr(existing, field, None)
+                    if current is None or current == "" or current == []:
+                        setattr(existing, field, value)
+                        changed.append(field)
+                if changed:
+                    db.add(
+                        ApplicationEvent(
+                            tracked_job_id=existing.id,
+                            event_type="note",
+                            event_date=datetime.now(tz=timezone.utc),
+                            details_md=(
+                                f"Enriched from fetch-queue URL `{row.url}` — "
+                                f"filled {', '.join(changed)}."
+                            ),
+                        )
+                    )
+                row.state = "done"
+                row.created_tracked_job_id = existing.id
+                row.result = {
+                    "created_tracked_job_id": existing.id,
+                    "mode": "enriched",
+                    "fields_filled": changed,
+                }
+                row.error_message = None
+                await db.commit()
+                queue_bus.publish({
+                    "item_id": f"queue:{item_id}", "source": "fetch",
+                    "label": label, "url": item_url, "kind": "done",
+                    "created_tracked_job_id": existing.id,
+                })
+                log.info(
+                    "Fetch task %d → enriched TrackedJob id=%d (filled %d fields)",
+                    row.id, existing.id, len(changed),
+                )
+                return
+
+        # Create path (default).
         job = TrackedJob(user_id=row.user_id, **payload)
         db.add(job)
         await db.flush()
 
-        from app.models.jobs import ApplicationEvent
         db.add(ApplicationEvent(
             tracked_job_id=job.id,
             event_type="note",
