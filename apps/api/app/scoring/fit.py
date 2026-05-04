@@ -33,6 +33,7 @@ from typing import Iterable, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.history import Skill
 from app.models.jobs import Organization, TrackedJob
 from app.models.preferences import JobCriterion, JobPreferences
 from app.models.user import User
@@ -49,6 +50,7 @@ BUILTIN_KEYS: tuple[str, ...] = (
     "location",
     "experience_level",
     "employment_type",
+    "skills",
     "travel",
     "hours",
 )
@@ -59,6 +61,7 @@ DEFAULT_BUILTIN_WEIGHTS: dict[str, int] = {
     "location": 50,
     "experience_level": 60,
     "employment_type": 50,
+    "skills": 80,
     "travel": 30,
     "hours": 30,
 }
@@ -512,6 +515,119 @@ def _score_employment_type(
     )
 
 
+async def _load_user_skill_terms(db: AsyncSession, user_id: int) -> set[str]:
+    """Lower-cased, punctuation-stripped pool of every skill name +
+    alias the user has in their catalog. Used by `_score_skills` and
+    mirrors the matching logic in `list_jobs` so the tracker's
+    skill-heatmap and the scorer agree."""
+
+    def _norm(s: object) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip()
+
+    rows = (
+        await db.execute(
+            select(Skill.name, Skill.aliases).where(
+                Skill.user_id == user_id, Skill.deleted_at.is_(None)
+            )
+        )
+    ).all()
+    out: set[str] = set()
+    for name, aliases in rows:
+        t = _norm(name)
+        if t:
+            out.add(t)
+        if isinstance(aliases, list):
+            for a in aliases:
+                ta = _norm(a)
+                if ta:
+                    out.add(ta)
+    return out
+
+
+def _score_skills(
+    job: TrackedJob,
+    user_skill_terms: set[str],
+    weight: int,
+) -> Component:
+    """How much of the JD's required_skills the user has in their
+    catalog. nice_to_have_skills count at half weight so they nudge but
+    don't dominate. Returns "unknown" when the JD doesn't expose either
+    list — usually means the JD-analyzer hasn't run yet."""
+
+    def _norm(s: object) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip()
+
+    required = job.required_skills if isinstance(job.required_skills, list) else []
+    nice = job.nice_to_have_skills if isinstance(job.nice_to_have_skills, list) else []
+    if not required and not nice:
+        return Component(
+            key="skills",
+            label="Skill match",
+            weight=weight,
+            verdict="unknown",
+            matched_pct=0.0,
+            detail=(
+                "JD didn't surface required skills. Run JD Analyze to "
+                "populate them; the heatmap will fill in."
+            ),
+        )
+    if not user_skill_terms:
+        return Component(
+            key="skills",
+            label="Skill match",
+            weight=weight,
+            verdict="unknown",
+            matched_pct=0.0,
+            detail="Your skills catalog is empty — add skills to enable matching.",
+        )
+
+    def _matched(term: str) -> bool:
+        n = _norm(term)
+        if not n:
+            return False
+        if n in user_skill_terms:
+            return True
+        # Bidirectional substring fallback for "AWS" vs "AWS (ECS)".
+        return any(n in t or t in n for t in user_skill_terms)
+
+    req_total = len(required)
+    req_matched = sum(1 for s in required if _matched(s))
+    nice_total = len(nice)
+    nice_matched = sum(1 for s in nice if _matched(s))
+
+    # Weight required at 1.0 and nice-to-have at 0.5 so the score reads
+    # as "how much of the must-haves do you have" with a small bump for
+    # nice-to-haves on top.
+    weighted_have = req_matched + 0.5 * nice_matched
+    weighted_total = req_total + 0.5 * nice_total
+    pct = (weighted_have / weighted_total) if weighted_total > 0 else 0.0
+
+    if pct >= 0.85:
+        verdict = "match"
+    elif pct >= 0.5:
+        verdict = "partial"
+    else:
+        verdict = "miss"
+
+    detail_parts = []
+    if req_total > 0:
+        detail_parts.append(
+            f"{req_matched}/{req_total} required"
+        )
+    if nice_total > 0:
+        detail_parts.append(
+            f"{nice_matched}/{nice_total} nice-to-have"
+        )
+    return Component(
+        key="skills",
+        label="Skill match",
+        weight=weight,
+        verdict=verdict,
+        matched_pct=pct,
+        detail=" · ".join(detail_parts) if detail_parts else "—",
+    )
+
+
 def _score_travel(
     job: TrackedJob, prefs: Optional[JobPreferences], weight: int
 ) -> Component:
@@ -693,6 +809,7 @@ async def compute_fit_score(
     prefs = await _load_prefs(db, user.id)
     criteria = await _load_criteria(db, user.id)
     org_name = await _resolve_org_name(db, job.organization_id)
+    user_skill_terms = await _load_user_skill_terms(db, user.id)
 
     components: list[Component] = []
     components.append(_score_salary(job, prefs, _resolve_weight(prefs, "salary")))
@@ -711,6 +828,9 @@ async def compute_fit_score(
         _score_employment_type(
             job, prefs, _resolve_weight(prefs, "employment_type")
         )
+    )
+    components.append(
+        _score_skills(job, user_skill_terms, _resolve_weight(prefs, "skills"))
     )
     components.append(_score_travel(job, prefs, _resolve_weight(prefs, "travel")))
     components.append(_score_hours(job, prefs, _resolve_weight(prefs, "hours")))

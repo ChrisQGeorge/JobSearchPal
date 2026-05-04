@@ -1334,6 +1334,7 @@ const BUILTIN_KEYS = [
   "location",
   "experience_level",
   "employment_type",
+  "skills",
   "travel",
   "hours",
 ] as const;
@@ -1344,6 +1345,7 @@ const BUILTIN_DEFAULTS: Record<string, number> = {
   location: 50,
   experience_level: 60,
   employment_type: 50,
+  skills: 80,
   travel: 30,
   hours: 30,
 };
@@ -1354,6 +1356,7 @@ const BUILTIN_LABELS: Record<string, string> = {
   location: "Location",
   experience_level: "Experience level",
   employment_type: "Employment type",
+  skills: "Skill match (required + nice-to-have)",
   travel: "Travel",
   hours: "Hours / week",
 };
