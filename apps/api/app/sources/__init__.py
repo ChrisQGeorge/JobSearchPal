@@ -20,20 +20,58 @@ poller / JD-analyzer can backfill later.
 """
 from __future__ import annotations
 
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
-from app.sources import ashby, greenhouse, lever, rss_feed, workable, yc
+from app.sources import ashby, brightdata, greenhouse, lever, rss_feed, workable, yc
 
 RawLead = dict
-Adapter = Callable[[str], Awaitable[list[RawLead]]]
+# Adapter contract: takes the source's slug_or_url plus a context dict
+# that may include `api_key`, `filters`, `dataset_id` (only populated
+# when the kind needs them — ATS / RSS adapters ignore the ctx).
+Adapter = Callable[[str, dict[str, Any]], Awaitable[list[RawLead]]]
+
+
+def _wrap_simple(fn: Callable[[str], Awaitable[list[RawLead]]]) -> Adapter:
+    """Adapt a single-arg adapter to the new (slug, ctx) contract so
+    existing greenhouse / lever / etc. modules don't have to change."""
+
+    async def _impl(slug_or_url: str, ctx: dict[str, Any]) -> list[RawLead]:
+        return await fn(slug_or_url)
+
+    return _impl
+
+
+async def _brightdata_linkedin_adapter(
+    slug_or_url: str, ctx: dict[str, Any]
+) -> list[RawLead]:
+    return await brightdata.fetch_linkedin(
+        slug_or_url,
+        api_key=ctx.get("api_key"),
+        filters=ctx.get("filters"),
+        dataset_id=ctx.get("dataset_id"),
+    )
+
+
+async def _brightdata_glassdoor_adapter(
+    slug_or_url: str, ctx: dict[str, Any]
+) -> list[RawLead]:
+    return await brightdata.fetch_glassdoor(
+        slug_or_url,
+        api_key=ctx.get("api_key"),
+        filters=ctx.get("filters"),
+        dataset_id=ctx.get("dataset_id"),
+    )
+
 
 ADAPTERS: dict[str, Adapter] = {
-    "greenhouse": greenhouse.fetch,
-    "lever": lever.fetch,
-    "ashby": ashby.fetch,
-    "workable": workable.fetch,
-    "rss": rss_feed.fetch,
-    "yc": yc.fetch,
+    "greenhouse": _wrap_simple(greenhouse.fetch),
+    "lever": _wrap_simple(lever.fetch),
+    "ashby": _wrap_simple(ashby.fetch),
+    "workable": _wrap_simple(workable.fetch),
+    "rss": _wrap_simple(rss_feed.fetch),
+    "yc": _wrap_simple(yc.fetch),
+    "brightdata_linkedin": _brightdata_linkedin_adapter,
+    "brightdata_glassdoor": _brightdata_glassdoor_adapter,
 }
 
 KIND_LABELS: dict[str, str] = {
@@ -43,6 +81,8 @@ KIND_LABELS: dict[str, str] = {
     "workable": "Workable (apply.workable.com)",
     "rss": "Generic RSS / Atom feed",
     "yc": "Y Combinator Jobs RSS",
+    "brightdata_linkedin": "Bright Data — LinkedIn Jobs (paid API)",
+    "brightdata_glassdoor": "Bright Data — Glassdoor Jobs (paid API)",
 }
 
 KIND_HINTS: dict[str, str] = {
@@ -52,6 +92,16 @@ KIND_HINTS: dict[str, str] = {
     "workable": "Account subdomain from apply.workable.com/<slug>.",
     "rss": "Full RSS / Atom feed URL (https://…).",
     "yc": "Full Y Combinator Atom feed URL (e.g. https://www.workatastartup.com/companies/feed.atom).",
+    "brightdata_linkedin": (
+        "Search keyword (e.g. 'senior backend engineer'). Set "
+        "filters.location_include for a city / country. Requires a "
+        "Bright Data API key on the Settings page."
+    ),
+    "brightdata_glassdoor": (
+        "Search keyword (e.g. 'data scientist'). Set "
+        "filters.location_include for a city / country. Requires a "
+        "Bright Data API key on the Settings page."
+    ),
 }
 
 # Curated known-good slugs / URLs the UI can offer as click-to-fill
@@ -107,6 +157,17 @@ KIND_EXAMPLES: dict[str, list[dict[str, str]]] = {
     # don't paste something that 404s. The `yc` kind itself still works
     # — paste any verified YC RSS / Atom URL by hand.
     "yc": [],
+    "brightdata_linkedin": [
+        {"label": "Senior backend engineer", "value": "senior backend engineer"},
+        {"label": "Staff software engineer", "value": "staff software engineer"},
+        {"label": "Data engineer", "value": "data engineer"},
+        {"label": "Engineering manager", "value": "engineering manager"},
+    ],
+    "brightdata_glassdoor": [
+        {"label": "Senior backend engineer", "value": "senior backend engineer"},
+        {"label": "Product manager", "value": "product manager"},
+        {"label": "Data scientist", "value": "data scientist"},
+    ],
 }
 
 

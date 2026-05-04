@@ -34,6 +34,7 @@ export default function SettingsPage() {
     >
       <div className="space-y-4">
         <ClaudeAuthPanel />
+        <ApiKeysPanel />
         <PersonaManager />
         <DataIoPanel />
       </div>
@@ -176,6 +177,226 @@ type Persona = {
   created_at: string;
   updated_at: string;
 };
+
+// ---------- API keys panel ---------------------------------------------------
+//
+// Per-user third-party API keys. Currently used by the Bright Data
+// adapter (LinkedIn / Glassdoor scraping) but designed to host any
+// provider. Secrets are stored AES-256-GCM-encrypted server-side; the
+// list endpoint never returns the plaintext, only the last4 digits.
+
+type Credential = {
+  id: number;
+  provider: string;
+  label: string;
+  last4: string;
+  last_used_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+const KNOWN_PROVIDERS: { value: string; label: string; hint: string }[] = [
+  {
+    value: "brightdata",
+    label: "Bright Data",
+    hint: (
+      "Used by the Bright Data — LinkedIn / Glassdoor source kinds. " +
+      "Find your key at brightdata.com → Account Settings → API tokens."
+    ),
+  },
+];
+
+function ApiKeysPanel() {
+  const [items, setItems] = useState<Credential[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+  const [provider, setProvider] = useState(KNOWN_PROVIDERS[0].value);
+  const [label, setLabel] = useState("default");
+  const [secret, setSecret] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [savedMsg, setSavedMsg] = useState<string | null>(null);
+
+  async function refresh() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const rows = await api.get<Credential[]>("/api/v1/auth/credentials");
+      setItems(rows);
+    } catch (e) {
+      setErr(
+        e instanceof ApiError ? `HTTP ${e.status}` : "Load failed.",
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+  }, []);
+
+  async function save() {
+    if (!secret.trim()) {
+      setErr("Secret is required.");
+      return;
+    }
+    setSaving(true);
+    setErr(null);
+    setSavedMsg(null);
+    try {
+      await api.put("/api/v1/auth/credentials", {
+        provider,
+        label: label.trim() || "default",
+        secret: secret.trim(),
+      });
+      setSecret("");
+      setSavedMsg(`${provider} key saved.`);
+      await refresh();
+      setTimeout(() => setSavedMsg(null), 2500);
+    } catch (e) {
+      setErr(
+        e instanceof ApiError
+          ? `Save failed (HTTP ${e.status}).`
+          : "Save failed.",
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function remove(id: number) {
+    if (!confirm("Delete this API key?")) return;
+    try {
+      await api.delete(`/api/v1/auth/credentials/${id}`);
+      await refresh();
+    } catch (e) {
+      setErr(
+        e instanceof ApiError
+          ? `Delete failed (HTTP ${e.status}).`
+          : "Delete failed.",
+      );
+    }
+  }
+
+  const providerHint =
+    KNOWN_PROVIDERS.find((p) => p.value === provider)?.hint ?? "";
+
+  return (
+    <section className="jsp-card p-5">
+      <header className="mb-3">
+        <h2 className="text-sm uppercase tracking-wider text-corp-muted">
+          Third-party API keys
+        </h2>
+        <p className="text-[11px] text-corp-muted mt-1">
+          Stored AES-256-GCM-encrypted at rest. The plaintext is never
+          returned by the list endpoint — only the last 4 characters
+          for identification.
+        </p>
+      </header>
+
+      {err ? (
+        <div className="text-xs text-corp-danger mb-2">{err}</div>
+      ) : null}
+      {savedMsg ? (
+        <div className="text-xs text-corp-muted mb-2">{savedMsg}</div>
+      ) : null}
+
+      <div className="grid grid-cols-1 md:grid-cols-[180px_180px_1fr_auto] gap-2 items-end mb-3">
+        <div>
+          <label className="jsp-label">Provider</label>
+          <select
+            className="jsp-input"
+            value={provider}
+            onChange={(e) => setProvider(e.target.value)}
+            disabled={saving}
+          >
+            {KNOWN_PROVIDERS.map((p) => (
+              <option key={p.value} value={p.value}>
+                {p.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label className="jsp-label">Label</label>
+          <input
+            className="jsp-input"
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+            placeholder="default"
+            disabled={saving}
+          />
+        </div>
+        <div>
+          <label className="jsp-label">Secret</label>
+          <input
+            type="password"
+            className="jsp-input font-mono"
+            value={secret}
+            onChange={(e) => setSecret(e.target.value)}
+            placeholder="paste your API key"
+            disabled={saving}
+            autoComplete="off"
+          />
+        </div>
+        <div>
+          <button
+            type="button"
+            className="jsp-btn-primary"
+            onClick={save}
+            disabled={saving || !secret.trim()}
+          >
+            {saving ? "Saving…" : "Save"}
+          </button>
+        </div>
+      </div>
+      {providerHint ? (
+        <p className="text-[11px] text-corp-muted mb-3">{providerHint}</p>
+      ) : null}
+
+      {loading ? (
+        <p className="text-sm text-corp-muted">Loading…</p>
+      ) : items.length === 0 ? (
+        <p className="text-sm text-corp-muted">
+          No API keys saved. Add one above to enable paid sources like
+          Bright Data.
+        </p>
+      ) : (
+        <ul className="divide-y divide-corp-border">
+          {items.map((c) => (
+            <li
+              key={c.id}
+              className="py-2 flex items-center gap-3 text-sm"
+            >
+              <span className="inline-block px-2 py-0.5 rounded text-[10px] uppercase tracking-wider bg-corp-surface2 text-corp-muted border border-corp-border shrink-0">
+                {c.provider}
+              </span>
+              <span className="text-corp-muted text-[11px] w-32 truncate">
+                {c.label}
+              </span>
+              <span className="font-mono text-[11px] text-corp-muted">
+                {c.last4}
+              </span>
+              <span className="text-[11px] text-corp-muted ml-auto">
+                {c.last_used_at
+                  ? `last used ${new Date(c.last_used_at).toLocaleString()}`
+                  : "never used"}
+              </span>
+              <button
+                type="button"
+                className="jsp-btn-ghost text-xs text-corp-danger border-corp-danger/40"
+                onClick={() => remove(c.id)}
+              >
+                Delete
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
 
 function PersonaManager() {
   const [personas, setPersonas] = useState<Persona[]>([]);

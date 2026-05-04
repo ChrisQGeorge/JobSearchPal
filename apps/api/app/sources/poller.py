@@ -77,18 +77,44 @@ def _matches_filters(lead: dict[str, Any], filters: Optional[dict]) -> bool:
     return True
 
 
-async def _adapter_fetch(kind: str, slug_or_url: str) -> list[dict[str, Any]]:
+async def _adapter_fetch(
+    kind: str,
+    slug_or_url: str,
+    ctx: dict[str, Any],
+) -> list[dict[str, Any]]:
     fn = ADAPTERS.get(kind)
     if fn is None:
         raise ValueError(f"Unknown source kind: {kind!r}")
-    return await fn(slug_or_url)
+    return await fn(slug_or_url, ctx)
+
+
+async def _build_ctx(
+    db: AsyncSession, source: JobSource
+) -> dict[str, Any]:
+    """Per-kind context dict — credentials for paid sources, filter
+    pass-through for everything. Adapters that don't need any of this
+    just ignore it."""
+    ctx: dict[str, Any] = {"filters": source.filters}
+    if source.kind in ("brightdata_linkedin", "brightdata_glassdoor"):
+        from app.api.v1.api_credentials import get_user_secret
+
+        ctx["api_key"] = await get_user_secret(
+            db, source.user_id, "brightdata", "default"
+        )
+        # Allow a per-source dataset_id override via filters.
+        if isinstance(source.filters, dict):
+            ds = source.filters.get("dataset_id")
+            if isinstance(ds, str) and ds.strip():
+                ctx["dataset_id"] = ds.strip()
+    return ctx
 
 
 async def poll_source(db: AsyncSession, source: JobSource) -> tuple[int, Optional[str]]:
     """Fetch + persist new leads for a single source. Returns
     (new_lead_count, error_message). Caller commits."""
     try:
-        raw_leads = await _adapter_fetch(source.kind, source.slug_or_url)
+        ctx = await _build_ctx(db, source)
+        raw_leads = await _adapter_fetch(source.kind, source.slug_or_url, ctx)
     except Exception as exc:  # noqa: BLE001
         # Format a more actionable message for the most common failure
         # mode (HTTP 404 — wrong slug or company isn't on this ATS).
