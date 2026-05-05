@@ -824,6 +824,26 @@ function OverviewTab({
         <SkillsAnalysis
           required={job.required_skills ?? null}
           niceToHave={job.nice_to_have_skills ?? null}
+          onSkillAdded={async () => {
+            // Adding a JD-required skill to the catalog should
+            // bump the deterministic fit-score immediately. The
+            // skill-match component reads the catalog at compute
+            // time, so a fresh recompute picks up the new row,
+            // and re-fetching the job reflects the new score in
+            // the breakdown panel without a full page reload.
+            try {
+              await api.post(
+                `/api/v1/jobs/${job.id}/recompute-fit-score`,
+                {},
+              );
+              const refreshed = await api.get<TrackedJob>(
+                `/api/v1/jobs/${job.id}`,
+              );
+              onSaved(refreshed);
+            } catch {
+              /* non-fatal — user can hit Recompute manually */
+            }
+          }}
         />
       ) : null}
     <div className="jsp-card p-5 space-y-4">
