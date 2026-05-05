@@ -455,66 +455,83 @@ export default function JobTrackerPage() {
       ) : null}
 
       {selectedIds.size > 0 ? (
-        <div className="jsp-card p-3 mt-3 flex flex-wrap gap-2 items-center border-l-4 border-l-corp-accent">
+        <div className="jsp-card p-3 mt-3 flex flex-wrap gap-3 items-center border-l-4 border-l-corp-accent">
           <span className="text-sm">
             <strong>{selectedIds.size}</strong> selected
           </span>
-          <div className="flex-1" />
-          <select
-            className="jsp-input text-xs w-44"
-            value={bulkStatusTarget}
-            onChange={(e) => {
-              const v = e.target.value as JobStatus | "";
-              setBulkStatusTarget(v);
-              if (v) bulkChangeStatus(v);
-            }}
-            disabled={bulkRunning}
-            title="Apply this status to every selected job"
-          >
-            <option value="">Change status to…</option>
-            {JOB_STATUSES.map((s) => (
-              <option key={s} value={s}>
-                {s.replace(/_/g, " ")}
-              </option>
-            ))}
-          </select>
+
+          {/* Status group — labeled + accent-bordered so it reads as
+              a primary bulk action, not a buried form field. */}
+          <div className="flex items-center gap-1.5 px-2 py-1 rounded border border-corp-accent/40 bg-corp-accent/10">
+            <span className="text-[10px] uppercase tracking-wider text-corp-accent">
+              Status
+            </span>
+            <select
+              className="jsp-input text-xs py-0.5 w-40 bg-corp-surface"
+              value={bulkStatusTarget}
+              onChange={(e) => {
+                const v = e.target.value as JobStatus | "";
+                setBulkStatusTarget(v);
+                if (v) bulkChangeStatus(v);
+              }}
+              disabled={bulkRunning}
+              title="Apply this status to every selected job"
+              aria-label="Change status of selected jobs"
+            >
+              <option value="">— pick a status —</option>
+              {JOB_STATUSES.map((s) => (
+                <option key={s} value={s}>
+                  {s.replace(/_/g, " ")}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Tailor group — separated visually from the status control
+              so neither feels lumped in with the other. */}
+          <div className="flex items-center gap-1.5 px-2 py-1 rounded border border-corp-border">
+            <span className="text-[10px] uppercase tracking-wider text-corp-muted">
+              Tailor
+            </span>
+            <button
+              type="button"
+              className="jsp-btn-ghost text-xs"
+              onClick={() => bulkTailor(["resume"])}
+              disabled={bulkRunning}
+              title="Queue a tailor run for each selected job — writes a resume per job"
+            >
+              Resumes
+            </button>
+            <button
+              type="button"
+              className="jsp-btn-ghost text-xs"
+              onClick={() => bulkTailor(["cover_letter"])}
+              disabled={bulkRunning}
+              title="Queue a tailor run for each selected job — writes a cover letter per job"
+            >
+              Cover letters
+            </button>
+            <button
+              type="button"
+              className="jsp-btn-primary text-xs"
+              onClick={() => bulkTailor(["resume", "cover_letter"])}
+              disabled={bulkRunning}
+              title="Queue both a resume and a cover letter per selected job"
+            >
+              {bulkRunning ? "Queuing…" : "Both"}
+            </button>
+          </div>
+
           <button
             type="button"
-            className="jsp-btn-ghost text-xs"
-            onClick={() => bulkTailor(["resume"])}
-            disabled={bulkRunning}
-            title="Queue a tailor run for each selected job — writes a resume per job"
-          >
-            Write resumes
-          </button>
-          <button
-            type="button"
-            className="jsp-btn-ghost text-xs"
-            onClick={() => bulkTailor(["cover_letter"])}
-            disabled={bulkRunning}
-            title="Queue a tailor run for each selected job — writes a cover letter per job"
-          >
-            Write cover letters
-          </button>
-          <button
-            type="button"
-            className="jsp-btn-primary text-xs"
-            onClick={() => bulkTailor(["resume", "cover_letter"])}
-            disabled={bulkRunning}
-            title="Queue both a resume and a cover letter per selected job"
-          >
-            {bulkRunning ? "Queuing…" : "Write both"}
-          </button>
-          <button
-            type="button"
-            className="jsp-btn-ghost text-xs"
+            className="jsp-btn-ghost text-xs ml-auto"
             onClick={() => {
               setSelectedIds(new Set());
               setBulkMsg(null);
             }}
             disabled={bulkRunning}
           >
-            Clear
+            Clear selection
           </button>
         </div>
       ) : null}
