@@ -196,6 +196,40 @@ export default function QueuePage() {
     await refresh();
   }
 
+  async function dismissByStatus(status: "done" | "error") {
+    // Only fetch-queue rows have a delete endpoint; companion tasks
+    // are in-memory SSE state and disappear on next refresh anyway.
+    // We still drop matching companion rows from local state so the
+    // button feels responsive regardless of which kind is hidden.
+    const fetchTargets = items.filter(
+      (i) => i.status === status && i.kind === "fetch" && i.fetch_queue_id,
+    );
+    const companionTargets = items.filter(
+      (i) => i.status === status && i.kind === "companion",
+    );
+    const total = fetchTargets.length + companionTargets.length;
+    if (total === 0) return;
+    if (
+      !confirm(
+        `Remove ${total} ${status} ${total === 1 ? "row" : "rows"} from the activity feed?`,
+      )
+    ) {
+      return;
+    }
+    if (fetchTargets.length > 0) {
+      await Promise.allSettled(
+        fetchTargets.map((t) =>
+          api.delete(`/api/v1/jobs/queue/${t.fetch_queue_id}`),
+        ),
+      );
+    }
+    if (companionTargets.length > 0) {
+      const dropIds = new Set(companionTargets.map((t) => t.id));
+      setItems((prev) => prev.filter((p) => !dropIds.has(p.id)));
+    }
+    await refresh();
+  }
+
   const counts = useMemo(() => {
     let active = 0;
     let waiting = 0;
@@ -215,21 +249,39 @@ export default function QueuePage() {
   }, [items]);
 
   const visible = useMemo<ActivityRow[]>(() => {
+    // Pick the rows for the active filter, then trim done-fetch rows
+    // to the most recent 20 so a long history of completed fetches
+    // doesn't bury active / errored work. items[] is already sorted
+    // newest-first by updated_at upstream.
+    function trimDone(arr: ActivityRow[]): ActivityRow[] {
+      let kept = 0;
+      const out: ActivityRow[] = [];
+      for (const it of arr) {
+        if (it.status === "done") {
+          if (kept >= 20) continue;
+          kept++;
+        }
+        out.push(it);
+      }
+      return out;
+    }
     switch (filter) {
       case "all":
-        return items;
+        return trimDone(items);
       case "active":
         return items.filter(isActive);
       case "waiting":
         return items.filter(isWaiting);
       case "done":
-        return items.filter((i) => i.status === "done");
+        return trimDone(items.filter((i) => i.status === "done"));
       case "error":
         return items.filter((i) => i.status === "error");
       default:
         return items;
     }
   }, [items, filter]);
+
+  const hiddenDoneCount = Math.max(0, counts.done - 20);
 
   // Soonest upcoming resume, for the "next resume in N min" hint.
   const nextResume = useMemo(() => {
@@ -382,15 +434,43 @@ export default function QueuePage() {
           label="All"
           onClick={() => setFilter("all")}
         />
-        <button
-          type="button"
-          className="jsp-btn-ghost text-xs ml-auto"
-          onClick={refresh}
-          disabled={loading}
-        >
-          {loading ? "…" : "Refresh"}
-        </button>
+        <div className="ml-auto flex items-center gap-2 flex-wrap">
+          {counts.done > 0 ? (
+            <button
+              type="button"
+              className="jsp-btn-ghost text-xs"
+              onClick={() => dismissByStatus("done")}
+              title={`Remove all ${counts.done} completed rows`}
+            >
+              Dismiss completed ({counts.done})
+            </button>
+          ) : null}
+          {counts.errored > 0 ? (
+            <button
+              type="button"
+              className="jsp-btn-ghost text-xs text-corp-danger border-corp-danger/40"
+              onClick={() => dismissByStatus("error")}
+              title={`Remove all ${counts.errored} errored rows`}
+            >
+              Dismiss errored ({counts.errored})
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="jsp-btn-ghost text-xs"
+            onClick={refresh}
+            disabled={loading}
+          >
+            {loading ? "…" : "Refresh"}
+          </button>
+        </div>
       </div>
+      {hiddenDoneCount > 0 && (filter === "all" || filter === "done") ? (
+        <div className="text-[11px] text-corp-muted -mt-2 mb-3">
+          Showing latest 20 completed rows; {hiddenDoneCount} older
+          hidden. Use <b>Dismiss completed</b> to clear them.
+        </div>
+      ) : null}
 
       {err ? (
         <div className="jsp-card p-3 mb-3 text-sm text-corp-danger">{err}</div>

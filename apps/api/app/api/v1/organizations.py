@@ -37,7 +37,7 @@ def _validate_type(org_type: str) -> str:
 async def list_organizations(
     q: str | None = Query(default=None, description="Case-insensitive prefix search on name"),
     type: str | None = Query(default=None, description="Filter by type"),
-    limit: int = Query(default=25, ge=1, le=200),
+    limit: int = Query(default=25, ge=1, le=5000),
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
 ) -> list[Organization]:

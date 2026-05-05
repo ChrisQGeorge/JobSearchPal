@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { Paginator, usePagination } from "@/components/Paginator";
 import { api, ApiError } from "@/lib/api";
 import type { Skill } from "@/lib/types";
 
@@ -195,6 +196,13 @@ export function SkillsPanel() {
       return (s.category ?? "").toLowerCase().includes(q);
     });
   }, [items, query]);
+
+  // Paginate the filtered set. Per-page choice persists in localStorage
+  // (jsp:paginate:skills). The bulk-select set still operates against
+  // the FULL filtered list (selecting a skill on page 2 then jumping
+  // to page 1 keeps the selection live), so the pager only affects
+  // what's rendered, not what's selectable.
+  const skillsPager = usePagination(filtered, "skills");
 
   function toggle(id: number) {
     setSelected((s) => {
@@ -407,7 +415,7 @@ export function SkillsPanel() {
           }
         >
           <ul className="jsp-card divide-y divide-corp-border overflow-hidden">
-            {filtered.map((s) =>
+            {skillsPager.visibleItems.map((s) =>
               editingId === s.id ? (
                 // Inline form — appears in the list where the row would be.
                 // Same SkillForm component as +New but slotted as a <li>.
@@ -444,6 +452,14 @@ export function SkillsPanel() {
               ),
             )}
           </ul>
+          <Paginator
+            page={skillsPager.page}
+            pageSize={skillsPager.pageSize}
+            setPage={skillsPager.setPage}
+            setPageSize={skillsPager.setPageSize}
+            total={skillsPager.total}
+            totalPages={skillsPager.totalPages}
+          />
           {detailId != null ? (
             <SkillDetailPanel
               skill={items.find((s) => s.id === detailId) ?? null}

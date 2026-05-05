@@ -100,9 +100,47 @@ export function FetchQueuePanel({ onJobCreated }: Props) {
     await refresh();
   }
 
+  async function dismissByState(state: "done" | "error") {
+    const targets = items.filter((i) => i.state === state);
+    if (targets.length === 0) return;
+    if (
+      !confirm(
+        `Remove ${targets.length} ${state} ${
+          targets.length === 1 ? "row" : "rows"
+        } from the fetch queue?`,
+      )
+    ) {
+      return;
+    }
+    await Promise.allSettled(
+      targets.map((t) => api.delete(`/api/v1/jobs/queue/${t.id}`)),
+    );
+    await refresh();
+  }
+
   const activeCount = items.filter(
     (i) => i.state === "queued" || i.state === "processing",
   ).length;
+  const doneCount = items.filter((i) => i.state === "done").length;
+  const errorCount = items.filter((i) => i.state === "error").length;
+
+  // Trim "done" rows to the most recent 20 so a long history of
+  // completed fetches doesn't bury active / errored work. Keep all
+  // queued / processing / error / waiting rows so nothing actionable
+  // ever gets hidden. The user can run "Dismiss completed" to clear
+  // them entirely.
+  const visibleItems = (() => {
+    const nonDone: typeof items = [];
+    const done: typeof items = [];
+    for (const it of items) {
+      if (it.state === "done") done.push(it);
+      else nonDone.push(it);
+    }
+    // `items` from the API is already sorted newest-first in the
+    // existing endpoint; slice the most recent 20 done rows.
+    return [...nonDone, ...done.slice(0, 20)];
+  })();
+  const hiddenDoneCount = Math.max(0, doneCount - 20);
 
   return (
     <section className="jsp-card">
@@ -190,13 +228,44 @@ export function FetchQueuePanel({ onJobCreated }: Props) {
 
           {error ? <div className="text-xs text-corp-danger">{error}</div> : null}
 
+          {(doneCount > 0 || errorCount > 0) ? (
+            <div className="flex flex-wrap items-center gap-2 text-[11px] text-corp-muted">
+              {doneCount > 0 ? (
+                <button
+                  type="button"
+                  className="jsp-btn-ghost text-xs"
+                  onClick={() => dismissByState("done")}
+                  title={`Remove all ${doneCount} completed rows`}
+                >
+                  Dismiss completed ({doneCount})
+                </button>
+              ) : null}
+              {errorCount > 0 ? (
+                <button
+                  type="button"
+                  className="jsp-btn-ghost text-xs text-corp-danger border-corp-danger/40"
+                  onClick={() => dismissByState("error")}
+                  title={`Remove all ${errorCount} errored rows`}
+                >
+                  Dismiss errored ({errorCount})
+                </button>
+              ) : null}
+              {hiddenDoneCount > 0 ? (
+                <span className="ml-auto">
+                  Showing latest 20 completed; {hiddenDoneCount} older
+                  hidden.
+                </span>
+              ) : null}
+            </div>
+          ) : null}
+
           {loading ? (
             <div className="text-xs text-corp-muted">Loading queue...</div>
           ) : items.length === 0 ? (
             <div className="text-xs text-corp-muted">Queue is empty.</div>
           ) : (
             <ul className="space-y-1.5">
-              {items.map((it) => (
+              {visibleItems.map((it) => (
                 <li
                   key={it.id}
                   className="flex items-start gap-3 py-2 border-t border-corp-border/40 first:border-t-0"

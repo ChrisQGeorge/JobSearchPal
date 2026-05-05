@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { PageShell } from "@/components/PageShell";
+import { Paginator, usePagination } from "@/components/Paginator";
 import { api, ApiError } from "@/lib/api";
 import {
   ORG_TYPES,
@@ -18,12 +19,15 @@ export default function OrganizationsPage() {
   const [editing, setEditing] = useState<Organization | null>(null);
   const [creating, setCreating] = useState(false);
   const [loading, setLoading] = useState(true);
+  const pager = usePagination(items, "organizations");
 
   async function refresh() {
     const params = new URLSearchParams();
     if (q.trim()) params.set("q", q.trim());
     if (typeFilter) params.set("type", typeFilter);
-    params.set("limit", "200");
+    // Larger page so client-side pagination has the whole set; the
+    // backend has a hard upper bound it'll honor.
+    params.set("limit", "1000");
     setLoading(true);
     try {
       setItems(await api.get<OrganizationSummary[]>(`/api/v1/organizations?${params.toString()}`));
@@ -135,11 +139,22 @@ export default function OrganizationsPage() {
           create them for you as you add experiences.
         </div>
       ) : (
-        <ul className="jsp-card divide-y divide-corp-border overflow-hidden">
-          {items.map((o) => (
-            <OrganizationCard key={o.id} summary={o} onEdit={openEdit} onDelete={remove} />
-          ))}
-        </ul>
+        <div className="jsp-card overflow-hidden">
+          <ul className="divide-y divide-corp-border">
+            {pager.visibleItems.map((o) => (
+              <OrganizationCard key={o.id} summary={o} onEdit={openEdit} onDelete={remove} />
+            ))}
+          </ul>
+          <Paginator
+            page={pager.page}
+            pageSize={pager.pageSize}
+            setPage={pager.setPage}
+            setPageSize={pager.setPageSize}
+            total={pager.total}
+            totalPages={pager.totalPages}
+            className="px-4 py-2 border-t border-corp-border"
+          />
+        </div>
       )}
     </PageShell>
   );

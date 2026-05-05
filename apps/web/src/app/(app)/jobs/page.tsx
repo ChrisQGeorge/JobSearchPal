@@ -12,6 +12,7 @@ import {
 import { InlineStatusPicker } from "@/components/InlineStatusPicker";
 import { OrganizationCombobox } from "@/components/OrganizationCombobox";
 import { PageShell } from "@/components/PageShell";
+import { Paginator, usePagination } from "@/components/Paginator";
 import { SkillsAnalysis } from "@/components/SkillsAnalysis";
 import { StatusBadge, STATUS_STYLES } from "@/components/StatusBadge";
 import { api, ApiError } from "@/lib/api";
@@ -154,6 +155,14 @@ export default function JobTrackerPage() {
     }
     return arr;
   }, [items, search, sortKey, sortDir]);
+
+  // Pagination layered on top of filter+search+sort. Page-size choice
+  // persists per-page via localStorage (jsp:paginate:jobs). The
+  // header checkbox + bulk actions deliberately operate on the
+  // current page only, so a user-visible "select all visible" matches
+  // what they actually see.
+  const pager = usePagination(visibleItems, "jobs");
+  const pagedItems = pager.visibleItems;
 
   // Status counts across the full set (unfiltered). Quick-nav to each bucket.
   const [counts, setCounts] = useState<Partial<Record<JobStatus, number>>>({});
@@ -539,25 +548,25 @@ export default function JobTrackerPage() {
                   <input
                     type="checkbox"
                     className="accent-corp-accent"
-                    aria-label="Select all visible rows"
+                    aria-label="Select all rows on this page"
                     checked={
-                      visibleItems.length > 0 &&
-                      visibleItems.every((j) => selectedIds.has(j.id))
+                      pagedItems.length > 0 &&
+                      pagedItems.every((j) => selectedIds.has(j.id))
                     }
-                    // Indeterminate state when some but not all visible rows
-                    // are selected — React doesn't expose it as a prop, so
-                    // set via ref on the DOM element.
+                    // Indeterminate state when some but not all current-page
+                    // rows are selected — React doesn't expose it as a prop,
+                    // so set via ref on the DOM element.
                     ref={(el) => {
                       if (el) {
-                        const count = visibleItems.filter((j) =>
+                        const count = pagedItems.filter((j) =>
                           selectedIds.has(j.id),
                         ).length;
                         el.indeterminate =
-                          count > 0 && count < visibleItems.length;
+                          count > 0 && count < pagedItems.length;
                       }
                     }}
                     onChange={() =>
-                      toggleSelectAllVisible(visibleItems.map((j) => j.id))
+                      toggleSelectAllVisible(pagedItems.map((j) => j.id))
                     }
                     onClick={(e) => e.stopPropagation()}
                   />
@@ -593,7 +602,7 @@ export default function JobTrackerPage() {
               </tr>
             </thead>
             <tbody>
-              {visibleItems.map((j) => (
+              {pagedItems.map((j) => (
                 <tr
                   key={j.id}
                   className={`border-t border-corp-border hover:bg-corp-surface2 cursor-pointer ${
@@ -674,6 +683,15 @@ export default function JobTrackerPage() {
               ))}
             </tbody>
           </table>
+          <Paginator
+            page={pager.page}
+            pageSize={pager.pageSize}
+            setPage={pager.setPage}
+            setPageSize={pager.setPageSize}
+            total={pager.total}
+            totalPages={pager.totalPages}
+            className="px-4 py-2 border-t border-corp-border"
+          />
         </div>
       )}
     </PageShell>
