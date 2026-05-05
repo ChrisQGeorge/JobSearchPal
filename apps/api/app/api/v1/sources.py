@@ -29,8 +29,16 @@ leads_router = APIRouter(prefix="/job-leads", tags=["job-leads"])
 
 
 SOURCE_KINDS = set(KIND_LABELS.keys())
-LEAD_TRIAGE_STATES = {"interested", "watching", "dismissed"}
-LEAD_PROMOTE_STATUSES = {"interested", "watching"}
+# Lead triage actions surfaced on the inbox.
+#   "review"     → promote to a TrackedJob at status=to_review (the
+#                  user reviews the row in the tracker queue, exactly
+#                  like a manually-pasted URL).
+#   "dismissed"  → drop the lead without creating anything.
+# `interested` / `watching` are no longer accepted — the user explicitly
+# asked that lead-promotions land at to_review so the review queue
+# gates everything new before it inflates active-application counts.
+LEAD_TRIAGE_STATES = {"review", "dismissed"}
+PROMOTED_STATUS = "to_review"
 
 
 # Seed sources offered to brand-new users so the /leads inbox isn't a
@@ -534,20 +542,22 @@ async def list_leads(
 async def _promote_lead(
     db: AsyncSession,
     lead: JobLead,
-    target_status: str,
     user: User,
 ) -> Optional[int]:
-    """Promote a lead by enqueueing a fetch task on its source_url with
-    `desired_status=target_status`. Same flow as pasting a URL on the
-    tracker — the fetch worker creates the TrackedJob, runs the JD
-    analyzer / fit scoring downstream, and the lead's tracked_job_id
-    is back-filled when the worker finishes (via `lead_id` in the
-    queue row's payload).
+    """Promote a lead by enqueueing a fetch task on its source_url
+    with `desired_status=to_review`. Same flow as pasting a URL on
+    the tracker — the fetch worker creates the TrackedJob, runs the
+    JD analyzer / fit scoring downstream, and the lead's
+    `tracked_job_id` is back-filled when the worker finishes (via
+    `lead_id` in the queue row's payload).
 
-    Fallback: if the lead has no source_url (rare for ATS adapters but
-    possible for some RSS feeds), we create a TrackedJob immediately
-    from the cached body since there's nothing to fetch.
+    Fallback: if the lead has no source_url (rare for ATS adapters
+    but possible for some RSS feeds), we create a TrackedJob
+    immediately from the cached body since there's nothing to fetch.
+    Either way the new row lands at status=to_review so the review
+    queue gates it before it inflates active-application counts.
     """
+    target_status = PROMOTED_STATUS
     if not lead.source_url:
         # No URL to fetch — fall back to immediate-create from the
         # cached body. Mirrors the behavior the user had before, just
@@ -623,11 +633,11 @@ async def lead_bulk_action(
             lead.state = "dismissed"
             dismissed += 1
             continue
-        # interested / watching → promote to tracked_jobs.
+        # action == "review" — promote to tracked_jobs at to_review.
         if lead.state == "promoted" and lead.tracked_job_id:
             # Already promoted — nothing to do, treat as success.
             continue
-        await _promote_lead(db, lead, action, user)
+        await _promote_lead(db, lead, user)
         promoted += 1
     await db.commit()
     return LeadActionOut(

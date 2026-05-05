@@ -3,9 +3,11 @@
 // Job Leads inbox + Sources management.
 //
 // Two stacked panels: top is the registered Sources (add/edit/poll-now),
-// bottom is the lead inbox with bulk-select → interested / watching /
-// dismiss. Triaging interested or watching auto-creates a TrackedJob and
-// queues a score task — the user lands in /jobs ready to triage further.
+// bottom is the lead inbox with bulk-select → "Add to tracker" (which
+// promotes to a tracked_jobs row at status=to_review and chains the
+// fetch + score + research follow-on tasks) or Dismiss. Promotions
+// always land at to_review so the review queue gates new rows before
+// they inflate active-application counts.
 
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
@@ -311,7 +313,7 @@ export default function LeadsPage() {
     });
   }, [leads, search]);
 
-  async function bulkAction(action: "interested" | "watching" | "dismissed") {
+  async function bulkAction(action: "review" | "dismissed") {
     if (selected.size === 0) return;
     setActionRunning(true);
     setActionMsg(null);
@@ -322,7 +324,10 @@ export default function LeadsPage() {
         { ids: [...selected], action },
       );
       const pieces: string[] = [];
-      if (out.promoted > 0) pieces.push(`${out.promoted} promoted to tracker (queued for scoring)`);
+      if (out.promoted > 0)
+        pieces.push(
+          `${out.promoted} added to tracker as to_review (queued for fetch + scoring)`,
+        );
       if (out.dismissed > 0) pieces.push(`${out.dismissed} dismissed`);
       setActionMsg(pieces.join(" · ") || `Action ${action} applied`);
       setSelected(new Set());
@@ -553,18 +558,11 @@ export default function LeadsPage() {
             <button
               type="button"
               className="jsp-btn-primary text-xs"
-              onClick={() => bulkAction("interested")}
+              onClick={() => bulkAction("review")}
               disabled={actionRunning}
+              title="Queue a fetch for each selected lead and add it to the tracker at status=to_review."
             >
-              {actionRunning ? "…" : "Add as interested"}
-            </button>
-            <button
-              type="button"
-              className="jsp-btn-ghost text-xs"
-              onClick={() => bulkAction("watching")}
-              disabled={actionRunning}
-            >
-              Add as watching
+              {actionRunning ? "…" : "Add to tracker"}
             </button>
             <button
               type="button"
