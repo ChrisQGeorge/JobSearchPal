@@ -45,12 +45,13 @@ This document exists so that an AI agent can "vibe code" the application from sc
 
 ### 1.2 Product Scope
 
-Job Search Pal's primary purpose is to use Claude Code to make a job search faster and less painful: tracking opportunities and applications, maintaining a rich personal history, and generating tailored application materials — with a Companion persona that keeps the process lighthearted in an ironic, retro-futurist way. The aesthetic target is ironic corporate-dystopia: cheerful copy, slightly ominous subtext, and a company tone that is simultaneously upbeat and faintly threatening.
+Job Search Pal's primary purpose is to use Claude Code to make a job search faster and less painful: tracking opportunities and applications, maintaining a rich personal history, generating tailored application materials, and — under R10 / R11 — assisting with the actual application submission through a streamed, user-visible Chromium session both the human and the Companion drive. The Companion persona keeps the process lighthearted in an ironic, retro-futurist way. The aesthetic target is ironic corporate-dystopia: cheerful copy, slightly ominous subtext, and a company tone that is simultaneously upbeat and faintly threatening.
 
-The application consists of two top-level systems:
+The application consists of three top-level systems:
 
 1. A set of Claude Code **skills** the Companion can invoke to: give job-search advice, tailor resumes and cover letters to specific job descriptions, record and maintain the user's history, ask relevant clarifying questions, analyze job descriptions, research companies, prep for interviews, and generally advance the search. A single skill may cover several of these responsibilities.
 2. A clean **web UI** that lets the user: enter and edit their personal history, upload writing samples, track applied and watched jobs through detailed status stages with interview artifacts attached, customize generated documents in-place, and converse with the Companion.
+3. A **streamed browser** (R10) — a Chromium instance running inside its own Docker container with a persistent profile volume, exposed to the user through a `/browser` page in the web UI as a noVNC stream and to the Companion through a CDP / Playwright control plane. Both control planes hit the same browser session, so the user can take over from the agent at any keystroke and the website sees a single human-like operator in either case. R11 layers ATS-aware Playwright templates (Greenhouse / Lever / Ashby / Workable) on top, with a generic agent loop as the long-tail fallback. Captchas, 2FA, and explicit "no automation" terms-of-service gates trigger a pause-for-user handoff rather than a programmatic bypass.
 
 
 #### Pages
@@ -289,6 +290,11 @@ Release plan (non-binding, informative):
 | **R4 – Humanization & Studio** | Document Studio, Writing Samples, writing-humanizer, selection-rewriter. | REQ-FUNC-Docs-*, REQ-FUNC-Humanize-*. |
 | **R5 – Analytics & Polish** | Dashboard charts, MetricSnapshot, persona gallery & custom personas, interview-prep & interview-retrospective. | REQ-FUNC-Metrics-*, REQ-FUNC-Persona-*. |
 | **R6 – Deferred / Stretch** | Additional import sources, export formats, optional OCR for PDF writing samples. | *Deferred — track in appendix.* |
+| **R7 – Source ingest** | Pollable ATS / RSS / paid-API job-source adapters, leads inbox, dedup + per-source rate caps. | REQ-FUNC-Leads-*. |
+| **R8 – Deterministic fit-score** | Pure-Python weighted scoring against `JobPreferences` + `JobCriterion`, replacing the prior LLM-driven score. | REQ-FUNC-Score-*. |
+| **R9 – Email ingest** | Paste-an-email classifier + suggested status change for the matched tracked job. | REQ-FUNC-Email-*. |
+| **R10 – Browser-piped automation** | Streamed Chromium service the user and Companion both drive over the same session; question-bank for repeated form prompts. | REQ-FUNC-Browser-*. |
+| **R11 – Auto-apply scope expansion** | ATS-aware Playwright templates (Greenhouse / Lever / Ashby / Workable) + a generic agent fallback for unknown ATSes. | REQ-FUNC-Apply-*. |
 
 ## 3. Requirements
 
@@ -668,6 +674,22 @@ Items acknowledged but intentionally out of scope for the current release plan:
 
 ### 5.4 Out-of-Scope Clarifications
 
-- Job Search Pal does **not** auto-apply to jobs on the user's behalf.
-- Job Search Pal does **not** scrape job boards at scale; imports are per-URL and user-initiated.
-- Job Search Pal does **not** share any user data with third parties except the user's own configured LLM provider.
+- Job Search Pal **may** drive a streamed, user-visible Chromium
+  instance to assist with applications under the R10 / R11 release
+  scope. The browser runs in a per-deployment Docker container and
+  the user can take over at any time. Both human input and
+  Companion-issued CDP / Playwright actions flow through the same
+  session, so from the website's perspective the activity is
+  indistinguishable from a single human operator. Captchas, 2FA
+  prompts, and any explicit terms-of-service "no automation" gates
+  trigger a pause-for-user handoff rather than a programmatic bypass.
+- Job Search Pal does **not** scrape job boards at scale; imports are
+  per-URL or via the per-user pollable source adapters under R7,
+  each gated by `poll_interval_hours` + `max_leads_per_poll`.
+- Job Search Pal does **not** share any user data with third parties
+  except the user's own configured LLM provider and any user-
+  configured paid source-adapter API (e.g., Bright Data when the
+  user supplies a key on the Settings page).
+- Job Search Pal does **not** submit applications without the user
+  having explicitly initiated an `apply_run` for that specific
+  tracked job; the agent does not auto-fire across the queue.
