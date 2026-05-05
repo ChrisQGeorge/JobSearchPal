@@ -198,11 +198,11 @@ from app.skills.runner import (
 
 _log = _logging.getLogger(__name__)
 
-_RESEARCH_PROMPT = """Research the company "{name}" using WebSearch and WebFetch.
-Prefer the company's own site (About, Careers, Engineering blog, Press) and
-credible external sources (the company's Wikipedia page, LinkedIn company
-page, Crunchbase summary, tech-press articles). Avoid Glassdoor-style rumor
-aggregation unless the signal is repeated across sources.
+_RESEARCH_PROMPT = """You are summarizing what the user already
+downloaded about the company "{name}". The corpus below is verbatim
+text from a small set of pages we fetched ourselves. Do NOT call
+WebSearch, WebFetch, or any other tool — read the corpus and emit
+one JSON object.
 
 {hint_block}
 
@@ -234,12 +234,56 @@ Return ONE JSON object, no prose, no markdown fences:
 }}
 
 Rules:
-- Prefer null over guessing. If a field truly isn't visible, null is better
-  than a plausible-sounding fabrication.
+- Prefer null over guessing. If a field truly isn't visible in the
+  corpus, null is better than a plausible-sounding fabrication.
 - `size` must be a bucket, not a raw number.
-- `source_links` should be ~3-6 URLs you actually fetched, not random matches.
-- `research_notes` should NOT regurgitate `description` — it's the deeper
-  context a candidate would actually want before interviewing.
+- `source_links` is the URL list under "SOURCES" below — copy them
+  verbatim, do not invent any.
+- `research_notes` should NOT regurgitate `description` — it's the
+  deeper context a candidate would actually want before interviewing.
+
+============================================================
+SOURCES
+============================================================
+{sources_block}
+
+============================================================
+CORPUS
+============================================================
+{corpus}
+"""
+
+
+_RESEARCH_FALLBACK_PROMPT = """We couldn't directly download anything
+useful for "{name}" ({fail_reason}). Use WebSearch + WebFetch to
+gather a corpus quickly — at most TWO WebSearch calls and TWO
+WebFetch calls total. Then emit the same JSON schema below.
+
+{hint_block}
+
+Schema:
+{{
+  "name": string,
+  "website": string | null,
+  "industry": string | null,
+  "size": "1-10" | "11-50" | "51-200" | "201-500" | "501-1000" |
+          "1001-5000" | "5001-10000" | "10000+" | null,
+  "headquarters_location": string | null,
+  "founded_year": number | null,
+  "description": string | null,
+  "research_notes": string | null,
+  "source_links": string[] | null,
+  "tech_stack_hints": string[] | null,
+  "reputation_signals": {{
+    "engineering_culture": string | null,
+    "work_life_balance": string | null,
+    "layoff_history": string | null,
+    "recent_news": string | null,
+    "red_flags": string[] | null,
+    "green_flags": string[] | null
+  }} | null,
+  "warning": string | null
+}}
 """
 
 
@@ -248,6 +292,89 @@ class _ResearchIn(_BaseModel):
 
 
 _JSON_RE = _re.compile(r"\{[\s\S]*\}", _re.MULTILINE)
+
+
+_RESEARCH_BUDGET = 50_000  # chars across all fetched pages combined.
+_RESEARCH_PER_PAGE_CAP = 18_000
+
+
+async def _fetch_corpus_for_org(
+    name: str, website: _Optional[str]
+) -> tuple[str, list[str], _Optional[str]]:
+    """Pull a small corpus of text about `name` directly via httpx.
+    Returns (corpus_markdown, source_urls, fail_reason).
+
+    Strategy is pragmatic: hit (1) the org's website if we have one or
+    a guessed URL, and (2) the company's Wikipedia page (if it exists).
+    Two HTTP calls max, no Claude. The Claude step that follows
+    summarizes whatever we found — no exploration, no recursion.
+    """
+    from app.sources._common import (
+        UpstreamGateError,
+        html_to_md,
+        http_get_text,
+    )
+    import httpx
+
+    candidates: list[str] = []
+    if website:
+        w = website.strip()
+        if not w.startswith("http"):
+            w = "https://" + w
+        candidates.append(w)
+    else:
+        # Best-effort guess at the homepage from the name. Lots of
+        # noise but cheap to try; the parse step happily ignores it
+        # if it 404s.
+        slug = "".join(c for c in name.lower() if c.isalnum())
+        if slug:
+            candidates.append(f"https://www.{slug}.com")
+    # Wikipedia is a reliably-structured second source.
+    wiki_slug = name.strip().replace(" ", "_")
+    candidates.append(f"https://en.wikipedia.org/wiki/{wiki_slug}")
+
+    pages: list[tuple[str, str]] = []
+    last_fail: _Optional[str] = None
+    for u in candidates:
+        try:
+            body = await http_get_text(u, timeout=20.0)
+        except UpstreamGateError as exc:
+            last_fail = f"{u}: bot-gated ({exc})"
+            continue
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code if exc.response is not None else "?"
+            last_fail = f"{u}: HTTP {code}"
+            continue
+        except httpx.HTTPError as exc:
+            last_fail = f"{u}: {exc}"
+            continue
+        except Exception as exc:  # pragma: no cover  (defensive)
+            last_fail = f"{u}: {type(exc).__name__}: {exc}"
+            continue
+        md = html_to_md(body)
+        if not md or len(md.strip()) < 200:
+            last_fail = f"{u}: thin response"
+            continue
+        if len(md) > _RESEARCH_PER_PAGE_CAP:
+            md = md[:_RESEARCH_PER_PAGE_CAP] + "\n\n[… truncated …]"
+        pages.append((u, md))
+
+    if not pages:
+        return "", [], last_fail or "no candidates resolved"
+
+    chunks: list[str] = []
+    sources: list[str] = []
+    total = 0
+    for u, md in pages:
+        block = f"### Source: {u}\n\n{md}\n"
+        if total + len(block) > _RESEARCH_BUDGET:
+            block = block[: _RESEARCH_BUDGET - total] + "\n[… truncated …]"
+        chunks.append(block)
+        sources.append(u)
+        total += len(block)
+        if total >= _RESEARCH_BUDGET:
+            break
+    return "\n\n".join(chunks), sources, None
 
 
 def _extract_json(text: str) -> _Optional[dict]:
@@ -299,7 +426,31 @@ async def research_organization(
         if payload.hint and payload.hint.strip()
         else "No specific focus — produce a general company overview."
     )
-    prompt = _RESEARCH_PROMPT.format(name=obj.name, hint_block=hint_block)
+
+    # Stage 1: pull a corpus directly via httpx (homepage + Wikipedia).
+    # Two HTTP calls, no Claude. Then Stage 2 summarizes — no
+    # exploration, no recursion.
+    corpus, sources, fail_reason = await _fetch_corpus_for_org(
+        obj.name, obj.website
+    )
+    if corpus:
+        sources_block = "\n".join(f"- {u}" for u in sources)
+        prompt = _RESEARCH_PROMPT.format(
+            name=obj.name,
+            hint_block=hint_block,
+            sources_block=sources_block,
+            corpus=corpus,
+        )
+        allowed_tools: list[str] = []
+    else:
+        # Stage 1 found nothing usable — fall back to Claude with a
+        # tight tool budget. Caller will see this in the activity feed.
+        prompt = _RESEARCH_FALLBACK_PROMPT.format(
+            name=obj.name,
+            hint_block=hint_block,
+            fail_reason=fail_reason or "unknown",
+        )
+        allowed_tools = ["WebFetch", "WebSearch"]
 
     from app.skills.queue_bus import run_claude_to_bus
 
@@ -309,7 +460,7 @@ async def research_organization(
             source="org_research",
             item_id=f"org:{org_id}",
             label=f"Research: {obj.name}",
-            allowed_tools=["WebFetch", "WebSearch"],
+            allowed_tools=allowed_tools,
             timeout_seconds=180,
         )
     except _ClaudeCodeError as exc:

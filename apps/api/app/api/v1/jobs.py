@@ -1656,53 +1656,44 @@ async def batch_analyze_jd(
 
 # --- Fetch-from-URL autofill ------------------------------------------------
 
-_FETCH_PROMPT_TEMPLATE = """Research this job posting and the hiring company. Start with the URL:
+_FETCH_PARSE_PROMPT = """You are parsing a job-posting page that has
+already been downloaded for you. The full page text is below the
+divider — do NOT call WebFetch, WebSearch, or any other tool. Just
+read the text and emit one JSON object.
 
-  {url}
+Today's date (for resolving relative timestamps like "Posted 3 days
+ago"): {today}
 
-Step 1: Use WebFetch to read the posting. Extract title, organization,
-location, remote policy, salary range, the platform this was posted on, and
-(if visible) the date the post was listed. For relative timestamps like
-"Posted 3 days ago", compute the absolute date based on today. If no date
-is visible, use null.
+Source URL the page was fetched from: {url}
 
-Step 2: Capture the FULL job description VERBATIM. This is the most important
-field. Do NOT summarize, condense, paraphrase, or "clean up" — copy the
-description exactly as it appears on the page, preserving bullet points,
-section headers (About the role, Responsibilities, Requirements, Benefits,
-etc.), and all bullet and paragraph text. Markdown formatting (##, -, **) is
-fine; use it to preserve structure. Omit only page chrome (nav, cookie
-banner, sidebar, related-jobs rail, apply-button text). The user will be
-reviewing this description in full so completeness matters more than
-brevity.
+Rules:
 
-Step 3: Extract structured requirement fields from the description. Be
-literal — if the JD says "5+ years" set experience_years_min=5, max=null. If
-it says "3-7 years" set min=3, max=7. If it never mentions years, both null.
-Experience level is a bucket the JD implies or states (junior / mid /
-senior / staff / principal / manager / director / vp / cxo). Employment type
-should be the JD's exact intent (full_time / part_time / contract / c2h /
-internship / freelance). Education required is a bucket (none /
-associates / bachelors / masters / phd) reflecting the MINIMUM required,
-not "preferred". Visa sponsorship and relocation_offered are tri-state
-booleans — true if explicitly offered, false if explicitly denied, null if
-the JD is silent.
-
-Step 4: Extract two skill lists from the description — required_skills
-(things the JD says you must have) and nice_to_have_skills (things the JD
-says are a plus, preferred, nice to have, or bonus). Use short canonical
-names ("Python", "React", "Kubernetes", "GraphQL"), not full sentences.
-Keep each list to at most ~15 items.
-
-Step 5: If the company isn't a household name, use WebSearch (or WebFetch on
-the company's own site) to gather a few more facts about them: website,
-industry, approximate size, headquarters, a one-sentence description, and
-any visible tech-stack hints. Keep that lookup light — one or two searches
-is enough.
-
-Step 6: Return ONE single JSON object with the schema below. No prose, no
-markdown code fences around the JSON, no explanation before or after.
-Unknown fields must be null.
+1. The most important field is `job_description` — copy the body
+   VERBATIM, preserving section headers (About the role,
+   Responsibilities, Requirements, Benefits, etc.), bullet points,
+   and paragraph text. Drop only page chrome (nav, cookie banner,
+   apply-button text, related-jobs rail).
+2. Be literal on numeric fields. "5+ years" → experience_years_min=5,
+   max=null. "3-7 years" → min=3, max=7. Silent → both null.
+3. `experience_level` ∈ junior / mid / senior / staff / principal /
+   manager / director / vp / cxo, or null.
+4. `employment_type` ∈ full_time / part_time / contract / c2h /
+   internship / freelance, or null.
+5. `education_required` is the MINIMUM required: none / associates /
+   bachelors / masters / phd, or null.
+6. `visa_sponsorship_offered` and `relocation_offered` are
+   tri-state — true if explicitly offered, false if explicitly
+   denied, null if the JD is silent.
+7. `required_skills` are things the JD says you MUST have;
+   `nice_to_have_skills` are "plus / preferred / bonus" items. Short
+   canonical names ("Python", "AWS", "Kubernetes"). Cap each list at
+   ~15.
+8. Organization fields (`organization_*`, `tech_stack_hints`) come
+   STRICTLY from the page text. Don't invent or fetch externally —
+   if the page doesn't mention industry / size / HQ, leave them null.
+   The org research endpoint handles enrichment separately.
+9. Return ONE single JSON object. No prose, no markdown code fences,
+   no explanation before or after. Unknown fields must be null.
 
 Schema:
 {{
@@ -1736,9 +1727,55 @@ Schema:
 
 `organization_size` should be a bucket like "1-10", "11-50", "51-200",
 "201-500", "501-1000", "1001-5000", "5001-10000", or "10000+".
-`research_notes` is a one-line summary of what you looked up ("Checked
-LinkedIn and the company's /about page"), NOT a summary of the job itself.
-Prefer null over guesses.
+`research_notes` should usually be null — this endpoint doesn't do
+external research. Prefer null over guesses.
+
+============================================================
+PAGE TEXT (parse this; do not fetch anything)
+============================================================
+
+{page_text}
+"""
+
+
+_FETCH_FALLBACK_PROMPT = """We couldn't directly download
+{url}
+({fail_reason}). Use WebFetch ONCE to read the posting and parse it
+into the JSON schema below. Do not browse other sites — if the
+single WebFetch fails, return as many fields as you can pull from
+context (title and source_url at minimum) with the rest null.
+
+Today's date: {today}
+
+Schema:
+{{
+  "title": string | null,
+  "organization_name": string | null,
+  "location": string | null,
+  "remote_policy": "remote" | "hybrid" | "onsite" | null,
+  "job_description": string | null,
+  "salary_min": number | null,
+  "salary_max": number | null,
+  "salary_currency": string | null,
+  "source_platform": "linkedin" | "indeed" | "company_site" | "other" | null,
+  "date_posted": "YYYY-MM-DD" | null,
+  "experience_years_min": number | null,
+  "experience_years_max": number | null,
+  "experience_level": "junior" | "mid" | "senior" | "staff" | "principal" | "manager" | "director" | "vp" | "cxo" | null,
+  "employment_type": "full_time" | "part_time" | "contract" | "c2h" | "internship" | "freelance" | null,
+  "education_required": "none" | "associates" | "bachelors" | "masters" | "phd" | null,
+  "visa_sponsorship_offered": true | false | null,
+  "relocation_offered": true | false | null,
+  "required_skills": string[] | null,
+  "nice_to_have_skills": string[] | null,
+  "organization_website": string | null,
+  "organization_industry": string | null,
+  "organization_size": string | null,
+  "organization_headquarters": string | null,
+  "organization_description": string | null,
+  "tech_stack_hints": string[] | null,
+  "research_notes": string | null
+}}
 """
 
 # Matches any JSON object inside a blob of text. Claude sometimes wraps the
@@ -1774,31 +1811,123 @@ def _extract_json_object(text: str) -> Optional[dict]:
     return None
 
 
+_PAGE_TEXT_BUDGET = 60_000  # chars sent to Claude in the parse step.
+_PAGE_TEXT_MIN = 400  # below this we treat the direct fetch as a JS-shell.
+
+
+async def _direct_fetch_page(url: str) -> tuple[str, Optional[str]]:
+    """Single httpx GET → cleaned markdown. Returns
+    `(text, error_reason)`. On success error_reason is None and text is
+    the page body trimmed to _PAGE_TEXT_BUDGET. On failure text is "" and
+    error_reason describes why so the fallback prompt can quote it."""
+    from app.sources._common import (
+        UpstreamGateError,
+        html_to_md,
+        http_get_text,
+    )
+    import httpx
+
+    try:
+        body = await http_get_text(url, timeout=25.0)
+    except UpstreamGateError as exc:
+        return "", f"bot-gated: {exc}"
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code if exc.response is not None else "?"
+        return "", f"HTTP {code}"
+    except httpx.HTTPError as exc:
+        return "", f"transport error: {exc}"
+    except Exception as exc:  # pragma: no cover  (defensive)
+        return "", f"{type(exc).__name__}: {exc}"
+
+    md = html_to_md(body)
+    if not md or len(md.strip()) < _PAGE_TEXT_MIN:
+        return "", (
+            "page returned <400 chars of usable text — likely a "
+            "JS-rendered SPA shell"
+        )
+    if len(md) > _PAGE_TEXT_BUDGET:
+        md = md[:_PAGE_TEXT_BUDGET] + "\n\n[… truncated for parse budget …]"
+    return md, None
+
+
 async def perform_fetch(
     db: AsyncSession,
     url: str,
     *,
     on_event: "Optional[callable]" = None,
 ) -> FetchedJobInfo:
-    """Core URL-fetch + org-enrichment pipeline.
+    """Core URL-fetch + parse pipeline.
 
-    When `on_event` is provided, uses the streaming Claude Code variant and
-    invokes the callback for each captured event (text chunk, tool_use,
-    result summary). Used by the queue worker to pipe live output to the
-    in-memory pub/sub. When None, runs the cheaper single-shot JSON mode.
+    Two-stage by design (the prior version let Claude loose with
+    WebFetch + WebSearch and watched it issue 20+ tool calls per
+    posting):
 
-    Raises ClaudeCodeError on CLI failure; otherwise the FetchedJobInfo has
-    organization_id set when an org was resolved or created.
+      1. Pull the page via httpx + html2text in our own process.
+         Fast, cheap, deterministic.
+      2. Hand the cleaned text to Claude with NO tools allowed —
+         just parse the JSON schema.
+
+    Falls back to a single Claude WebFetch call only when the direct
+    download fails (4xx, transport error, or thin JS-shell page).
+    Even then the prompt caps Claude to one tool use.
+
+    When `on_event` is provided, emits compact streaming events
+    (page-fetched / parsing / done) for the queue UI. When None, runs
+    the cheaper single-shot JSON mode.
+
+    Raises ClaudeCodeError on CLI failure; otherwise the
+    FetchedJobInfo has organization_id set when an org was resolved
+    or created.
     """
+    from datetime import date as _date, datetime as _dt, timezone as _tz
+
     url = url.strip()
     if not (url.startswith("http://") or url.startswith("https://")):
         raise ValueError("URL must start with http(s)://")
 
-    prompt = _FETCH_PROMPT_TEMPLATE.format(url=url)
+    def _emit(ev: dict) -> None:
+        if on_event is None:
+            return
+        ev["t"] = _dt.now(tz=_tz.utc).isoformat(timespec="seconds")
+        try:
+            on_event(ev)
+        except Exception:  # pragma: no cover  (bus error must not kill fetch)
+            pass
+
+    # Stage 1 — direct download.
+    _emit({"kind": "system", "text": f"Fetching {url}"})
+    page_text, fail_reason = await _direct_fetch_page(url)
+    today_iso = _date.today().isoformat()
+
+    if page_text:
+        _emit(
+            {
+                "kind": "system",
+                "text": f"Page downloaded ({len(page_text):,} chars). Parsing…",
+            }
+        )
+        prompt = _FETCH_PARSE_PROMPT.format(
+            url=url, today=today_iso, page_text=page_text
+        )
+        allowed_tools: list[str] = []
+    else:
+        # Stage 1 failed — fall back to ONE Claude WebFetch.
+        _emit(
+            {
+                "kind": "system",
+                "text": (
+                    f"Direct download didn't work ({fail_reason}). "
+                    "Falling back to a single Claude WebFetch."
+                ),
+            }
+        )
+        prompt = _FETCH_FALLBACK_PROMPT.format(
+            url=url, today=today_iso, fail_reason=fail_reason or "unknown"
+        )
+        allowed_tools = ["WebFetch"]
 
     final_text = ""
     if on_event is not None:
-        from datetime import datetime as _dt, timezone as _tz
         from app.skills.runner import (
             ClaudeCodeError as _CCE,
             stream_claude_prompt as _scp,
@@ -1806,21 +1935,16 @@ async def perform_fetch(
         collected: list[str] = []
         had_error: str | None = None
 
-        def _emit(ev: dict) -> None:
-            ev["t"] = _dt.now(tz=_tz.utc).isoformat(timespec="seconds")
-            try:
-                on_event(ev)
-            except Exception:  # pragma: no cover  (bus error must not kill fetch)
-                pass
-
         async for raw in _scp(
             prompt=prompt,
-            allowed_tools=["WebFetch", "WebSearch"],
-            timeout_seconds=240,
+            allowed_tools=allowed_tools,
+            timeout_seconds=180,
         ):
             ev_type = raw.get("type")
             if ev_type == "system":
-                _emit({"kind": "system", "text": "Claude session started"})
+                # Suppress the noisy per-turn "Claude session started" —
+                # we already emitted our own user-friendly system events.
+                continue
             elif ev_type == "error":
                 had_error = str(raw.get("message") or "streaming error")
                 _emit({"kind": "error", "text": had_error})
@@ -1832,7 +1956,9 @@ async def perform_fetch(
                         text = block.get("text") or ""
                         if text.strip():
                             collected.append(text)
-                            _emit({"kind": "text", "text": text})
+                            # Don't echo the full JSON to the bus —
+                            # that's the final answer, surfaced
+                            # separately.
                     elif btype == "tool_use":
                         inp = block.get("input") or {}
                         compact = {
@@ -1870,7 +1996,7 @@ async def perform_fetch(
         result = await run_claude_prompt(
             prompt=prompt,
             output_format="json",
-            allowed_tools=["WebFetch", "WebSearch"],
+            allowed_tools=allowed_tools,
             timeout_seconds=180,
         )
         final_text = result.result
