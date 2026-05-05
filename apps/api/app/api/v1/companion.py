@@ -175,6 +175,13 @@ similar, audit their data:
 
 Never write without explicit user confirmation in either workflow.
 
+Diagnostics:
+  /app/logs/source_errors.jsonl  — append-only JSONL of every job-source
+    poll failure. Each line: {{ts, user_id, source_id, kind, slug_or_url,
+    error_class, error_message}}. Use `tail -n 50` or grep by source_id
+    when the user asks "why didn't <source> pull anything?". File
+    rotates at 5 MB with 3 backups.
+
 Style: concise, helpful, lightly ironic-corporate in tone. Stay factual.
 """
 

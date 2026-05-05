@@ -173,6 +173,23 @@ async def poll_source(db: AsyncSession, source: JobSource) -> tuple[int, Optiona
             source.slug_or_url,
             msg,
         )
+        # Append a JSONL line to /app/logs/source_errors.jsonl so the
+        # Companion (and any external tail-able log scrape) can
+        # diagnose failures without round-tripping through the API.
+        try:
+            from app.sources._errlog import log_source_error
+
+            log_source_error(
+                user_id=source.user_id,
+                source_id=source.id,
+                kind=source.kind,
+                slug_or_url=source.slug_or_url,
+                error_class=type(exc).__name__,
+                error_message=str(exc),
+            )
+        except Exception:
+            # Diagnostics must never break the poller.
+            pass
         source.last_polled_at = _now()
         source.last_error = msg[:1000]
         return 0, msg
