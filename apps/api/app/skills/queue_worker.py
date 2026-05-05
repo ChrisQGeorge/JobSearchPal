@@ -324,6 +324,67 @@ async def _fail(db: AsyncSession, row: JobFetchQueue, err: str) -> None:
     )
 
 
+async def _enqueue_followups(
+    db: "AsyncSession",
+    tj: "TrackedJob",
+    *,
+    label_prefix: str = "",
+) -> None:
+    """After a fetch lands a TrackedJob, queue (1) JD analysis +
+    (2) company research so the user doesn't have to click those
+    manually. Both are best-effort: if no description / no org, we
+    skip silently. Caller is responsible for the surrounding commit.
+
+    Idempotent-ish: skips org_research when the org already has
+    description + industry filled in (a previous research pass
+    already covered it)."""
+    from app.models.jobs import JobFetchQueue, Organization
+    from sqlalchemy import select
+
+    # JD-analyze (kind=score) — only when there's a description for
+    # the analyzer to actually read.
+    if tj.job_description and tj.job_description.strip():
+        db.add(
+            JobFetchQueue(
+                user_id=tj.user_id,
+                kind="score",
+                label=f"{label_prefix}Score → {tj.title[:80]}"[:512],
+                url="",
+                payload={"tracked_job_id": tj.id},
+                state="queued",
+            )
+        )
+
+    # org_research — only when the org exists AND is missing the
+    # main enrichment fields. Repeated fetches of jobs at the same
+    # well-known company shouldn't re-research it every time.
+    if tj.organization_id:
+        org = (
+            await db.execute(
+                select(Organization).where(
+                    Organization.id == tj.organization_id,
+                    Organization.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if org is not None:
+            already_researched = bool(
+                (org.description or "").strip()
+                and (org.industry or "").strip()
+            )
+            if not already_researched:
+                db.add(
+                    JobFetchQueue(
+                        user_id=tj.user_id,
+                        kind="org_research",
+                        label=f"{label_prefix}Research: {org.name}"[:512],
+                        url="",
+                        payload={"organization_id": org.id},
+                        state="queued",
+                    )
+                )
+
+
 async def _handle_fetch(item: JobFetchQueue) -> None:
     """Claim-a-URL → fetch → create OR enrich a TrackedJob.
 
@@ -451,6 +512,11 @@ async def _handle_fetch(item: JobFetchQueue) -> None:
                     "fields_filled": changed,
                 }
                 row.error_message = None
+                # Auto-queue JD-analyze + org_research if the
+                # enrichment filled new fields. Skipped silently when
+                # there's nothing to score or the org's already
+                # researched.
+                await _enqueue_followups(db, existing)
                 await db.commit()
                 queue_bus.publish({
                     "item_id": f"queue:{item_id}", "source": "fetch",
@@ -511,6 +577,9 @@ async def _handle_fetch(item: JobFetchQueue) -> None:
             new_payload = dict(row.payload)
             new_payload.pop("rate_limit_count", None)
             row.payload = new_payload or None
+        # Auto-queue JD-analyze + company-research so the new row
+        # lands fully enriched without the user clicking Score / Research.
+        await _enqueue_followups(db, job)
         await db.commit()
         queue_bus.publish({
             "item_id": f"queue:{item_id}", "source": "fetch",
@@ -962,12 +1031,82 @@ async def _handle_humanize(item: JobFetchQueue) -> None:
         log.info("Humanize task %d → updated GeneratedDocument %d", row.id, doc_id)
 
 
+async def _handle_org_research(item: JobFetchQueue) -> None:
+    """Run the company-research pipeline against an organization_id
+    in the queue row's payload. Re-uses the same direct-fetch +
+    parse pipeline the HTTP endpoint uses (no Claude exploration —
+    one or two httpx GETs followed by a single no-tool parse)."""
+    from app.api.v1.organizations import run_org_research_pipeline
+    from app.models.jobs import Organization
+    from app.skills.runner import ClaudeCodeError
+
+    async with SessionLocal() as db:
+        row = (
+            await db.execute(
+                select(JobFetchQueue).where(JobFetchQueue.id == item.id)
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            return
+        payload = row.payload or {}
+        org_id = payload.get("organization_id")
+        if not org_id:
+            await _fail(db, row, "org_research task missing organization_id")
+            return
+
+        org = (
+            await db.execute(
+                select(Organization).where(
+                    Organization.id == org_id,
+                    Organization.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if org is None:
+            await _fail(db, row, f"Organization {org_id} not found")
+            return
+
+        try:
+            await run_org_research_pipeline(db, org)
+        except ClaudeCodeError as exc:
+            err = str(exc)
+            if _is_rate_limited(err):
+                await _handle_rate_limit(db, row, err)
+                return
+            await _fail(db, row, err)
+            return
+        except Exception as exc:  # pragma: no cover
+            await _fail(db, row, f"Unexpected error: {exc}")
+            log.exception("org_research task %d unhandled error", row.id)
+            return
+
+        # Re-load the queue row — run_org_research_pipeline commits
+        # internally so the existing reference is detached.
+        row = (
+            await db.execute(
+                select(JobFetchQueue).where(JobFetchQueue.id == item.id)
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            return
+        row.state = "done"
+        row.result = {"organization_id": org_id}
+        row.error_message = None
+        if isinstance(row.payload, dict) and "rate_limit_count" in row.payload:
+            new_payload = dict(row.payload)
+            new_payload.pop("rate_limit_count", None)
+            row.payload = new_payload or None
+        await db.commit()
+        log.info("org_research task %d → enriched Organization %d", row.id, org_id)
+
+
 # kind → handler. Extensible: add new kinds here.
 _HANDLERS = {
     "fetch": _handle_fetch,
     "score": _handle_score,
     "tailor": _handle_tailor,
     "humanize": _handle_humanize,
+    "org_research": _handle_org_research,
 }
 
 

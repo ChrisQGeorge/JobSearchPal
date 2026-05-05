@@ -400,30 +400,16 @@ def _extract_json(text: str) -> _Optional[dict]:
     return None
 
 
-@router.post("/{org_id}/research", response_model=OrganizationOut)
-async def research_organization(
-    org_id: int,
-    payload: _ResearchIn,
-    db: AsyncSession = Depends(get_db),
-    _: User = Depends(get_current_user),
+async def run_org_research_pipeline(
+    db: AsyncSession, obj: Organization, hint: _Optional[str] = None
 ) -> Organization:
-    """Run the Companion to enrich an organization in place.
-
-    Safe-by-default: we only OVERWRITE fields that are currently null/empty.
-    Multi-valued fields (source_links, tech_stack_hints) are merged rather
-    than replaced. `research_notes` always overwrites — that's the field the
-    user knows they're refreshing.
-    """
-    stmt = select(Organization).where(
-        Organization.id == org_id, Organization.deleted_at.is_(None)
-    )
-    obj = (await db.execute(stmt)).scalar_one_or_none()
-    if obj is None:
-        raise HTTPException(status_code=404, detail="Organization not found")
-
+    """The actual research-an-org pipeline. Used by both the HTTP
+    endpoint and the queue worker's `org_research` handler. Mutates
+    `obj` in place, commits, and returns it. Raises ClaudeCodeError
+    on Claude failure — caller decides how to surface it."""
     hint_block = (
-        f"User focus for this research pass: {payload.hint.strip()}"
-        if payload.hint and payload.hint.strip()
+        f"User focus for this research pass: {hint.strip()}"
+        if hint and hint.strip()
         else "No specific focus — produce a general company overview."
     )
 
@@ -454,20 +440,26 @@ async def research_organization(
 
     from app.skills.queue_bus import run_claude_to_bus
 
-    try:
-        final_text = await run_claude_to_bus(
-            prompt=prompt,
-            source="org_research",
-            item_id=f"org:{org_id}",
-            label=f"Research: {obj.name}",
-            allowed_tools=allowed_tools,
-            timeout_seconds=180,
-        )
-    except _ClaudeCodeError as exc:
-        _log.warning("Org research failed for %s (%s): %s", obj.name, org_id, exc)
-        raise HTTPException(status_code=502, detail=f"Claude Code error: {exc}")
+    final_text = await run_claude_to_bus(
+        prompt=prompt,
+        source="org_research",
+        item_id=f"org:{obj.id}",
+        label=f"Research: {obj.name}",
+        allowed_tools=allowed_tools,
+        timeout_seconds=180,
+    )
 
     data = _extract_json(final_text) or {}
+    _apply_research_to_org(obj, data)
+    await db.commit()
+    await db.refresh(obj)
+    return obj
+
+
+def _apply_research_to_org(obj: Organization, data: dict) -> None:
+    """Apply a research-pipeline JSON result to an Organization row.
+    Only overwrites empty fields; merges list fields; always refreshes
+    research_notes + reputation_signals."""
 
     # Fill only if empty — don't stomp user-entered data.
     scalar_fields = [
@@ -505,6 +497,30 @@ async def research_organization(
         if merged:
             setattr(obj, field, merged)
 
-    await db.commit()
-    await db.refresh(obj)
-    return obj
+
+@router.post("/{org_id}/research", response_model=OrganizationOut)
+async def research_organization(
+    org_id: int,
+    payload: _ResearchIn,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> Organization:
+    """Run the Companion to enrich an organization in place.
+
+    Safe-by-default: we only OVERWRITE fields that are currently null/empty.
+    Multi-valued fields (source_links, tech_stack_hints) are merged rather
+    than replaced. `research_notes` always overwrites — that's the field the
+    user knows they're refreshing.
+    """
+    stmt = select(Organization).where(
+        Organization.id == org_id, Organization.deleted_at.is_(None)
+    )
+    obj = (await db.execute(stmt)).scalar_one_or_none()
+    if obj is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    try:
+        return await run_org_research_pipeline(db, obj, payload.hint)
+    except _ClaudeCodeError as exc:
+        _log.warning("Org research failed for %s (%s): %s", obj.name, org_id, exc)
+        raise HTTPException(status_code=502, detail=f"Claude Code error: {exc}")
