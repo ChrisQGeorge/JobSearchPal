@@ -120,12 +120,18 @@ async def poll_source(db: AsyncSession, source: JobSource) -> tuple[int, Optiona
         raw_leads = await _adapter_fetch(source.kind, source.slug_or_url, ctx)
     except Exception as exc:  # noqa: BLE001
         # Format a more actionable message for the most common failure
-        # mode (HTTP 404 — wrong slug or company isn't on this ATS).
+        # modes — httpx 4xx, transport errors, bot-gate interstitials.
         msg = str(exc)
         try:
             import httpx  # local import keeps adapters loosely coupled
 
-            if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+            from app.sources._common import UpstreamGateError
+
+            if isinstance(exc, UpstreamGateError):
+                # Already actionable as-is; just keep it short for the
+                # source row's last_error field.
+                msg = str(exc)
+            elif isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
                 code = exc.response.status_code
                 if code == 404:
                     msg = (
@@ -143,6 +149,22 @@ async def poll_source(db: AsyncSession, source: JobSource) -> tuple[int, Optiona
                         f"{source.kind} rate-limited us. Increase the "
                         "poll interval and try again later."
                     )
+                elif 500 <= code < 600:
+                    msg = (
+                        f"{source.kind} returned {code} (server error). "
+                        "The next scheduled poll will retry automatically."
+                    )
+            elif isinstance(exc, httpx.TimeoutException):
+                msg = (
+                    f"{source.kind} request timed out — the upstream is "
+                    "slow or unreachable. The next scheduled poll will "
+                    "retry automatically."
+                )
+            elif isinstance(exc, httpx.ConnectError):
+                msg = (
+                    f"{source.kind} connection failed — DNS, TLS, or "
+                    "network blocked. Check the URL is correct."
+                )
         except Exception:
             pass
         log.warning(

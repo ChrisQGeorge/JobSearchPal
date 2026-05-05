@@ -47,12 +47,13 @@ async def fetch(slug_or_url: str) -> list[dict[str, Any]]:
         raise ValueError(
             "rss source needs a full URL starting with http:// or https://."
         )
-    # Two-stage fetch: pull the body with our own User-Agent first
+    # Two-stage fetch: pull the body with a browser-style UA first
     # (feedparser's default UA gets blocked by some Cloudflare-fronted
-    # feeds), then hand the bytes to feedparser. If httpx fetch fails
-    # we let the exception bubble — caller surfaces it with a friendly
-    # 4xx mapping.
-    text = await http_get_text(url)
+    # feeds), then hand the bytes to feedparser. `expect="feed"` makes
+    # http_get_text raise UpstreamGateError when the response is an
+    # HTML interstitial / homepage redirect instead of a real feed,
+    # so we don't silently return 0 leads on bot-gated sites.
+    text = await http_get_text(url, expect="feed")
 
     try:
         import feedparser  # type: ignore
