@@ -323,10 +323,12 @@ async def _drive_browser(
         # ATS short-circuit: deterministic field-fill before the
         # generic loop starts. Whatever's left (custom questions,
         # demographics, EEO) the agent loop picks up.
-        if run.ats_kind == "greenhouse":
+        if run.ats_kind in ("greenhouse", "lever", "ashby"):
             try:
                 from app.skills.apply_templates import (
+                    fill_ashby_known_fields,
                     fill_greenhouse_known_fields,
+                    fill_lever_known_fields,
                     parse_profile_block,
                 )
 
@@ -334,12 +336,22 @@ async def _drive_browser(
                     await _log_step(db, run.id, kind, payload)
 
                 profile_dict = parse_profile_block(profile)
-                results = await fill_greenhouse_known_fields(
-                    page, profile_dict, log_fn=_logger,
-                )
+                if run.ats_kind == "greenhouse":
+                    results = await fill_greenhouse_known_fields(
+                        page, profile_dict, log_fn=_logger,
+                    )
+                elif run.ats_kind == "lever":
+                    results = await fill_lever_known_fields(
+                        page, profile_dict, log_fn=_logger,
+                    )
+                else:
+                    results = await fill_ashby_known_fields(
+                        page, profile_dict, log_fn=_logger,
+                    )
                 await _log_step(
                     db, run.id, "note",
-                    {"detail": "greenhouse template results", "results": results},
+                    {"detail": f"{run.ats_kind} template results",
+                     "results": results},
                 )
                 await _capture_screenshot(
                     db, run.id, page, "01_template.png", "after-template",
@@ -349,7 +361,7 @@ async def _drive_browser(
                 # loop on any failure rather than abandoning the run.
                 await _log_step(
                     db, run.id, "note",
-                    {"detail": f"greenhouse template skipped: {exc}"},
+                    {"detail": f"{run.ats_kind} template skipped: {exc}"},
                 )
 
         # ===== Action loop =====

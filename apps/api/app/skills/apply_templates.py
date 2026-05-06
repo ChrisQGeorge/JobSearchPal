@@ -143,6 +143,99 @@ async def fill_greenhouse_known_fields(
     return out
 
 
+LEVER_FIELD_MAP: list[tuple[str, list[str], str]] = [
+    ("full_name", ["input[name='name']", "#name"], "fill"),
+    ("email", ["input[name='email']", "#email"], "fill"),
+    ("phone", ["input[name='phone']", "#phone"], "fill"),
+    (
+        "linkedin_url",
+        [
+            "input[name='urls[LinkedIn]']",
+            "input[name='urls[LinkedIn URL]']",
+            "input[id*='linkedin' i]",
+        ],
+        "fill",
+    ),
+    (
+        "github_url",
+        ["input[name='urls[GitHub]']", "input[id*='github' i]"],
+        "fill",
+    ),
+    (
+        "portfolio_url",
+        ["input[name='urls[Portfolio]']", "input[name='urls[Other]']"],
+        "fill",
+    ),
+]
+
+ASHBY_FIELD_MAP: list[tuple[str, list[str], str]] = [
+    # Ashby uses generated IDs but reliably names fields by role.
+    ("full_name", [
+        "input[aria-label*='Full Name' i]",
+        "input[name*='name' i]:not([name*='last'])",
+    ], "fill"),
+    ("email", ["input[aria-label*='Email' i]", "input[type='email']"], "fill"),
+    ("phone", ["input[aria-label*='Phone' i]", "input[type='tel']"], "fill"),
+    (
+        "linkedin_url",
+        ["input[aria-label*='LinkedIn' i]", "input[id*='linkedin' i]"],
+        "fill",
+    ),
+]
+
+
+async def _fill_with_map(
+    page,
+    profile: dict[str, Any],
+    field_map: list[tuple[str, list[str], str]],
+    *,
+    log_fn,
+) -> dict[str, str]:
+    """Generic field-fill driver shared by lever / ashby. Same shape
+    as the Greenhouse-specific path; just data-driven."""
+    out: dict[str, str] = {}
+    for key, selectors, action in field_map:
+        value = _profile_lookup(profile, key)
+        if not value:
+            out[key] = "skipped: no profile value"
+            continue
+        filled = False
+        for sel in selectors:
+            try:
+                handle = await page.query_selector(sel)
+                if handle is None:
+                    continue
+                if action == "fill":
+                    await handle.fill(value, timeout=5_000)
+                else:
+                    await handle.click(timeout=5_000)
+                await log_fn("type", {"selector": sel, "field": key,
+                                       "value_preview": value[:80]})
+                filled = True
+                break
+            except Exception as exc:
+                out[key] = f"error: {exc}"
+                continue
+        if filled:
+            out[key] = "filled"
+        elif key not in out:
+            out[key] = "skipped: selector not found"
+    return out
+
+
+async def fill_lever_known_fields(page, profile: dict[str, Any], *, log_fn) -> dict[str, str]:
+    """Lever-specific deterministic field-fill. Lever apply pages
+    typically don't have a separate "Apply" click — the form is
+    inline."""
+    return await _fill_with_map(page, profile, LEVER_FIELD_MAP, log_fn=log_fn)
+
+
+async def fill_ashby_known_fields(page, profile: dict[str, Any], *, log_fn) -> dict[str, str]:
+    """Ashby-specific field-fill. Ashby uses React-rendered forms with
+    aria-labels that are more reliable than generated DOM ids."""
+    return await _fill_with_map(page, profile, ASHBY_FIELD_MAP, log_fn=log_fn)
+
+
 def parse_profile_block(block: str) -> dict[str, Any]:
     """Parse the human-readable block emitted by `_load_user_profile_block`
     back into a flat `{field: value}` dict. Lines look like

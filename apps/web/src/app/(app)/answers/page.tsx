@@ -58,13 +58,38 @@ export default function AnswersPage() {
       title="Answer Bank"
       subtitle="Saved answers the Companion reuses on every application. Built up automatically as you answer novel form questions during application runs."
       actions={
-        <button
-          type="button"
-          className="jsp-btn-primary"
-          onClick={() => setEditingId("new")}
-        >
-          + New saved answer
-        </button>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            className="jsp-btn-ghost"
+            onClick={async () => {
+              try {
+                const res = await api.post<{ inserted: number; skipped: number }>(
+                  "/api/v1/question-bank/seed-from-profile",
+                );
+                alert(
+                  `Seed complete — inserted ${res.inserted}, skipped ${res.skipped}.`,
+                );
+                await refresh();
+              } catch (e) {
+                alert(
+                  e instanceof ApiError
+                    ? `Seed failed (HTTP ${e.status}).`
+                    : "Seed failed.",
+                );
+              }
+            }}
+          >
+            Seed from profile
+          </button>
+          <button
+            type="button"
+            className="jsp-btn-primary"
+            onClick={() => setEditingId("new")}
+          >
+            + New saved answer
+          </button>
+        </div>
       }
     >
       {err ? (

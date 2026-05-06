@@ -729,6 +729,105 @@ async def delete_question_answer(
     await db.commit()
 
 
+# A list of (question_text, profile_lookup_callable) pairs used to seed the
+# question bank from the user's existing profile. Each callable receives the
+# loaded ResumeProfile / WorkAuthorization / Demographics rows and returns
+# the answer string (or None to skip).
+def _seed_pairs():
+    return [
+        ("What is your full name?",
+         lambda rp, _wa, _dm: rp.full_name if rp else None),
+        ("What is your email address?",
+         lambda rp, _wa, _dm: rp.email if rp else None),
+        ("What is your phone number?",
+         lambda rp, _wa, _dm: rp.phone if rp else None),
+        ("What is your current location?",
+         lambda rp, _wa, _dm: rp.location if rp else None),
+        ("What is your LinkedIn URL?",
+         lambda rp, _wa, _dm: rp.linkedin_url if rp else None),
+        ("What is your GitHub URL?",
+         lambda rp, _wa, _dm: rp.github_url if rp else None),
+        ("What is your portfolio URL?",
+         lambda rp, _wa, _dm: rp.portfolio_url if rp else None),
+        ("Are you legally authorized to work in the United States?",
+         lambda _rp, wa, _dm: (
+             "Yes" if wa and wa.work_authorization_status
+             and "citizen" in (wa.work_authorization_status or "").lower()
+             else None
+         )),
+        ("Will you now or in the future require visa sponsorship?",
+         lambda _rp, wa, _dm: (
+             "Yes" if wa and (wa.visa_sponsorship_required_now
+                              or wa.visa_sponsorship_required_future)
+             else "No" if wa else None
+         )),
+        ("What pronouns do you use?",
+         lambda _rp, _wa, dm: dm.pronouns if dm and dm.pronouns else None),
+    ]
+
+
+@qa_router.post("/seed-from-profile")
+async def seed_from_profile(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Pre-populate the question bank from the user's profile so the
+    auto-apply agent doesn't ask "what's your email" on the first
+    application. Idempotent — only inserts a Q→A row when the hash
+    isn't already present (so the user's manual edits are never
+    overwritten)."""
+    from app.models.preferences import (
+        Demographics,
+        ResumeProfile,
+        WorkAuthorization,
+    )
+
+    rp = (await db.execute(
+        select(ResumeProfile).where(ResumeProfile.user_id == user.id)
+    )).scalar_one_or_none()
+    wa = (await db.execute(
+        select(WorkAuthorization).where(WorkAuthorization.user_id == user.id)
+    )).scalar_one_or_none()
+    dm = (await db.execute(
+        select(Demographics).where(Demographics.user_id == user.id)
+    )).scalar_one_or_none()
+
+    inserted = 0
+    skipped = 0
+    for question, fn in _seed_pairs():
+        try:
+            answer = fn(rp, wa, dm)
+        except Exception:
+            answer = None
+        if not answer:
+            skipped += 1
+            continue
+        h = _hash_question(question)
+        existing = (
+            await db.execute(
+                select(QuestionAnswer).where(
+                    QuestionAnswer.user_id == user.id,
+                    QuestionAnswer.question_hash == h,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            skipped += 1
+            continue
+        db.add(
+            QuestionAnswer(
+                user_id=user.id,
+                question_hash=h,
+                question_text=question[:2000],
+                answer=str(answer)[:8000],
+                source="profile_seed",
+            )
+        )
+        inserted += 1
+    await db.commit()
+    return {"inserted": inserted, "skipped": skipped}
+
+
 def register(app) -> None:
     app.include_router(router, prefix="/api/v1")
     app.include_router(runs_router, prefix="/api/v1")
