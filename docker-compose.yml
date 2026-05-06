@@ -110,6 +110,21 @@ services:
     ports:
       - "${CHROMIUM_PORT:-6901}:3000"
 
+  # Tiny sidecar that exposes chromium's CDP over the docker network.
+  # The linuxserver/chromium wrapper strips --remote-debugging-address
+  # so Chromium binds CDP to 127.0.0.1 only, which our api container
+  # can't reach. socat shares chromium's network namespace via
+  # network_mode: service:chromium and forwards 0.0.0.0:9223 → the
+  # localhost CDP port. The api container connects to `chromium:9223`.
+  chromium-cdp-proxy:
+    image: alpine/socat:latest
+    container_name: jsp-chromium-cdp-proxy
+    restart: unless-stopped
+    network_mode: "service:chromium"
+    depends_on:
+      - chromium
+    command: ["TCP-LISTEN:9223,fork,reuseaddr", "TCP:127.0.0.1:9222"]
+
 volumes:
   db_data:
   uploads:

@@ -49,7 +49,9 @@ from app.models.jobs import JobFetchQueue, TrackedJob
 log = logging.getLogger(__name__)
 
 CHROMIUM_HOST = os.environ.get("CHROMIUM_HOST", "chromium")
-CHROMIUM_CDP_PORT = int(os.environ.get("CHROMIUM_CDP_PORT", "9222"))
+# linuxserver/chromium binds CDP to 127.0.0.1; the chromium-cdp-proxy
+# sidecar forwards 0.0.0.0:9223 → 127.0.0.1:9222.
+CHROMIUM_CDP_PORT = int(os.environ.get("CHROMIUM_CDP_PORT", "9223"))
 
 MAX_ACTIONS = 50
 MAX_WALL_CLOCK_SECONDS = 300
@@ -253,7 +255,8 @@ async def _drive_browser(
     async with async_playwright() as p:
         try:
             browser = await p.chromium.connect_over_cdp(
-                f"http://{CHROMIUM_HOST}:{CHROMIUM_CDP_PORT}"
+                f"http://{CHROMIUM_HOST}:{CHROMIUM_CDP_PORT}",
+                headers={"Host": "localhost"},
             )
         except Exception as exc:
             await _log_step(

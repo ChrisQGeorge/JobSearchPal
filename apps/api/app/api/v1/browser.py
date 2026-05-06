@@ -64,7 +64,10 @@ qa_router = APIRouter(prefix="/question-bank", tags=["question-bank"])
 # debugger on 9222.
 CHROMIUM_HOST = os.environ.get("CHROMIUM_HOST", "chromium")
 CHROMIUM_VNC_PORT = int(os.environ.get("CHROMIUM_VNC_PORT", "3000"))
-CHROMIUM_CDP_PORT = int(os.environ.get("CHROMIUM_CDP_PORT", "9222"))
+# linuxserver/chromium binds CDP to 127.0.0.1 only; the
+# `chromium-cdp-proxy` sidecar (socat in the same netns) forwards
+# 0.0.0.0:9223 → 127.0.0.1:9222 so the api container can reach it.
+CHROMIUM_CDP_PORT = int(os.environ.get("CHROMIUM_CDP_PORT", "9223"))
 CHROMIUM_VNC_PASSWORD = os.environ.get("CHROMIUM_VNC_PASSWORD", "jobsearchpal")
 
 
@@ -93,10 +96,20 @@ class BrowserInfoOut(BaseModel):
 
 
 async def _check_cdp() -> bool:
-    """Quick liveness check on the chromium container's CDP endpoint."""
+    """Quick liveness check on the chromium container's CDP endpoint.
+
+    Chromium's CDP rejects non-loopback Host headers as a CSRF
+    defense ("Host header is specified and is not an IP address or
+    localhost"). The cdp-proxy sidecar forwards the port but
+    can't rewrite the request, so we send `Host: localhost` ourselves."""
     try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            r = await client.get(f"http://{CHROMIUM_HOST}:{CHROMIUM_CDP_PORT}/json/version")
+        async with httpx.AsyncClient(
+            timeout=3.0,
+            headers={"Host": "localhost"},
+        ) as client:
+            r = await client.get(
+                f"http://{CHROMIUM_HOST}:{CHROMIUM_CDP_PORT}/json/version"
+            )
         return r.status_code == 200
     except Exception:
         return False
@@ -172,7 +185,8 @@ async def navigate(
 
         async with async_playwright() as p:
             browser = await p.chromium.connect_over_cdp(
-                f"http://{CHROMIUM_HOST}:{CHROMIUM_CDP_PORT}"
+                f"http://{CHROMIUM_HOST}:{CHROMIUM_CDP_PORT}",
+                headers={"Host": "localhost"},
             )
             ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
@@ -198,7 +212,8 @@ async def screenshot(user: User = Depends(get_current_user)) -> Response:
 
         async with async_playwright() as p:
             browser = await p.chromium.connect_over_cdp(
-                f"http://{CHROMIUM_HOST}:{CHROMIUM_CDP_PORT}"
+                f"http://{CHROMIUM_HOST}:{CHROMIUM_CDP_PORT}",
+                headers={"Host": "localhost"},
             )
             ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
