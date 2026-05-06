@@ -46,6 +46,14 @@ TICK_SECONDS = 5 * 60
 # misconfigured "daily_cap=999" from flooding the queue.
 MAX_SPAWN_PER_TICK = 10
 
+# How recent the /browser-page heartbeat must be (in seconds) for the
+# auto-apply poller to consider the user "watching." If the user
+# closes / hides the /browser tab, heartbeats stop and runs pause
+# automatically within this window. The /browser page bumps the
+# heartbeat every 10s while visible, so 60s is a comfortable margin
+# for a missed tick.
+HEARTBEAT_GRACE_SECONDS = 60
+
 
 def _now() -> datetime:
     return datetime.now(tz=timezone.utc)
@@ -185,6 +193,17 @@ async def _enqueue_apply_run(
     return run.id
 
 
+def _is_browser_visible_recent(
+    now: datetime, last_heartbeat: Optional[datetime]
+) -> bool:
+    """True if the user has had the /browser page open + visible
+    within the heartbeat grace window. False otherwise — and the
+    poller treats that as "do nothing this tick."""
+    if last_heartbeat is None:
+        return False
+    return (now - last_heartbeat).total_seconds() <= HEARTBEAT_GRACE_SECONDS
+
+
 async def _tick_user(
     db: AsyncSession, user_id: int, settings: AutoApplySettings
 ) -> int:
@@ -194,6 +213,12 @@ async def _tick_user(
 
     now = _now()
     if _is_in_pause_window(now, settings.pause_start_hour, settings.pause_end_hour):
+        return 0
+
+    # Visibility gate — only fire when the user has the /browser page
+    # actively visible. Stops the auto-apply loop the moment they close
+    # the tab, switch tabs, or close their laptop.
+    if not _is_browser_visible_recent(now, settings.last_browser_visible_at):
         return 0
 
     used = await _count_today_runs(db, user_id, _utc_midnight(now))

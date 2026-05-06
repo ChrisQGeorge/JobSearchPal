@@ -1,0 +1,84 @@
+# Job Search Pal — HTTPS reverse proxy (R10/R11).
+#
+# Two TLS-terminated listeners, both using Caddy's internal CA so
+# the stack works on any host without external DNS or ACME setup:
+#
+#   :443  → web container (port 3000). Next.js's built-in rewrites
+#           still forward /api/* and /health/* to the api container,
+#           so this is one hostname for everything user-facing.
+#
+#   :6443 → chromium container (port 3000). KasmVNC uses absolute
+#           paths from / for its assets and websocket endpoints, so
+#           it can't sit behind a path prefix on the same host. The
+#           streamed-browser iframe inside /browser hits this port
+#           directly.
+#
+# To use a real domain + Let's Encrypt instead of self-signed:
+#   1. Set CADDY_HOSTNAME in .env to your public hostname
+#   2. Replace `tls internal` with `tls {$ADMIN_EMAIL}` in this file
+#   3. Make sure ports 80 + 443 are reachable from the internet
+#
+# Self-signed root cert lives in the caddy_data volume after first
+# boot — `docker compose exec caddy cat /data/caddy/pki/authorities/local/root.crt`
+# and trust that file in your browser to silence the warning.
+
+{
+	# Disable Caddy's "you should set an admin email" warning when the
+	# user hasn't set one yet (self-signed mode doesn't need one).
+	email {$ADMIN_EMAIL:admin@local}
+	# Bind admin endpoint to localhost only inside the container — we
+	# don't expose it on the host.
+	admin off
+	# Allow on-demand cert issuance via Caddy's internal CA so this
+	# config works for any hostname / IP without the user having to
+	# bake a domain into the Caddyfile. The ask endpoint must return
+	# 200 for Caddy to issue; api's /health is already in the docker
+	# network and returns {status:ok} for everything.
+	on_demand_tls {
+		ask http://api:8000/health
+	}
+}
+
+# --- Main app + API --------------------------------------------------------
+# `https://` (no host) matches every TLS request landing on the listen
+# port. Combined with `tls internal { on_demand }` this lets us work
+# regardless of whether the user reaches the box at localhost, an IP,
+# or a real domain — Caddy mints a cert per SNI from its local CA.
+https:// {
+	bind 0.0.0.0
+	tls internal {
+		on_demand
+	}
+
+	# Larger upload cap for resume / cover-letter ingest.
+	request_body {
+		max_size 50MB
+	}
+
+	# Pass everything to the web container. Next.js handles /api/*
+	# and /health/* via its own rewrites pointing at api:8000.
+	reverse_proxy web:3000 {
+		# Keep websocket + SSE upgrades transparent for the
+		# Companion's queue stream and the browser-take-over flow.
+		flush_interval -1
+	}
+}
+
+# --- Streamed Chromium (KasmVNC) on a separate port ------------------------
+# KasmVNC uses absolute paths from / for assets and websockets, so
+# it can't share a hostname with the web app. Park it on a dedicated
+# port — the /browser page iframes whatever NEXT_PUBLIC_CHROMIUM_URL
+# resolves to.
+https://:6443 {
+	bind 0.0.0.0
+	tls internal {
+		on_demand
+	}
+
+	reverse_proxy chromium:3000 {
+		flush_interval -1
+		transport http {
+			read_buffer 64KB
+		}
+	}
+}

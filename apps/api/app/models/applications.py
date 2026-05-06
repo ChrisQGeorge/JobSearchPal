@@ -123,3 +123,10 @@ class AutoApplySettings(Base, IdMixin, TimestampMixin):
     last_run_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Bumped by the web /browser page's heartbeat while the tab is
+    # visible. The auto-apply poller refuses to spawn runs when this
+    # value is older than the configured grace window, so the agent
+    # only fires when the user has eyes on the streamed browser.
+    last_browser_visible_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

@@ -41,6 +41,7 @@ class AutoApplySettingsOut(BaseModel):
     pause_start_hour: Optional[int] = None
     pause_end_hour: Optional[int] = None
     last_run_at: Optional[datetime] = None
+    last_browser_visible_at: Optional[datetime] = None
 
 
 class AutoApplySettingsIn(BaseModel):
@@ -94,6 +95,29 @@ async def update_settings(
     return row
 
 
+class HeartbeatOut(BaseModel):
+    last_browser_visible_at: Optional[datetime]
+    grace_seconds: int
+
+
+@router.post("/heartbeat", response_model=HeartbeatOut)
+async def heartbeat(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> HeartbeatOut:
+    """Bumped by the /browser page while the tab is visible. The
+    poller's _is_browser_visible_recent check uses this value as the
+    gate that prevents auto-apply from running when the user can't
+    see what the agent is doing."""
+    row = await _get_or_create(db, user.id)
+    row.last_browser_visible_at = datetime.now(tz=timezone.utc)
+    await db.commit()
+    return HeartbeatOut(
+        last_browser_visible_at=row.last_browser_visible_at,
+        grace_seconds=auto_apply_worker.HEARTBEAT_GRACE_SECONDS,
+    )
+
+
 class RunNowOut(BaseModel):
     spawned: int
     last_run_at: Optional[datetime]
@@ -113,6 +137,19 @@ async def run_now(
         raise HTTPException(
             status_code=409,
             detail="Auto-apply is disabled — turn it on first.",
+        )
+    # Mirror the poller's visibility gate so the run-now button can't
+    # bypass the "browser must be visible" rule.
+    now = auto_apply_worker._now()
+    if not auto_apply_worker._is_browser_visible_recent(
+        now, row.last_browser_visible_at
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The /browser page must be open and visible for auto-apply "
+                "to fire. Open it and try again."
+            ),
         )
     spawned = await auto_apply_worker._tick_user(db, user.id, row)
     await db.commit()

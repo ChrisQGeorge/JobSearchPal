@@ -63,11 +63,15 @@ services:
       args:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
         NEXT_PUBLIC_API_PORT: ${NEXT_PUBLIC_API_PORT}
+        NEXT_PUBLIC_CHROMIUM_PORT: ${NEXT_PUBLIC_CHROMIUM_PORT:-6901}
+        NEXT_PUBLIC_HTTPS_CHROMIUM_PORT: ${HTTPS_CHROMIUM_PORT:-6443}
     container_name: jsp-web
     restart: unless-stopped
     environment:
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
       NEXT_PUBLIC_API_PORT: ${NEXT_PUBLIC_API_PORT}
+      NEXT_PUBLIC_CHROMIUM_PORT: ${NEXT_PUBLIC_CHROMIUM_PORT:-6901}
+      NEXT_PUBLIC_HTTPS_CHROMIUM_PORT: ${HTTPS_CHROMIUM_PORT:-6443}
       # Used by next.config.mjs rewrites to proxy /api/* and /health/* to the
       # api container over the internal Docker network. The api container
       # always listens on 8000 inside the network regardless of API_PORT (which
@@ -127,8 +131,34 @@ services:
       - chromium
     command: ["TCP-LISTEN:9223,fork,reuseaddr", "TCP:127.0.0.1:9222"]
 
+  # HTTPS reverse proxy. Required for remote-host deployments because
+  # modern browsers refuse clipboard / WebRTC / secure-context APIs
+  # over plain HTTP to non-localhost origins (which breaks KasmVNC's
+  # streamed browser inside the /browser iframe). Caddy terminates
+  # TLS for the web app on :443 and the streamed Chromium on :6443.
+  # `tls internal` self-signs via Caddy's local CA — see
+  # apps/caddy/Caddyfile for the LE-public-domain alternative.
+  caddy:
+    image: caddy:2-alpine
+    container_name: jsp-caddy
+    restart: unless-stopped
+    environment:
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@local}
+    ports:
+      - "${HTTPS_WEB_PORT:-443}:443"
+      - "${HTTPS_CHROMIUM_PORT:-6443}:6443"
+    volumes:
+      - ./apps/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+      - chromium
+
 volumes:
   db_data:
   uploads:
   claude_config:
   chromium_profile:
+  caddy_data:
+  caddy_config:

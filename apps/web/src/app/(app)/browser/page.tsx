@@ -17,6 +17,7 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
+import { BrowserAutoApplyPanel } from "@/components/BrowserAutoApplyPanel";
 import { PageShell } from "@/components/PageShell";
 import { api, ApiError } from "@/lib/api";
 
@@ -87,18 +88,18 @@ export default function BrowserPage() {
     }
   }
 
-  // First cut: iframe directly to the chromium container's host port
-  // (default 6901) where KasmVNC serves its full UI + WebSocket. The
-  // container's PASSWORD env gates the initial connection. Keeping the
-  // port on the host means we don't need to reverse-proxy KasmVNC's
-  // entire static-asset + websocket bundle through the api. The
-  // api-mediated WebSocket proxy still exists for programmatic
-  // control via Playwright/CDP.
+  // Build the iframe target URL for the streamed chromium container.
   //
-  // The user can override the chromium URL through the env var by
-  // setting NEXT_PUBLIC_CHROMIUM_URL in .env. Default builds the URL
-  // from the current page's hostname + the CHROMIUM_PORT (default
-  // 6901), which works for both localhost and LAN deployments.
+  // Three sources, in priority order:
+  //   1. NEXT_PUBLIC_CHROMIUM_URL — explicit override for users
+  //      fronting the stack with a reverse proxy that doesn't fit
+  //      the heuristics below.
+  //   2. If the current page is loaded over HTTPS (i.e. behind
+  //      Caddy), point at the HTTPS chromium port (default 6443).
+  //      Mixed-content rules block iframing HTTP into an HTTPS
+  //      page, so we MUST stay on HTTPS in this branch.
+  //   3. Otherwise (plain HTTP / localhost dev), use the plain
+  //      CHROMIUM_PORT (default 6901).
   const [streamUrl, setStreamUrl] = useState<string>("");
   useEffect(() => {
     const fromEnv = process.env.NEXT_PUBLIC_CHROMIUM_URL;
@@ -107,8 +108,13 @@ export default function BrowserPage() {
       return;
     }
     if (typeof window !== "undefined") {
-      const port = process.env.NEXT_PUBLIC_CHROMIUM_PORT || "6901";
-      setStreamUrl(`${window.location.protocol}//${window.location.hostname}:${port}`);
+      const isHttps = window.location.protocol === "https:";
+      const port = isHttps
+        ? process.env.NEXT_PUBLIC_HTTPS_CHROMIUM_PORT || "6443"
+        : process.env.NEXT_PUBLIC_CHROMIUM_PORT || "6901";
+      setStreamUrl(
+        `${window.location.protocol}//${window.location.hostname}:${port}`,
+      );
     }
   }, []);
 
@@ -122,6 +128,8 @@ export default function BrowserPage() {
       {err ? (
         <div className="jsp-card p-4 text-sm text-corp-danger mb-3">{err}</div>
       ) : null}
+
+      <BrowserAutoApplyPanel />
 
       {info && !reachable ? (
         <div className="jsp-card p-4 text-sm text-corp-accent2 mb-3 space-y-1">
