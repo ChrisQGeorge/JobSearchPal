@@ -86,7 +86,9 @@ services:
   # network — both control planes are reverse-proxied through the api
   # container's cookie auth so only the logged-in user can connect.
   chromium:
-    image: lscr.io/linuxserver/chromium:latest
+    build:
+      context: ./apps/chromium
+      dockerfile: Dockerfile
     container_name: jsp-chromium
     restart: unless-stopped
     shm_size: "1gb"
