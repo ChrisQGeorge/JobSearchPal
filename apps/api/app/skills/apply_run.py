@@ -62,6 +62,33 @@ def _hash_question(text: str) -> str:
     return hashlib.sha1(norm.encode("utf-8")).hexdigest()
 
 
+async def _resolve_ws() -> Optional[str]:
+    """Match _resolve_ws_endpoint in browser.py — discover the CDP
+    WebSocket URL with Host: localhost so Chromium accepts the
+    request, then rewrite the host to the address the api container
+    can reach."""
+    import httpx
+    from urllib.parse import urlparse, urlunparse
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=3.0,
+            headers={"Host": "localhost"},
+        ) as client:
+            r = await client.get(
+                f"http://{CHROMIUM_HOST}:{CHROMIUM_CDP_PORT}/json/version"
+            )
+        if r.status_code != 200:
+            return None
+        ws = r.json().get("webSocketDebuggerUrl")
+        if not isinstance(ws, str):
+            return None
+        parsed = urlparse(ws)
+        return urlunparse(parsed._replace(netloc=f"{CHROMIUM_HOST}:{CHROMIUM_CDP_PORT}"))
+    except Exception:
+        return None
+
+
 async def _detect_ats(url: str) -> Optional[str]:
     u = url.lower()
     if "boards.greenhouse.io" in u or "greenhouse.io" in u:
@@ -254,8 +281,11 @@ async def _drive_browser(
 
     async with async_playwright() as p:
         try:
+            ws = await _resolve_ws()
+            if not ws:
+                raise RuntimeError("CDP /json/version did not return a websocket URL")
             browser = await p.chromium.connect_over_cdp(
-                f"http://{CHROMIUM_HOST}:{CHROMIUM_CDP_PORT}",
+                ws,
                 headers={"Host": "localhost"},
             )
         except Exception as exc:

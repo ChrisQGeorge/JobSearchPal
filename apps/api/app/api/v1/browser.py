@@ -115,6 +115,38 @@ async def _check_cdp() -> bool:
         return False
 
 
+async def _resolve_ws_endpoint() -> Optional[str]:
+    """Hit /json/version with Host: localhost, pull the
+    `webSocketDebuggerUrl`, replace Chromium's loopback host:port
+    with our reachable `chromium:9223`. Playwright's connect_over_cdp
+    on the HTTP root re-uses the Host header on the WS upgrade and
+    drops the port, which fails — passing a fully-formed WS URL
+    sidesteps that path entirely."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=3.0,
+            headers={"Host": "localhost"},
+        ) as client:
+            r = await client.get(
+                f"http://{CHROMIUM_HOST}:{CHROMIUM_CDP_PORT}/json/version"
+            )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        ws = data.get("webSocketDebuggerUrl")
+        if not isinstance(ws, str):
+            return None
+        # Replace whatever host:port Chromium reported with the address
+        # the api container can actually reach.
+        from urllib.parse import urlparse, urlunparse
+
+        parsed = urlparse(ws)
+        rewritten = parsed._replace(netloc=f"{CHROMIUM_HOST}:{CHROMIUM_CDP_PORT}")
+        return urlunparse(rewritten)
+    except Exception:
+        return None
+
+
 async def _check_vnc() -> bool:
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
@@ -184,8 +216,14 @@ async def navigate(
         from playwright.async_api import async_playwright
 
         async with async_playwright() as p:
+            ws = await _resolve_ws_endpoint()
+            if not ws:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Couldn't resolve Chromium CDP endpoint.",
+                )
             browser = await p.chromium.connect_over_cdp(
-                f"http://{CHROMIUM_HOST}:{CHROMIUM_CDP_PORT}",
+                ws,
                 headers={"Host": "localhost"},
             )
             ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
@@ -211,8 +249,14 @@ async def screenshot(user: User = Depends(get_current_user)) -> Response:
         from playwright.async_api import async_playwright
 
         async with async_playwright() as p:
+            ws = await _resolve_ws_endpoint()
+            if not ws:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Couldn't resolve Chromium CDP endpoint.",
+                )
             browser = await p.chromium.connect_over_cdp(
-                f"http://{CHROMIUM_HOST}:{CHROMIUM_CDP_PORT}",
+                ws,
                 headers={"Host": "localhost"},
             )
             ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
