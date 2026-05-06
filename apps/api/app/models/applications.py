@@ -6,8 +6,10 @@ from typing import Optional
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
+    Integer,
     JSON,
     Numeric,
     String,
@@ -89,3 +91,35 @@ class QuestionAnswer(Base, IdMixin, TimestampMixin):
     answer: Mapped[str] = mapped_column(Text, nullable=False)
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
     last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AutoApplySettings(Base, IdMixin, TimestampMixin):
+    """Per-user policy for the auto-apply background poller.
+
+    The poller wakes every few minutes, scans every user with
+    `enabled=True`, and enqueues `apply_run` rows for the highest-fit
+    `interested` tracked jobs that haven't been applied to yet —
+    bounded by `daily_cap` per UTC day. `min_fit_score` (when set)
+    gates lower-quality matches so the auto-pilot doesn't burn through
+    Claude budget on bad-fit positions. `only_known_ats` further
+    narrows to URLs whose ATS the apply_run handler knows how to drive
+    (greenhouse / lever / ashby / workable) until the generic loop is
+    proven."""
+
+    __tablename__ = "auto_apply_settings"
+    __table_args__ = (
+        UniqueConstraint("user_id", name="uq_auto_apply_settings_user"),
+    )
+
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    daily_cap: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    min_fit_score: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    only_known_ats: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    pause_start_hour: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    pause_end_hour: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    last_run_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

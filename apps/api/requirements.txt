@@ -29,3 +29,6 @@ websockets>=13.0,<15.0
 # the api container. No separate `playwright install` needed because
 # we connect to an already-running Chromium via remote debugging URL.
 playwright>=1.46,<2.0
+# Markdown → HTML conversion for the server-side PDF render path
+# (R11 — apply_run uploads tailored resume/cover-letter PDFs).
+markdown-it-py>=3.0,<4.0

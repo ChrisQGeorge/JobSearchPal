@@ -1838,6 +1838,43 @@ async def download_document_file(
     )
 
 
+@router.post("/{doc_id:int}/render-pdf")
+async def render_document_pdf(
+    doc_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> FileResponse:
+    """Render the document's `content_md` to a PDF via the chromium
+    service and stream it back. Used by Studio's "Download as PDF"
+    button and by `apply_run` when it needs to attach a tailored
+    resume / cover letter to an application form."""
+    from app.skills.pdf_render import render_document_to_pdf
+
+    doc = await _get_owned_document(db, doc_id, user.id)
+    md = (doc.content_md or "").strip()
+    if not md:
+        raise HTTPException(
+            status_code=422, detail="Document has no markdown body to render.",
+        )
+    try:
+        pdf_path = await render_document_to_pdf(doc_id)
+    except Exception as exc:
+        log.exception("PDF render failed for document %d", doc_id)
+        raise HTTPException(
+            status_code=502, detail=f"PDF render failed: {exc}",
+        )
+    if pdf_path is None or not pdf_path.is_file():
+        raise HTTPException(
+            status_code=502, detail="Renderer did not produce a PDF.",
+        )
+    return FileResponse(
+        path=str(pdf_path),
+        media_type="application/pdf",
+        filename=f"{(doc.title or 'document').replace(' ', '_')}.pdf",
+        content_disposition_type="attachment",
+    )
+
+
 # --- Writing Samples Library -----------------------------------------------
 
 
