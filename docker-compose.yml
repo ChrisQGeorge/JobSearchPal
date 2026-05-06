@@ -78,7 +78,40 @@ services:
     ports:
       - "${WEB_PORT}:3000"
 
+  # R10 — streamed Chromium for Companion-driven application assistance.
+  # Both the user (via /browser → noVNC stream) and the Companion (via
+  # CDP / Playwright on port 9222) drive the same browser session.
+  # Persistent profile in `chromium_profile` volume keeps logins (LinkedIn,
+  # Greenhouse SSO, etc.) across restarts. Not exposed to the host
+  # network — both control planes are reverse-proxied through the api
+  # container's cookie auth so only the logged-in user can connect.
+  chromium:
+    image: lscr.io/linuxserver/chromium:latest
+    container_name: jsp-chromium
+    restart: unless-stopped
+    shm_size: "1gb"
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: "${TZ:-America/New_York}"
+      # CHROMIUM_VNC_PASSWORD gates the underlying VNC stream. The api
+      # proxy adds its own cookie-auth layer on top, so this is
+      # defense-in-depth rather than the only auth.
+      PASSWORD: "${CHROMIUM_VNC_PASSWORD:-jobsearchpal}"
+      CHROME_CLI: "--remote-debugging-port=9222 --remote-debugging-address=0.0.0.0"
+    volumes:
+      - chromium_profile:/config
+    # KasmVNC's web app is served on 3000 inside the container.
+    # We expose it on the host so the /browser page can iframe it
+    # directly — much simpler than reverse-proxying every static
+    # asset + WebSocket through api. KasmVNC's built-in PASSWORD
+    # env var gates initial connection. CDP (port 9222) stays
+    # internal-only since only the api container drives it.
+    ports:
+      - "${CHROMIUM_PORT:-6901}:3000"
+
 volumes:
   db_data:
   uploads:
   claude_config:
+  chromium_profile:

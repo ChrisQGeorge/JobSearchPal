@@ -299,6 +299,30 @@ export default function JobTrackerPage() {
     setTimeout(() => setBulkMsg(null), 15000);
   }
 
+  async function bulkApplyWithCompanion() {
+    const ids = [...selectedIds];
+    if (ids.length === 0) return;
+    setBulkRunning(true);
+    setBulkMsg(null);
+    const results = await Promise.allSettled(
+      ids.map((id) =>
+        api.post("/api/v1/application-runs/start", {
+          tracked_job_id: id,
+        }),
+      ),
+    );
+    const ok = results.filter((r) => r.status === "fulfilled").length;
+    const fail = results.length - ok;
+    setBulkRunning(false);
+    setSelectedIds(new Set());
+    setBulkMsg(
+      fail === 0
+        ? `Queued ${ok} apply run${ok === 1 ? "" : "s"}. Watch /applications for progress.`
+        : `Queued ${ok} of ${results.length} (${fail} skipped — usually already-applied or missing source URL). Check /applications.`,
+    );
+    setTimeout(() => setBulkMsg(null), 15000);
+  }
+
   async function onQueueImport(file: File | null) {
     if (!file) return;
     setQueueImporting(true);
@@ -485,6 +509,23 @@ export default function JobTrackerPage() {
                 </option>
               ))}
             </select>
+          </div>
+
+          {/* Apply group — Companion-driven application run. Sits
+              alongside Tailor + Status as a parallel bulk action. */}
+          <div className="flex items-center gap-1.5 px-2 py-1 rounded border border-corp-accent2/40 bg-corp-accent2/10">
+            <span className="text-[10px] uppercase tracking-wider text-corp-accent2">
+              Apply
+            </span>
+            <button
+              type="button"
+              className="jsp-btn-ghost text-xs"
+              onClick={bulkApplyWithCompanion}
+              disabled={bulkRunning}
+              title="Queue a Companion-driven apply_run for each selected job. Watch progress on /applications."
+            >
+              Apply with Companion
+            </button>
           </div>
 
           {/* Tailor group — separated visually from the status control

@@ -22,3 +22,10 @@ html2text>=2024.2,<2026.0
 httpx>=0.27,<1.0
 # RSS / Atom feed parser used by the rss + yc adapters.
 feedparser>=6.0,<7.0
+# Websockets for the noVNC stream proxy (R10).
+websockets>=13.0,<15.0
+# Playwright drives the streamed Chromium over CDP (R10/R11). The
+# chromium service runs the browser; this is just the client lib in
+# the api container. No separate `playwright install` needed because
+# we connect to an already-running Chromium via remote debugging URL.
+playwright>=1.46,<2.0

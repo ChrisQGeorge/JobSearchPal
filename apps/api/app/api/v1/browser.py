@@ -1,0 +1,676 @@
+"""Browser-piped automation surface (R10).
+
+Three concerns wrapped in one router:
+
+  /api/v1/browser/info       — stream URL + status (single-user)
+  /api/v1/browser/stream     — websocket proxy from Next → KasmVNC
+  /api/v1/browser/navigate   — POST a URL, Chromium goes there
+  /api/v1/browser/take-over  — soft mutex toggles
+  /api/v1/browser/release
+  /api/v1/browser/screenshot — debug helper, returns a PNG
+
+  /api/v1/application-runs   — list + open one + answer pending Q
+  /api/v1/application-runs/start — start an apply_run for a tracked job
+
+  /api/v1/question-bank      — CRUD for QuestionAnswer
+
+The Chromium service runs in its own container and is unreachable
+from the host. Both the noVNC stream and the CDP control plane are
+proxied through this api with cookie auth so only the logged-in user
+can touch them."""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+import httpx
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import desc, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database import get_db
+from app.core.deps import get_current_user
+from app.models.applications import (
+    ApplicationRun,
+    ApplicationRunStep,
+    QuestionAnswer,
+)
+from app.models.jobs import JobFetchQueue, TrackedJob
+from app.models.user import User
+
+log = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/browser", tags=["browser"])
+runs_router = APIRouter(prefix="/application-runs", tags=["application-runs"])
+qa_router = APIRouter(prefix="/question-bank", tags=["question-bank"])
+
+
+# Inside the docker-compose network the chromium container resolves to
+# its service name. KasmVNC's web app listens on port 3000, the CDP
+# debugger on 9222.
+CHROMIUM_HOST = os.environ.get("CHROMIUM_HOST", "chromium")
+CHROMIUM_VNC_PORT = int(os.environ.get("CHROMIUM_VNC_PORT", "3000"))
+CHROMIUM_CDP_PORT = int(os.environ.get("CHROMIUM_CDP_PORT", "9222"))
+CHROMIUM_VNC_PASSWORD = os.environ.get("CHROMIUM_VNC_PASSWORD", "jobsearchpal")
+
+
+# ---------- soft mutex ------------------------------------------------------
+#
+# A single in-memory flag tracks who's "driving" the browser — user or
+# Companion. Both control planes always work regardless (this is a
+# hint, not a hard lock). Persists for the lifetime of the api process,
+# which is fine for a single-user deployment.
+_DRIVER: dict[str, str] = {"who": "user"}
+
+
+def _driver_status() -> dict[str, str]:
+    return {"driver": _DRIVER.get("who", "user")}
+
+
+# ---------- /info -----------------------------------------------------------
+
+
+class BrowserInfoOut(BaseModel):
+    cdp_reachable: bool
+    vnc_reachable: bool
+    driver: str
+    chromium_host: str
+    note: Optional[str] = None
+
+
+async def _check_cdp() -> bool:
+    """Quick liveness check on the chromium container's CDP endpoint."""
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(f"http://{CHROMIUM_HOST}:{CHROMIUM_CDP_PORT}/json/version")
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+async def _check_vnc() -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(f"http://{CHROMIUM_HOST}:{CHROMIUM_VNC_PORT}/", follow_redirects=True)
+        return r.status_code < 500
+    except Exception:
+        return False
+
+
+@router.get("/info", response_model=BrowserInfoOut)
+async def get_info(
+    user: User = Depends(get_current_user),
+) -> BrowserInfoOut:
+    cdp = await _check_cdp()
+    vnc = await _check_vnc()
+    note = None
+    if not (cdp and vnc):
+        note = (
+            "The chromium service isn't reachable yet. Make sure the "
+            "`chromium` compose service is running: "
+            "`docker compose up -d chromium`."
+        )
+    return BrowserInfoOut(
+        cdp_reachable=cdp,
+        vnc_reachable=vnc,
+        driver=_driver_status()["driver"],
+        chromium_host=CHROMIUM_HOST,
+        note=note,
+    )
+
+
+# ---------- soft mutex toggles ----------------------------------------------
+
+
+@router.post("/take-over")
+async def take_over(user: User = Depends(get_current_user)) -> dict[str, str]:
+    _DRIVER["who"] = "user"
+    return _driver_status()
+
+
+@router.post("/release")
+async def release(user: User = Depends(get_current_user)) -> dict[str, str]:
+    _DRIVER["who"] = "companion"
+    return _driver_status()
+
+
+# ---------- navigate --------------------------------------------------------
+
+
+class NavigateIn(BaseModel):
+    url: str = Field(min_length=1, max_length=2048)
+
+
+@router.post("/navigate")
+async def navigate(
+    payload: NavigateIn,
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Navigate the streamed Chromium to `url`. Uses Playwright over
+    CDP. Returns the page title on success."""
+    target = payload.url.strip()
+    if not (target.startswith("http://") or target.startswith("https://")):
+        target = "https://" + target
+    try:
+        # Lazy import — playwright is only installed once R10 ships and
+        # the chromium service is up, so don't pull it at module load.
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(
+                f"http://{CHROMIUM_HOST}:{CHROMIUM_CDP_PORT}"
+            )
+            ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            await page.goto(target, timeout=30_000)
+            title = await page.title()
+            await browser.close()
+        return {"url": target, "title": title}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Browser navigate failed: %s", exc)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Couldn't drive the browser: {exc}",
+        )
+
+
+# ---------- screenshot ------------------------------------------------------
+
+
+@router.get("/screenshot")
+async def screenshot(user: User = Depends(get_current_user)) -> Response:
+    try:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(
+                f"http://{CHROMIUM_HOST}:{CHROMIUM_CDP_PORT}"
+            )
+            ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            png = await page.screenshot(type="png", full_page=False)
+            await browser.close()
+        return Response(content=png, media_type="image/png")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Screenshot failed: {exc}")
+
+
+# ---------- stream proxy (websocket) ----------------------------------------
+#
+# KasmVNC speaks WebSocket on /websockify by default. We accept the
+# user's WebSocket (cookie-auth at handshake), open a second one to
+# the chromium container, and pump bytes both ways. Single-user
+# deployment so we don't worry about multiplexing.
+
+
+@router.websocket("/stream")
+async def browser_stream(
+    websocket: WebSocket,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    # Cookie-auth on the WebSocket. Mirrors get_current_user but gentle
+    # on failure (close instead of raise).
+    from app.core.deps import _resolve_user_from_request
+
+    try:
+        user = await _resolve_user_from_request(websocket, db)
+    except Exception:
+        await websocket.close(code=4401)
+        return
+    if user is None:
+        await websocket.close(code=4401)
+        return
+
+    await websocket.accept(subprotocol="binary")
+    upstream_url = f"ws://{CHROMIUM_HOST}:{CHROMIUM_VNC_PORT}/websockify"
+    try:
+        import websockets
+
+        async with websockets.connect(
+            upstream_url, subprotocols=["binary"], max_size=None
+        ) as upstream:
+
+            async def _client_to_upstream() -> None:
+                while True:
+                    msg = await websocket.receive_bytes()
+                    await upstream.send(msg)
+
+            async def _upstream_to_client() -> None:
+                async for msg in upstream:
+                    if isinstance(msg, bytes):
+                        await websocket.send_bytes(msg)
+                    else:
+                        await websocket.send_text(msg)
+
+            tasks = [
+                asyncio.create_task(_client_to_upstream()),
+                asyncio.create_task(_upstream_to_client()),
+            ]
+            try:
+                done, pending = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_EXCEPTION
+                )
+                for t in pending:
+                    t.cancel()
+            finally:
+                for t in tasks:
+                    t.cancel()
+    except WebSocketDisconnect:
+        return
+    except Exception as exc:  # pragma: no cover
+        log.info("browser stream error: %s", exc)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+# ---------- application-run endpoints ---------------------------------------
+
+
+class ApplicationRunOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    tracked_job_id: int
+    tier: str
+    state: str
+    ats_kind: Optional[str] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    queue_id: Optional[int] = None
+    cost_usd: Optional[float] = None
+    error_message: Optional[str] = None
+    pending_question: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ApplicationRunStepOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    ts: datetime
+    kind: str
+    payload: Optional[dict] = None
+    screenshot_url: Optional[str] = None
+
+
+class ApplicationRunDetailOut(ApplicationRunOut):
+    steps: list[ApplicationRunStepOut] = []
+    tracked_job_title: Optional[str] = None
+
+
+class StartRunIn(BaseModel):
+    tracked_job_id: int
+
+
+class StartRunOut(BaseModel):
+    run_id: int
+    queue_id: int
+
+
+@runs_router.get("", response_model=list[ApplicationRunOut])
+async def list_runs(
+    state: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[ApplicationRun]:
+    stmt = (
+        select(ApplicationRun)
+        .where(ApplicationRun.user_id == user.id)
+        .order_by(desc(ApplicationRun.created_at))
+        .limit(limit)
+    )
+    if state:
+        stmt = stmt.where(ApplicationRun.state == state)
+    return list((await db.execute(stmt)).scalars().all())
+
+
+@runs_router.get("/{run_id:int}/screenshot/{name}")
+async def get_run_screenshot(
+    run_id: int,
+    name: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Response:
+    """Serve a screenshot file written by the apply_run handler under
+    `/app/uploads/applications/<run_id>/<name>`. Cookie-auth gates
+    access; filenames are restricted to a safe charset to prevent
+    directory traversal."""
+    from pathlib import Path
+
+    if not re.fullmatch(r"[\w.\-]+\.(png|jpg|jpeg)", name):
+        raise HTTPException(status_code=400, detail="Bad filename")
+    row = (
+        await db.execute(
+            select(ApplicationRun).where(
+                ApplicationRun.id == run_id,
+                ApplicationRun.user_id == user.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    p = Path("/app/uploads/applications") / str(run_id) / name
+    if not p.is_file():
+        raise HTTPException(status_code=404, detail="Screenshot not found")
+    return Response(content=p.read_bytes(), media_type="image/png")
+
+
+@runs_router.get("/{run_id:int}", response_model=ApplicationRunDetailOut)
+async def get_run(
+    run_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ApplicationRunDetailOut:
+    row = (
+        await db.execute(
+            select(ApplicationRun).where(
+                ApplicationRun.id == run_id,
+                ApplicationRun.user_id == user.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    steps = list(
+        (
+            await db.execute(
+                select(ApplicationRunStep)
+                .where(ApplicationRunStep.run_id == run_id)
+                .order_by(ApplicationRunStep.ts.asc(), ApplicationRunStep.id.asc())
+            )
+        ).scalars().all()
+    )
+    job = (
+        await db.execute(
+            select(TrackedJob.title).where(TrackedJob.id == row.tracked_job_id)
+        )
+    ).first()
+    out = ApplicationRunDetailOut.model_validate(row)
+    out.steps = [ApplicationRunStepOut.model_validate(s) for s in steps]
+    out.tracked_job_title = job[0] if job else None
+    return out
+
+
+@runs_router.post("/start", response_model=StartRunOut, status_code=status.HTTP_201_CREATED)
+async def start_run(
+    payload: StartRunIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> StartRunOut:
+    """Kick off a Companion-driven application attempt for `tracked_job_id`.
+    Creates an ApplicationRun row + a `apply_run` queue row that the
+    worker picks up. Refuses to start if the tracked job's status is
+    already past `to_review` (already applied / responded / etc.) so
+    a stale browser tab can't accidentally re-apply."""
+    job = (
+        await db.execute(
+            select(TrackedJob).where(
+                TrackedJob.id == payload.tracked_job_id,
+                TrackedJob.user_id == user.id,
+                TrackedJob.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if job is None:
+        raise HTTPException(status_code=404, detail="Tracked job not found")
+
+    blocked = {
+        "applied",
+        "responded",
+        "screening",
+        "interviewing",
+        "assessment",
+        "offer",
+        "won",
+        "withdrawn",
+    }
+    if job.status in blocked:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Job is at status='{job.status}' — apply_run refuses to "
+                "submit a duplicate application."
+            ),
+        )
+    if not job.source_url:
+        raise HTTPException(
+            status_code=422,
+            detail="Tracked job has no source_url to drive the browser to.",
+        )
+
+    run = ApplicationRun(
+        user_id=user.id,
+        tracked_job_id=job.id,
+        tier="generic",
+        state="queued",
+    )
+    db.add(run)
+    await db.flush()
+
+    queued = JobFetchQueue(
+        user_id=user.id,
+        kind="apply_run",
+        label=f"Apply → {job.title[:80]}"[:512],
+        url=job.source_url,
+        payload={"application_run_id": run.id, "tracked_job_id": job.id},
+        state="queued",
+    )
+    db.add(queued)
+    await db.flush()
+    run.queue_id = queued.id
+    await db.commit()
+    return StartRunOut(run_id=run.id, queue_id=queued.id)
+
+
+class AnswerIn(BaseModel):
+    answer: str = Field(min_length=1, max_length=8000)
+    save_to_bank: bool = True
+
+
+@runs_router.post("/{run_id:int}/answer")
+async def answer_pending(
+    run_id: int,
+    payload: AnswerIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Submit the user's answer for a run that's in state=awaiting_user.
+    Stores in the question-bank (idempotent on hash), flips the run
+    back to state=running, and lets the worker resume."""
+    row = (
+        await db.execute(
+            select(ApplicationRun).where(
+                ApplicationRun.id == run_id,
+                ApplicationRun.user_id == user.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if row.state != "awaiting_user" or not row.pending_question_hash:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Run is in state='{row.state}', not awaiting an answer.",
+        )
+
+    if payload.save_to_bank and row.pending_question:
+        existing = (
+            await db.execute(
+                select(QuestionAnswer).where(
+                    QuestionAnswer.user_id == user.id,
+                    QuestionAnswer.question_hash == row.pending_question_hash,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            db.add(
+                QuestionAnswer(
+                    user_id=user.id,
+                    question_hash=row.pending_question_hash,
+                    question_text=row.pending_question[:2000],
+                    answer=payload.answer,
+                    source="user",
+                    last_used_at=datetime.now(tz=timezone.utc),
+                )
+            )
+        else:
+            existing.answer = payload.answer
+            existing.last_used_at = datetime.now(tz=timezone.utc)
+
+    db.add(
+        ApplicationRunStep(
+            run_id=row.id,
+            ts=datetime.now(tz=timezone.utc),
+            kind="answer",
+            payload={
+                "question": row.pending_question,
+                "answer_preview": payload.answer[:200],
+            },
+        )
+    )
+    row.pending_question = None
+    row.pending_question_hash = None
+    row.state = "running"
+    await db.commit()
+    return {"state": row.state}
+
+
+@runs_router.post("/{run_id:int}/cancel")
+async def cancel_run(
+    run_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    row = (
+        await db.execute(
+            select(ApplicationRun).where(
+                ApplicationRun.id == run_id,
+                ApplicationRun.user_id == user.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if row.state in ("submitted", "failed", "cancelled"):
+        return {"state": row.state}
+    row.state = "cancelled"
+    row.finished_at = datetime.now(tz=timezone.utc)
+    await db.commit()
+    return {"state": row.state}
+
+
+# ---------- question-bank ---------------------------------------------------
+
+
+class QuestionAnswerOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    question_text: str
+    answer: str
+    source: str
+    last_used_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class QuestionAnswerIn(BaseModel):
+    question_text: str = Field(min_length=1, max_length=2000)
+    answer: str = Field(min_length=1, max_length=8000)
+    source: Optional[str] = None
+
+
+def _hash_question(text: str) -> str:
+    import hashlib
+    import re
+
+    norm = re.sub(r"\s+", " ", text.strip().lower())
+    return hashlib.sha1(norm.encode("utf-8")).hexdigest()
+
+
+@qa_router.get("", response_model=list[QuestionAnswerOut])
+async def list_question_answers(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[QuestionAnswer]:
+    stmt = (
+        select(QuestionAnswer)
+        .where(QuestionAnswer.user_id == user.id)
+        .order_by(desc(func.coalesce(QuestionAnswer.last_used_at, QuestionAnswer.created_at)))
+    )
+    return list((await db.execute(stmt)).scalars().all())
+
+
+@qa_router.put("", response_model=QuestionAnswerOut)
+async def upsert_question_answer(
+    payload: QuestionAnswerIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> QuestionAnswer:
+    h = _hash_question(payload.question_text)
+    existing = (
+        await db.execute(
+            select(QuestionAnswer).where(
+                QuestionAnswer.user_id == user.id,
+                QuestionAnswer.question_hash == h,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        existing = QuestionAnswer(
+            user_id=user.id,
+            question_hash=h,
+            question_text=payload.question_text[:2000],
+            answer=payload.answer,
+            source=(payload.source or "manual")[:32],
+        )
+        db.add(existing)
+    else:
+        existing.question_text = payload.question_text[:2000]
+        existing.answer = payload.answer
+        if payload.source:
+            existing.source = payload.source[:32]
+    await db.commit()
+    await db.refresh(existing)
+    return existing
+
+
+@qa_router.delete("/{qa_id:int}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_question_answer(
+    qa_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> None:
+    row = (
+        await db.execute(
+            select(QuestionAnswer).where(
+                QuestionAnswer.id == qa_id,
+                QuestionAnswer.user_id == user.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Question not found")
+    await db.delete(row)
+    await db.commit()
+
+
+def register(app) -> None:
+    app.include_router(router, prefix="/api/v1")
+    app.include_router(runs_router, prefix="/api/v1")
+    app.include_router(qa_router, prefix="/api/v1")
