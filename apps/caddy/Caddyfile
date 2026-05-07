@@ -1,7 +1,11 @@
-# Job Search Pal — HTTPS reverse proxy (R10/R11).
+# Job Search Pal — HTTPS reverse proxy.
 #
-# Two TLS-terminated listeners, both using Caddy's internal CA so
-# the stack works on any host without external DNS or ACME setup:
+# Two TLS-terminated listeners using a self-signed cert generated at
+# container startup by entrypoint.sh and stored in the caddy_data
+# volume. SAN entries cover localhost / *.local / *.lan / the
+# CADDY_HOSTNAME env var. Add your server's public IP / hostname to
+# CADDY_EXTRA_SANS in .env (e.g. `IP:203.0.113.5,DNS:my.public.com`)
+# to get a clean lock without warnings.
 #
 #   :443  → web container (port 3000). Next.js's built-in rewrites
 #           still forward /api/* and /health/* to the api container,
@@ -15,40 +19,30 @@
 #
 # To use a real domain + Let's Encrypt instead of self-signed:
 #   1. Set CADDY_HOSTNAME in .env to your public hostname
-#   2. Replace `tls internal` with `tls {$ADMIN_EMAIL}` in this file
+#   2. Replace the `tls /data/...` lines with `tls {$ADMIN_EMAIL}`
 #   3. Make sure ports 80 + 443 are reachable from the internet
-#
-# Self-signed root cert lives in the caddy_data volume after first
-# boot — `docker compose exec caddy cat /data/caddy/pki/authorities/local/root.crt`
-# and trust that file in your browser to silence the warning.
+#   4. Delete the volumes/jsp-tls dir to drop the self-signed cert
 
 {
 	# Disable Caddy's "you should set an admin email" warning when the
-	# user hasn't set one yet (self-signed mode doesn't need one).
+	# user hasn't set one yet.
 	email {$ADMIN_EMAIL:admin@local}
 	# Bind admin endpoint to localhost only inside the container — we
 	# don't expose it on the host.
 	admin off
-	# Allow on-demand cert issuance via Caddy's internal CA so this
-	# config works for any hostname / IP without the user having to
-	# bake a domain into the Caddyfile. The ask endpoint must return
-	# 200 for Caddy to issue; api's /health is already in the docker
-	# network and returns {status:ok} for everything.
-	on_demand_tls {
-		ask http://api:8000/health
-	}
+	# We bring our own TLS cert via the entrypoint script — disable
+	# Caddy's automatic HTTPS (which would otherwise try to provision
+	# certs from LE / internal CA on every hostname it sees, and add
+	# HTTP→HTTPS redirects we don't want).
+	auto_https off
 }
 
 # --- Main app + API --------------------------------------------------------
-# `https://` (no host) matches every TLS request landing on the listen
-# port. Combined with `tls internal { on_demand }` this lets us work
-# regardless of whether the user reaches the box at localhost, an IP,
-# or a real domain — Caddy mints a cert per SNI from its local CA.
-https:// {
+# `https://` prefix forces HTTPS on the listen port even with
+# auto_https off, so the static cert below actually gets used.
+https://:443 {
 	bind 0.0.0.0
-	tls internal {
-		on_demand
-	}
+	tls /data/jsp-tls/cert.pem /data/jsp-tls/key.pem
 
 	# Larger upload cap for resume / cover-letter ingest.
 	request_body {
@@ -65,15 +59,9 @@ https:// {
 }
 
 # --- Streamed Chromium (KasmVNC) on a separate port ------------------------
-# KasmVNC uses absolute paths from / for assets and websockets, so
-# it can't share a hostname with the web app. Park it on a dedicated
-# port — the /browser page iframes whatever NEXT_PUBLIC_CHROMIUM_URL
-# resolves to.
 https://:6443 {
 	bind 0.0.0.0
-	tls internal {
-		on_demand
-	}
+	tls /data/jsp-tls/cert.pem /data/jsp-tls/key.pem
 
 	reverse_proxy chromium:3000 {
 		flush_interval -1

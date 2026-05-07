@@ -135,15 +135,28 @@ services:
   # modern browsers refuse clipboard / WebRTC / secure-context APIs
   # over plain HTTP to non-localhost origins (which breaks KasmVNC's
   # streamed browser inside the /browser iframe). Caddy terminates
-  # TLS for the web app on :443 and the streamed Chromium on :6443.
-  # `tls internal` self-signs via Caddy's local CA — see
-  # apps/caddy/Caddyfile for the LE-public-domain alternative.
+  # TLS for the web app on :443 and the streamed Chromium on :6443
+  # using a self-signed cert generated at container startup by
+  # apps/caddy/entrypoint.sh — no on-demand cert pipeline, no
+  # external dependencies, no chance of a TLS handshake failing
+  # because the api container hasn't booted yet.
   caddy:
-    image: caddy:2-alpine
+    build:
+      context: ./apps/caddy
+      dockerfile: Dockerfile
     container_name: jsp-caddy
     restart: unless-stopped
     environment:
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@local}
+      # Hostname baked into the cert's CN + first SAN. Users on LAN
+      # deployments typically leave this default and add their
+      # server's IP / public hostname to CADDY_EXTRA_SANS instead.
+      CADDY_HOSTNAME: ${CADDY_HOSTNAME:-jobsearchpal.local}
+      # Comma-separated extra SANs in OpenSSL's `DNS:foo,IP:1.2.3.4`
+      # shape. Set this to your remote server's public IP / hostname
+      # for a clean lock icon — without it the browser will warn
+      # about cert mismatch even after you trust the cert once.
+      CADDY_EXTRA_SANS: ${CADDY_EXTRA_SANS:-}
     ports:
       - "${HTTPS_WEB_PORT:-443}:443"
       - "${HTTPS_CHROMIUM_PORT:-6443}:6443"
