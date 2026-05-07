@@ -45,7 +45,11 @@ services:
       db:
         condition: service_healthy
     ports:
-      - "${API_PORT}:8000"
+      # Bound to loopback only by default so the LAN can't reach the
+      # api over plain HTTP — Caddy proxies it through HTTPS on 443.
+      # Set PUBLIC_API_BIND=0.0.0.0 in .env to expose on the LAN
+      # (dev only — bypasses TLS).
+      - "${PUBLIC_API_BIND:-127.0.0.1}:${API_PORT}:8000"
     volumes:
       - ./skills:/app/skills:ro
       # Isolated named volume for the container's own Claude Code config.
@@ -55,6 +59,10 @@ services:
       # credentials into this volume.
       - claude_config:/root/.claude
       - uploads:/app/uploads
+    # api is bound to loopback only — Caddy reaches it over the
+    # internal docker network at api:8000, no host exposure needed.
+    # Override with PUBLIC_API_BIND=0.0.0.0 in .env for direct
+    # access from the LAN (dev only — bypasses HTTPS).
 
   web:
     build:
@@ -80,7 +88,11 @@ services:
     depends_on:
       - api
     ports:
-      - "${WEB_PORT}:3000"
+      # Bound to loopback by default so the LAN can't reach the web
+      # container over plain HTTP — Caddy serves it via HTTPS on
+      # port 443. Set PUBLIC_WEB_BIND=0.0.0.0 in .env if you want
+      # direct LAN access without TLS (dev only).
+      - "${PUBLIC_WEB_BIND:-127.0.0.1}:${WEB_PORT}:3000"
 
   # R10 — streamed Chromium for Companion-driven application assistance.
   # Both the user (via /browser → noVNC stream) and the Companion (via
@@ -108,13 +120,13 @@ services:
     volumes:
       - chromium_profile:/config
     # KasmVNC's web app is served on 3000 inside the container.
-    # We expose it on the host so the /browser page can iframe it
-    # directly — much simpler than reverse-proxying every static
-    # asset + WebSocket through api. KasmVNC's built-in PASSWORD
-    # env var gates initial connection. CDP (port 9222) stays
-    # internal-only since only the api container drives it.
+    # Bound to loopback by default — Caddy proxies the iframe
+    # through HTTPS on port 6443. Set PUBLIC_CHROMIUM_BIND=0.0.0.0
+    # to expose directly on the LAN over plain HTTP (KasmVNC will
+    # error inside the iframe because secure-context APIs require
+    # HTTPS, so this is dev-only).
     ports:
-      - "${CHROMIUM_PORT:-6901}:3000"
+      - "${PUBLIC_CHROMIUM_BIND:-127.0.0.1}:${CHROMIUM_PORT:-6901}:3000"
 
   # Tiny sidecar that exposes chromium's CDP over the docker network.
   # The linuxserver/chromium wrapper strips --remote-debugging-address
