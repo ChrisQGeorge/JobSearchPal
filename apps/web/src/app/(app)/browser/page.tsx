@@ -100,11 +100,19 @@ export default function BrowserPage() {
   //      page, so we MUST stay on HTTPS in this branch.
   //   3. Otherwise (plain HTTP / localhost dev), use the plain
   //      CHROMIUM_PORT (default 6901).
+  // KasmVNC defaults to single-primary-client mode — opening the
+  // /browser page in a second tab kicks the first one with a
+  // "Connection Terminated: a new primary client connected" toast.
+  // Append ?shared=1 to the iframe URL so multiple viewers can
+  // attach simultaneously (e.g., the user has the page open on
+  // both a laptop and a phone, or accidentally double-clicked).
   const [streamUrl, setStreamUrl] = useState<string>("");
   useEffect(() => {
+    const append = (u: string) =>
+      u.includes("?") ? `${u}&shared=1` : `${u}/?shared=1`;
     const fromEnv = process.env.NEXT_PUBLIC_CHROMIUM_URL;
     if (fromEnv) {
-      setStreamUrl(fromEnv);
+      setStreamUrl(append(fromEnv));
       return;
     }
     if (typeof window !== "undefined") {
@@ -113,7 +121,9 @@ export default function BrowserPage() {
         ? process.env.NEXT_PUBLIC_HTTPS_CHROMIUM_PORT || "6443"
         : process.env.NEXT_PUBLIC_CHROMIUM_PORT || "6901";
       setStreamUrl(
-        `${window.location.protocol}//${window.location.hostname}:${port}`,
+        append(
+          `${window.location.protocol}//${window.location.hostname}:${port}`,
+        ),
       );
     }
   }, []);

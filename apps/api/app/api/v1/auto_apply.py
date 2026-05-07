@@ -54,11 +54,30 @@ class AutoApplySettingsIn(BaseModel):
 
 
 async def _get_or_create(db: AsyncSession, user_id: int) -> AutoApplySettings:
-    row = (
-        await db.execute(
-            select(AutoApplySettings).where(AutoApplySettings.user_id == user_id)
-        )
-    ).scalar_one_or_none()
+    try:
+        row = (
+            await db.execute(
+                select(AutoApplySettings).where(AutoApplySettings.user_id == user_id)
+            )
+        ).scalar_one_or_none()
+    except Exception as exc:
+        # Almost always: the api image is stale and migration 0025
+        # never ran, so `last_browser_visible_at` is in the model but
+        # not in the DB schema → "Unknown column" → 500. Convert to a
+        # clear 503 with the fix command so the user doesn't have to
+        # dig through tracebacks.
+        msg = str(exc)
+        if "last_browser_visible_at" in msg or "Unknown column" in msg.lower():
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "auto_apply_settings schema is out of date — migration 0025 "
+                    "hasn't run on this api container. Run "
+                    "`docker compose build api && docker compose up -d api` "
+                    "on the host. Original error: " + msg[:200]
+                ),
+            )
+        raise
     if row is not None:
         return row
     row = AutoApplySettings(user_id=user_id)
