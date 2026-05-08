@@ -124,7 +124,15 @@ async def _candidate_jobs(
             TrackedJob.source_url != "",
             TrackedJob.id.notin_(active_run_subq),
         )
-        .order_by(TrackedJob.date_discovered.desc().nullslast(), TrackedJob.id.desc())
+        # MySQL doesn't understand PG's `NULLS LAST` keyword. Emulate
+        # it by sorting on the IS NULL boolean first (False sorts
+        # before True → non-null rows come first), then the actual
+        # date desc, then id desc as a tiebreaker.
+        .order_by(
+            TrackedJob.date_discovered.is_(None),
+            TrackedJob.date_discovered.desc(),
+            TrackedJob.id.desc(),
+        )
         # Pull a wider window than `limit` because we still need to
         # filter by fit_score / ATS in Python (fit_summary is JSON).
         .limit(max(limit * 4, 25))

@@ -5,6 +5,10 @@
 // having the streamed browser visible. While the tab is visible we
 // post a heartbeat to /api/v1/auto-apply/heartbeat every 10s; the
 // poller refuses to fire runs unless it has a recent heartbeat.
+//
+// All policy controls live here (collapsed by default) so there's no
+// separate /auto-apply page — the user can't enable auto-apply
+// without being on the same page that proves the browser is visible.
 
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
@@ -39,14 +43,26 @@ type Preview = {
   candidates: PreviewJob[];
 };
 
+const DEFAULT_DRAFT: Settings = {
+  enabled: false,
+  daily_cap: 5,
+  min_fit_score: null,
+  only_known_ats: false,
+  pause_start_hour: null,
+  pause_end_hour: null,
+  last_run_at: null,
+  last_browser_visible_at: null,
+};
+
 export function BrowserAutoApplyPanel() {
   const [preview, setPreview] = useState<Preview | null>(null);
+  const [draft, setDraft] = useState<Settings>(DEFAULT_DRAFT);
+  const [policyOpen, setPolicyOpen] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
   const [running, setRunning] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  // Default to "paused" during SSR — flipped to "active" on the
-  // first client-side effect tick if the tab is visible.
   const [heartbeatStatus, setHeartbeatStatus] = useState<"active" | "paused">(
     "paused",
   );
@@ -106,9 +122,23 @@ export function BrowserAutoApplyPanel() {
     try {
       const p = await api.get<Preview>("/api/v1/auto-apply/preview");
       setPreview(p);
+      setDraft(p.settings);
       setErr(null);
     } catch (e) {
-      setErr(e instanceof ApiError ? `HTTP ${e.status}` : "Load failed.");
+      const detail =
+        e instanceof ApiError &&
+        typeof e.detail === "object" &&
+        e.detail !== null &&
+        "detail" in (e.detail as Record<string, unknown>)
+          ? String((e.detail as { detail: unknown }).detail)
+          : null;
+      setErr(
+        detail
+          ? detail
+          : e instanceof ApiError
+            ? `HTTP ${e.status}`
+            : "Load failed.",
+      );
     } finally {
       setLoading(false);
     }
@@ -120,15 +150,24 @@ export function BrowserAutoApplyPanel() {
     return () => clearInterval(t);
   }, []);
 
-  async function toggle() {
-    if (!preview) return;
-    const next = { ...preview.settings, enabled: !preview.settings.enabled };
+  async function save(next: Settings) {
+    setSaving(true);
+    setMsg(null);
+    setErr(null);
     try {
       await api.put("/api/v1/auto-apply/settings", next);
       await refresh();
     } catch (e) {
       setErr(e instanceof ApiError ? `HTTP ${e.status}` : "Save failed.");
+    } finally {
+      setSaving(false);
     }
+  }
+
+  async function toggle() {
+    if (!preview) return;
+    const next = { ...preview.settings, enabled: !preview.settings.enabled };
+    await save(next);
   }
 
   async function runNow() {
@@ -146,14 +185,19 @@ export function BrowserAutoApplyPanel() {
       );
       await refresh();
     } catch (e) {
+      const detail =
+        e instanceof ApiError &&
+        typeof e.detail === "object" &&
+        e.detail !== null &&
+        "detail" in (e.detail as Record<string, unknown>)
+          ? String((e.detail as { detail: unknown }).detail)
+          : null;
       setErr(
-        e instanceof ApiError
-          ? typeof e.detail === "object" &&
-            e.detail !== null &&
-            "detail" in (e.detail as Record<string, unknown>)
-            ? String((e.detail as { detail: unknown }).detail)
-            : `HTTP ${e.status}`
-          : "Run failed.",
+        detail
+          ? detail
+          : e instanceof ApiError
+            ? `HTTP ${e.status}`
+            : "Run failed.",
       );
     } finally {
       setRunning(false);
@@ -169,6 +213,13 @@ export function BrowserAutoApplyPanel() {
   }
 
   const s = preview?.settings;
+  const dirty =
+    s !== undefined &&
+    (draft.daily_cap !== s.daily_cap ||
+      draft.min_fit_score !== s.min_fit_score ||
+      draft.only_known_ats !== s.only_known_ats ||
+      draft.pause_start_hour !== s.pause_start_hour ||
+      draft.pause_end_hour !== s.pause_end_hour);
 
   return (
     <div className="jsp-card p-3 mb-3">
@@ -202,9 +253,13 @@ export function BrowserAutoApplyPanel() {
             {s.enabled ? "Enabled — click to disable" : "Disabled — click to enable"}
           </button>
         ) : null}
-        <Link href="/auto-apply" className="text-xs text-corp-accent hover:underline ml-auto">
-          Tune policy →
-        </Link>
+        <button
+          type="button"
+          className="text-xs text-corp-accent hover:underline ml-auto"
+          onClick={() => setPolicyOpen((v) => !v)}
+        >
+          {policyOpen ? "Hide policy ▴" : "Tune policy ▾"}
+        </button>
       </div>
 
       <div className="flex flex-wrap items-center gap-3 text-xs text-corp-muted">
@@ -240,6 +295,106 @@ export function BrowserAutoApplyPanel() {
       {msg ? <div className="text-[11px] text-corp-ok mt-2">{msg}</div> : null}
       {err ? <div className="text-[11px] text-corp-danger mt-2">{err}</div> : null}
 
+      {policyOpen ? (
+        <div className="mt-3 border-t border-corp-border pt-3 grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+          <Field label="Daily cap" hint="0 disables">
+            <input
+              type="number"
+              min={0}
+              max={100}
+              value={draft.daily_cap}
+              onChange={(e) =>
+                setDraft({
+                  ...draft,
+                  daily_cap: parseInt(e.target.value || "0", 10),
+                })
+              }
+              className="jsp-input w-20"
+            />
+          </Field>
+          <Field label="Min fit-score" hint="0-100, blank = none">
+            <input
+              type="number"
+              min={0}
+              max={100}
+              value={draft.min_fit_score ?? ""}
+              onChange={(e) =>
+                setDraft({
+                  ...draft,
+                  min_fit_score:
+                    e.target.value === "" ? null : parseInt(e.target.value, 10),
+                })
+              }
+              className="jsp-input w-20"
+            />
+          </Field>
+          <Field label="Pause from (UTC hour)" hint="0-23, blank = no pause">
+            <input
+              type="number"
+              min={0}
+              max={23}
+              value={draft.pause_start_hour ?? ""}
+              onChange={(e) =>
+                setDraft({
+                  ...draft,
+                  pause_start_hour:
+                    e.target.value === "" ? null : parseInt(e.target.value, 10),
+                })
+              }
+              className="jsp-input w-20"
+            />
+          </Field>
+          <Field label="Pause to (UTC hour)" hint="0-23">
+            <input
+              type="number"
+              min={0}
+              max={23}
+              value={draft.pause_end_hour ?? ""}
+              onChange={(e) =>
+                setDraft({
+                  ...draft,
+                  pause_end_hour:
+                    e.target.value === "" ? null : parseInt(e.target.value, 10),
+                })
+              }
+              className="jsp-input w-20"
+            />
+          </Field>
+
+          <label className="col-span-2 sm:col-span-3 flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={draft.only_known_ats}
+              onChange={(e) =>
+                setDraft({ ...draft, only_known_ats: e.target.checked })
+              }
+            />
+            <span>
+              Only auto-apply to known ATS hosts (greenhouse / lever / ashby)
+            </span>
+          </label>
+
+          <div className="col-span-2 sm:col-span-1 flex items-center gap-2 justify-end">
+            <button
+              type="button"
+              className="jsp-btn-ghost text-xs"
+              onClick={() => preview && setDraft(preview.settings)}
+              disabled={saving || !dirty}
+            >
+              Reset
+            </button>
+            <button
+              type="button"
+              className="jsp-btn text-xs"
+              onClick={() => save(draft)}
+              disabled={saving || !dirty}
+            >
+              {saving ? "Saving…" : "Save"}
+            </button>
+          </div>
+        </div>
+      ) : null}
+
       {preview && preview.candidates.length > 0 ? (
         <details className="mt-2">
           <summary className="text-[11px] text-corp-muted cursor-pointer">
@@ -262,6 +417,28 @@ export function BrowserAutoApplyPanel() {
             ))}
           </ul>
         </details>
+      ) : null}
+    </div>
+  );
+}
+
+function Field({
+  label,
+  hint,
+  children,
+}: {
+  label: string;
+  hint?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-wider text-corp-muted mb-1">
+        {label}
+      </div>
+      {children}
+      {hint ? (
+        <div className="text-[10px] text-corp-muted mt-1">{hint}</div>
       ) : null}
     </div>
   );

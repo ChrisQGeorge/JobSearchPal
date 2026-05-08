@@ -16,7 +16,6 @@ const NAV = [
   { href: "/inbox", label: "Email Inbox" },
   { href: "/browser", label: "Browser" },
   { href: "/applications", label: "Applications" },
-  { href: "/auto-apply", label: "Auto-Apply" },
   { href: "/answers", label: "Answer Bank" },
   { href: "/queue", label: "Companion Activity" },
   { href: "/studio", label: "Document Studio" },
