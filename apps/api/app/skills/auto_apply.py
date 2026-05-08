@@ -93,16 +93,16 @@ async def _candidate_jobs(
     db: AsyncSession,
     user_id: int,
     *,
-    min_fit_score: Optional[int],
-    only_known_ats: bool,
     limit: int,
 ) -> list[TrackedJob]:
     """Pull the user's `interested` jobs that are eligible for an
-    auto-apply run. Skips anything that already has a non-terminal
-    ApplicationRun."""
+    auto-apply run. Single criterion: status == 'interested' (and not
+    already in flight). No fit-score / ATS filtering — those gates
+    were removed because the user explicitly wanted "interested"
+    status to be the only thing the auto-apply considers."""
 
     # Subquery: tracked_job_ids that already have an active or
-    # successful ApplicationRun.
+    # successful ApplicationRun. Exclude these so we don't double-fire.
     active_run_subq = (
         select(ApplicationRun.tracked_job_id)
         .where(
@@ -133,40 +133,9 @@ async def _candidate_jobs(
             TrackedJob.date_discovered.desc(),
             TrackedJob.id.desc(),
         )
-        # Pull a wider window than `limit` because we still need to
-        # filter by fit_score / ATS in Python (fit_summary is JSON).
-        .limit(max(limit * 4, 25))
+        .limit(limit)
     )
-    rows = list((await db.execute(stmt)).scalars().all())
-
-    out: list[TrackedJob] = []
-    for j in rows:
-        if min_fit_score is not None:
-            score = None
-            if isinstance(j.fit_summary, dict):
-                raw = j.fit_summary.get("score")
-                if isinstance(raw, (int, float)):
-                    score = int(raw)
-            if score is None or score < min_fit_score:
-                continue
-        if only_known_ats:
-            ats = await _detect_ats(j.source_url or "")
-            if not ats:
-                continue
-        out.append(j)
-        if len(out) >= limit:
-            break
-
-    # Sort by best fit-score desc so the top-N picks are highest quality.
-    def _score_key(j: TrackedJob) -> int:
-        if isinstance(j.fit_summary, dict):
-            raw = j.fit_summary.get("score")
-            if isinstance(raw, (int, float)):
-                return int(raw)
-        return 0
-
-    out.sort(key=_score_key, reverse=True)
-    return out[:limit]
+    return list((await db.execute(stmt)).scalars().all())
 
 
 async def _enqueue_apply_run(
@@ -236,13 +205,7 @@ async def _tick_user(
         settings.last_run_at = now
         return 0
 
-    candidates = await _candidate_jobs(
-        db,
-        user_id,
-        min_fit_score=settings.min_fit_score,
-        only_known_ats=bool(settings.only_known_ats),
-        limit=remaining,
-    )
+    candidates = await _candidate_jobs(db, user_id, limit=remaining)
 
     spawned = 0
     for job in candidates:
@@ -250,11 +213,10 @@ async def _tick_user(
         if rid is not None:
             spawned += 1
     settings.last_run_at = now
-    if spawned:
-        log.info(
-            "auto-apply: spawned %d run(s) for user_id=%s (cap=%d, used_today=%d)",
-            spawned, user_id, settings.daily_cap, used,
-        )
+    log.info(
+        "auto-apply tick user=%s: spawned=%d candidates=%d remaining=%d used_today=%d",
+        user_id, spawned, len(candidates), remaining, used,
+    )
     return spawned
 
 

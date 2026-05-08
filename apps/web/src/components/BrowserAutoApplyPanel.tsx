@@ -19,6 +19,8 @@ const HEARTBEAT_INTERVAL_MS = 10_000;
 type Settings = {
   enabled: boolean;
   daily_cap: number;
+  // Server still accepts these but the UI no longer touches them —
+  // the only filter that matters is TrackedJob.status === "interested".
   min_fit_score: number | null;
   only_known_ats: boolean;
   pause_start_hour: number | null;
@@ -40,6 +42,7 @@ type Preview = {
   settings: Settings;
   used_today: number;
   remaining_today: number;
+  in_flight: number;
   candidates: PreviewJob[];
 };
 
@@ -146,7 +149,9 @@ export function BrowserAutoApplyPanel() {
 
   useEffect(() => {
     refresh();
-    const t = setInterval(refresh, 30_000);
+    // Poll fairly aggressively so the user sees in_flight / candidates
+    // counts move within a few seconds of spawning runs.
+    const t = setInterval(refresh, 5_000);
     return () => clearInterval(t);
   }, []);
 
@@ -213,13 +218,7 @@ export function BrowserAutoApplyPanel() {
   }
 
   const s = preview?.settings;
-  const dirty =
-    s !== undefined &&
-    (draft.daily_cap !== s.daily_cap ||
-      draft.min_fit_score !== s.min_fit_score ||
-      draft.only_known_ats !== s.only_known_ats ||
-      draft.pause_start_hour !== s.pause_start_hour ||
-      draft.pause_end_hour !== s.pause_end_hour);
+  const dirty = s !== undefined && draft.daily_cap !== s.daily_cap;
 
   return (
     <div className="jsp-card p-3 mb-3">
@@ -268,8 +267,15 @@ export function BrowserAutoApplyPanel() {
           <span className="text-corp-text"> {s?.daily_cap}</span> cap
         </span>
         <span>
-          Min fit-score:{" "}
-          <span className="text-corp-text">{s?.min_fit_score ?? "—"}</span>
+          In flight:{" "}
+          <span className="text-corp-text">{preview?.in_flight ?? 0}</span>
+        </span>
+        <span>
+          Eligible{" "}
+          <span className="text-corp-muted">(status=interested)</span>:{" "}
+          <span className="text-corp-text">
+            {preview?.candidates.length ?? 0}
+          </span>
         </span>
         <span>
           Last tick:{" "}
@@ -296,8 +302,8 @@ export function BrowserAutoApplyPanel() {
       {err ? <div className="text-[11px] text-corp-danger mt-2">{err}</div> : null}
 
       {policyOpen ? (
-        <div className="mt-3 border-t border-corp-border pt-3 grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
-          <Field label="Daily cap" hint="0 disables">
+        <div className="mt-3 border-t border-corp-border pt-3 flex flex-wrap items-end gap-3 text-xs">
+          <Field label="Daily cap" hint="Max submissions per UTC day. 0 disables.">
             <input
               type="number"
               min={0}
@@ -312,86 +318,29 @@ export function BrowserAutoApplyPanel() {
               className="jsp-input w-20"
             />
           </Field>
-          <Field label="Min fit-score" hint="0-100, blank = none">
-            <input
-              type="number"
-              min={0}
-              max={100}
-              value={draft.min_fit_score ?? ""}
-              onChange={(e) =>
-                setDraft({
-                  ...draft,
-                  min_fit_score:
-                    e.target.value === "" ? null : parseInt(e.target.value, 10),
-                })
-              }
-              className="jsp-input w-20"
-            />
-          </Field>
-          <Field label="Pause from (UTC hour)" hint="0-23, blank = no pause">
-            <input
-              type="number"
-              min={0}
-              max={23}
-              value={draft.pause_start_hour ?? ""}
-              onChange={(e) =>
-                setDraft({
-                  ...draft,
-                  pause_start_hour:
-                    e.target.value === "" ? null : parseInt(e.target.value, 10),
-                })
-              }
-              className="jsp-input w-20"
-            />
-          </Field>
-          <Field label="Pause to (UTC hour)" hint="0-23">
-            <input
-              type="number"
-              min={0}
-              max={23}
-              value={draft.pause_end_hour ?? ""}
-              onChange={(e) =>
-                setDraft({
-                  ...draft,
-                  pause_end_hour:
-                    e.target.value === "" ? null : parseInt(e.target.value, 10),
-                })
-              }
-              className="jsp-input w-20"
-            />
-          </Field>
-
-          <label className="col-span-2 sm:col-span-3 flex items-center gap-2">
-            <input
-              type="checkbox"
-              checked={draft.only_known_ats}
-              onChange={(e) =>
-                setDraft({ ...draft, only_known_ats: e.target.checked })
-              }
-            />
-            <span>
-              Only auto-apply to known ATS hosts (greenhouse / lever / ashby)
-            </span>
-          </label>
-
-          <div className="col-span-2 sm:col-span-1 flex items-center gap-2 justify-end">
-            <button
-              type="button"
-              className="jsp-btn-ghost text-xs"
-              onClick={() => preview && setDraft(preview.settings)}
-              disabled={saving || !dirty}
-            >
-              Reset
-            </button>
-            <button
-              type="button"
-              className="jsp-btn text-xs"
-              onClick={() => save(draft)}
-              disabled={saving || !dirty}
-            >
-              {saving ? "Saving…" : "Save"}
-            </button>
+          <div className="text-corp-muted text-[11px] flex-1">
+            Auto-apply scans every TrackedJob with{" "}
+            <code className="text-corp-accent">status = &quot;interested&quot;</code>{" "}
+            and a non-empty source URL. No fit-score / ATS gating —
+            mark a job <i>interested</i> if and only if you want the agent
+            to attempt it.
           </div>
+          <button
+            type="button"
+            className="jsp-btn-ghost text-xs"
+            onClick={() => preview && setDraft(preview.settings)}
+            disabled={saving || !dirty}
+          >
+            Reset
+          </button>
+          <button
+            type="button"
+            className="jsp-btn text-xs"
+            onClick={() => save(draft)}
+            disabled={saving || !dirty}
+          >
+            {saving ? "Saving…" : "Save"}
+          </button>
         </div>
       ) : null}
 

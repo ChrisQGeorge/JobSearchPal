@@ -188,6 +188,7 @@ class PreviewOut(BaseModel):
     settings: AutoApplySettingsOut
     used_today: int
     remaining_today: int
+    in_flight: int
     candidates: list[PreviewJobOut]
 
 
@@ -197,8 +198,10 @@ async def preview(
     user: User = Depends(get_current_user),
 ) -> PreviewOut:
     """Show what the next tick would do without enqueueing anything."""
+    from app.models.applications import ApplicationRun
     from app.models.jobs import Organization
     from app.skills.apply_run import _detect_ats
+    from sqlalchemy import func as sa_func
 
     row = await _get_or_create(db, user.id)
     await db.commit()
@@ -209,11 +212,21 @@ async def preview(
     )
     remaining = max(0, int(row.daily_cap or 0) - used)
 
+    in_flight = int(
+        (
+            await db.execute(
+                select(sa_func.count(ApplicationRun.id)).where(
+                    ApplicationRun.user_id == user.id,
+                    ApplicationRun.state.in_(("queued", "running", "awaiting_user")),
+                )
+            )
+        ).scalar()
+        or 0
+    )
+
     candidates = await auto_apply_worker._candidate_jobs(
         db,
         user.id,
-        min_fit_score=row.min_fit_score,
-        only_known_ats=bool(row.only_known_ats),
         limit=max(remaining, 5),
     )
 
@@ -252,6 +265,7 @@ async def preview(
         settings=AutoApplySettingsOut.model_validate(row),
         used_today=used,
         remaining_today=remaining,
+        in_flight=in_flight,
         candidates=out_jobs,
     )
 
