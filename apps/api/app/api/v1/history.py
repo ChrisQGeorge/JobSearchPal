@@ -1384,15 +1384,58 @@ async def delete_contact(
 
 # ----- Timeline ---------------------------------------------------------------
 
+async def _list_in_own_session(model, user_id: int):
+    """Variant of _list_for_user that opens its own session, used so the
+    timeline endpoint can `asyncio.gather` 9 independent fetches in
+    parallel. SQLAlchemy AsyncSessions are not safe for concurrent use,
+    so each parallel task needs its own session bound to a free pool
+    connection."""
+    from app.core.database import SessionLocal
+
+    async with SessionLocal() as db:
+        return await _list_for_user(db, model, user_id)
+
+
 @router.get("/timeline", response_model=list[TimelineEvent])
 async def timeline(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> list[TimelineEvent]:
-    """Unified feed of every dated history event for the Career Timeline page."""
+    """Unified feed of every dated history event for the Career Timeline page.
+
+    Performance note: this used to run nine sequential SELECTs (work,
+    education, achievement, certification, project, publication,
+    presentation, volunteer, custom_event) on a single session, plus
+    several follow-up queries for course rows and project→org links.
+    On a typical timeline that's ~12 round-trips serially. The bulk
+    reads are now fanned out via asyncio.gather so latency drops to
+    roughly the slowest single query rather than the sum.
+    """
+    import asyncio
+
     events: list[TimelineEvent] = []
-    works = await _list_for_user(db, WorkExperience, user.id)
-    educations = await _list_for_user(db, Education, user.id)
+
+    (
+        works,
+        educations,
+        achievements,
+        certifications,
+        all_projects,
+        publications,
+        presentations,
+        volunteers,
+        custom_events,
+    ) = await asyncio.gather(
+        _list_in_own_session(WorkExperience, user.id),
+        _list_in_own_session(Education, user.id),
+        _list_in_own_session(Achievement, user.id),
+        _list_in_own_session(Certification, user.id),
+        _list_in_own_session(Project, user.id),
+        _list_in_own_session(Publication, user.id),
+        _list_in_own_session(Presentation, user.id),
+        _list_in_own_session(VolunteerWork, user.id),
+        _list_in_own_session(CustomEvent, user.id),
+    )
 
     # Pre-load referenced organization names so the timeline can show them as
     # subtitles without issuing N+1 queries.
@@ -1461,7 +1504,7 @@ async def timeline(
                 },
             )
         )
-    for a in await _list_for_user(db, Achievement, user.id):
+    for a in achievements:
         events.append(
             TimelineEvent(
                 kind="achievement",
@@ -1474,7 +1517,7 @@ async def timeline(
             )
         )
 
-    for c in await _list_for_user(db, Certification, user.id):
+    for c in certifications:
         events.append(
             TimelineEvent(
                 kind="certification",
@@ -1490,7 +1533,6 @@ async def timeline(
     # Resolve project → linked work/education → org, so By Org grouping can
     # place a project under the same company or school it's associated with
     # via entity_links rather than dumping it in "Unaffiliated".
-    all_projects = await _list_for_user(db, Project, user.id)
     project_effective_org: dict[int, str] = {}
     if all_projects:
         project_ids = [p.id for p in all_projects]
@@ -1579,7 +1621,7 @@ async def timeline(
             )
         )
 
-    for pub in await _list_for_user(db, Publication, user.id):
+    for pub in publications:
         events.append(
             TimelineEvent(
                 kind="publication",
@@ -1592,7 +1634,7 @@ async def timeline(
             )
         )
 
-    for pres in await _list_for_user(db, Presentation, user.id):
+    for pres in presentations:
         events.append(
             TimelineEvent(
                 kind="presentation",
@@ -1605,7 +1647,7 @@ async def timeline(
             )
         )
 
-    for v in await _list_for_user(db, VolunteerWork, user.id):
+    for v in volunteers:
         events.append(
             TimelineEvent(
                 kind="volunteer",
@@ -1665,7 +1707,7 @@ async def timeline(
             )
         )
 
-    for ev in await _list_for_user(db, CustomEvent, user.id):
+    for ev in custom_events:
         events.append(
             TimelineEvent(
                 kind="custom",

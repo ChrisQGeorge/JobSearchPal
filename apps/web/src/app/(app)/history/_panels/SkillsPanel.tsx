@@ -133,28 +133,33 @@ export function SkillsPanel() {
 
   async function refresh() {
     setLoading(true);
+    // The catalog is the primary content the user came here for.
+    // Render it as soon as it lands rather than waiting on the
+    // auxiliary audit endpoints (missing-from-jobs and stacks both
+    // scan every TrackedJob, so they're the slow part of this tab).
     try {
-      const missingUrl = auditAppliedOnly
-        ? "/api/v1/history/skills/missing-from-jobs?status_in=applied,interested,phone_screen,take_home,onsite,final_round,offer"
-        : "/api/v1/history/skills/missing-from-jobs";
-      const [skillData, missingData, stackData] = await Promise.all([
-        api.get<Skill[]>("/api/v1/history/skills"),
-        api
-          .get<MissingSkill[]>(missingUrl)
-          .catch(() => [] as MissingSkill[]),
-        api
-          .get<SkillStack[]>("/api/v1/history/skills/stacks?min_count=2&limit=12")
-          .catch(() => [] as SkillStack[]),
-      ]);
+      const skillData = await api.get<Skill[]>("/api/v1/history/skills");
       setItems(skillData);
-      setMissing(missingData);
-      setStacks(stackData);
       setErr(null);
     } catch (e) {
       setErr(e instanceof ApiError ? `HTTP ${e.status}` : "Load failed.");
     } finally {
       setLoading(false);
     }
+
+    // Audit data — fire in the background. Failures are non-fatal:
+    // the catalog still renders, the audit panels just stay empty.
+    const missingUrl = auditAppliedOnly
+      ? "/api/v1/history/skills/missing-from-jobs?status_in=applied,interested,phone_screen,take_home,onsite,final_round,offer"
+      : "/api/v1/history/skills/missing-from-jobs";
+    api
+      .get<MissingSkill[]>(missingUrl)
+      .then(setMissing)
+      .catch(() => setMissing([]));
+    api
+      .get<SkillStack[]>("/api/v1/history/skills/stacks?min_count=2&limit=12")
+      .then(setStacks)
+      .catch(() => setStacks([]));
   }
 
   useEffect(() => {

@@ -242,14 +242,23 @@ export function BrowserAutoApplyPanel() {
         </span>
         {s ? (
           <button
-            className={`jsp-btn-ghost text-xs ${
-              s.enabled
-                ? "border-corp-ok text-corp-ok"
-                : "border-corp-accent2 text-corp-accent2"
-            }`}
+            type="button"
+            role="switch"
+            aria-checked={s.enabled}
             onClick={toggle}
+            className={`inline-flex items-center gap-2 px-2 py-0.5 rounded-full border text-xs font-semibold uppercase tracking-wider transition-colors ${
+              s.enabled
+                ? "bg-corp-ok/20 border-corp-ok text-corp-ok"
+                : "bg-corp-surface2 border-corp-border text-corp-muted"
+            }`}
+            title="Click to toggle auto-apply on or off"
           >
-            {s.enabled ? "Enabled — click to disable" : "Disabled — click to enable"}
+            <span
+              className={`inline-block w-2.5 h-2.5 rounded-full ${
+                s.enabled ? "bg-corp-ok" : "bg-corp-muted"
+              }`}
+            />
+            {s.enabled ? "ON" : "OFF"}
           </button>
         ) : null}
         <button
