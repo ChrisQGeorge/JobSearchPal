@@ -6,55 +6,42 @@ milestones the project picked up along the way (R7 leads ingest, R8
 deterministic fit-score, R9 email ingest, R10/R11 browser-piped
 auto-apply).
 
-## R10 — Companion-driven browser automation (foundation)
+## R10 / R11 — Companion-driven browser + auto-apply
 
-**Shipped** ✅. Streamed Chromium service, CDP plumbing through the
-api container's cookie-auth, `apply_run` queue kind, full
-question-bank, application-run log, and the `/browser` /
-`/applications` / `/answers` pages all landed in the R10 build.
+**Status: parked.** The full R10/R11 work (streamed Chromium service,
+apply_run agent loop, ATS templates, auto-apply poller, /browser /
+/applications / /answers / /auto-apply pages, ask-user banner,
+server-side PDF render) was stripped from `main` because the
+constant polling on the panel + heartbeat + preview was visibly
+slowing the rest of the app. The full implementation is preserved
+on the `auto-apply-experiment` branch — `git checkout
+auto-apply-experiment` to get it back, then re-merge once it's
+re-architected to be cheaper at idle.
 
-The persistent profile volume is the moat — log into LinkedIn /
-Greenhouse SSO / Workday once and stay logged in for every subsequent
-application. See `done.md` for the line-item history.
+Migrations 0023 (browser_automation), 0024 (auto_apply_settings),
+and 0025 (auto_apply_heartbeat) remain applied on existing
+databases. The tables (application_run / application_run_step /
+question_answer / auto_apply_settings) are orphans now — harmless,
+and re-attaching to them is just restoring the matching model
+file + routers from the branch.
 
-## R11 — Auto-apply scope expansion
+What still needs design rework before bringing it back:
 
-**Shipped (initial cut):**
-
-- [x] **Generic agent loop** — DOM read → Claude action → click /
-  type / select / check / upload / screenshot → repeat. 50 action /
-  5 min wall-clock cap. Pauses to user on novel questions.
-- [x] **Greenhouse-aware template** — deterministic field-fill for
-  first/last/email/phone/location/linkedin/github/portfolio. Falls
-  through to the generic loop for everything else (custom
-  questions, EEO, demographics).
-- [x] **Server-side PDF render** — markdown-it-py → HTML →
-  `page.pdf()` via the chromium service. New
-  `POST /api/v1/documents/{id}/render-pdf` endpoint plus
-  `kind=upload` action that picks the most recent tailored doc
-  for the tracked job and attaches its PDF to a file input.
-- [x] **Auto-apply queue** — `auto_apply_settings` table per user,
-  background poller (5 min tick) that scans `interested` jobs and
-  fires `apply_run` rows respecting daily cap, fit-score floor,
-  pause window, and known-ATS-only mode. New `/auto-apply` page +
-  `/api/v1/auto-apply/{settings,preview,run-now,today}` endpoints.
-- [x] **Ask-user banner** — sticky top-of-page alert on every
-  `(app)` route that polls for `state=awaiting_user` runs and
-  fires desktop Web Notifications on rising-edge so the user gets
-  pinged when the tab isn't focused.
-- [x] **Re-application guard** — `apply_run` start refuses jobs
-  whose status is already past `to_review`.
-
-**Still open:**
-
-- [ ] **Lever-aware apply path** — same shape as Greenhouse.
-- [ ] **Ashby-aware apply path** — same shape.
-- [ ] **Workable-aware apply path** — same shape.
-- [ ] **Hard-coded Greenhouse smoke test** against one current
-  posting once an active job-search session has provided one.
-- [ ] **Cost cap per run** (default $1) so a runaway agent loop
-  can't drain credits / Pro budget. Pairs with the SRS spend-cap
-  carry-over.
+- [ ] **Cheaper idle path** — the panel polled /preview every 5s,
+  fired a /heartbeat every 10s, and the background poller every
+  5min. Even with no candidates the cumulative chatter slowed the
+  app. Make all of it event-driven or much less frequent at idle.
+- [ ] **Migration cleanup** — decide whether to drop the orphan
+  tables or keep them for restore. A 0026 migration could either
+  drop them or be a no-op marker.
+- [ ] **Lever / Ashby / Workable templates** — the shape is in the
+  branch (`apps/api/app/skills/apply_templates.py`).
+- [ ] **Hard-coded Greenhouse smoke test** against one live posting.
+- [ ] **Cost cap per run** (default $1).
+- [ ] **HTTPS proxy stays on main** — Caddy reverse-proxies the web
+  app on HTTPS_WEB_PORT with a self-signed cert generated at
+  container startup. web + api are bound to 127.0.0.1 by default
+  so the LAN can't reach plain HTTP.
 
 ## Carry-overs from earlier releases
 

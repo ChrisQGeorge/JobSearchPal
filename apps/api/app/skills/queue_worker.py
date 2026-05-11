@@ -1100,15 +1100,6 @@ async def _handle_org_research(item: JobFetchQueue) -> None:
         log.info("org_research task %d → enriched Organization %d", row.id, org_id)
 
 
-async def _handle_apply_run(item: JobFetchQueue) -> None:
-    """Companion-driven application run (R10). Thin wrapper that defers
-    to app/skills/apply_run.py so the heavy lifting stays out of the
-    queue dispatcher."""
-    from app.skills.apply_run import handle_apply_run
-
-    await handle_apply_run(item)
-
-
 # kind → handler. Extensible: add new kinds here.
 _HANDLERS = {
     "fetch": _handle_fetch,
@@ -1116,7 +1107,6 @@ _HANDLERS = {
     "tailor": _handle_tailor,
     "humanize": _handle_humanize,
     "org_research": _handle_org_research,
-    "apply_run": _handle_apply_run,
 }
 
 

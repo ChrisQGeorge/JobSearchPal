@@ -1,4 +1,3 @@
-import { AskUserBanner } from "@/components/AskUserBanner";
 import { CommandPalette } from "@/components/CommandPalette";
 import { CompanionDock } from "@/components/CompanionDock";
 import { Sidebar } from "@/components/Sidebar";
@@ -17,7 +16,6 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
         tabIndex={-1}
         className="flex-1 min-w-0 pt-10 md:pt-0"
       >
-        <AskUserBanner />
         {children}
       </main>
       <CompanionDock />

@@ -45,10 +45,10 @@ services:
       db:
         condition: service_healthy
     ports:
-      # Bound to loopback only by default so the LAN can't reach the
-      # api over plain HTTP — Caddy proxies it through HTTPS on 443.
-      # Set PUBLIC_API_BIND=0.0.0.0 in .env to expose on the LAN
-      # (dev only — bypasses TLS).
+      # Bound to loopback by default — Caddy reaches it through the
+      # internal docker network at api:8000, no host exposure needed.
+      # Override with PUBLIC_API_BIND=0.0.0.0 in .env for direct LAN
+      # access without TLS (dev only).
       - "${PUBLIC_API_BIND:-127.0.0.1}:${API_PORT}:8000"
     volumes:
       - ./skills:/app/skills:ro
@@ -59,10 +59,6 @@ services:
       # credentials into this volume.
       - claude_config:/root/.claude
       - uploads:/app/uploads
-    # api is bound to loopback only — Caddy reaches it over the
-    # internal docker network at api:8000, no host exposure needed.
-    # Override with PUBLIC_API_BIND=0.0.0.0 in .env for direct
-    # access from the LAN (dev only — bypasses HTTPS).
 
   web:
     build:
@@ -71,15 +67,11 @@ services:
       args:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
         NEXT_PUBLIC_API_PORT: ${NEXT_PUBLIC_API_PORT}
-        NEXT_PUBLIC_CHROMIUM_PORT: ${NEXT_PUBLIC_CHROMIUM_PORT:-6901}
-        NEXT_PUBLIC_HTTPS_CHROMIUM_PORT: ${HTTPS_CHROMIUM_PORT:-6443}
     container_name: jsp-web
     restart: unless-stopped
     environment:
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
       NEXT_PUBLIC_API_PORT: ${NEXT_PUBLIC_API_PORT}
-      NEXT_PUBLIC_CHROMIUM_PORT: ${NEXT_PUBLIC_CHROMIUM_PORT:-6901}
-      NEXT_PUBLIC_HTTPS_CHROMIUM_PORT: ${HTTPS_CHROMIUM_PORT:-6443}
       # Used by next.config.mjs rewrites to proxy /api/* and /health/* to the
       # api container over the internal Docker network. The api container
       # always listens on 8000 inside the network regardless of API_PORT (which
@@ -94,64 +86,11 @@ services:
       # direct LAN access without TLS (dev only).
       - "${PUBLIC_WEB_BIND:-127.0.0.1}:${WEB_PORT}:3000"
 
-  # R10 — streamed Chromium for Companion-driven application assistance.
-  # Both the user (via /browser → noVNC stream) and the Companion (via
-  # CDP / Playwright on port 9222) drive the same browser session.
-  # Persistent profile in `chromium_profile` volume keeps logins (LinkedIn,
-  # Greenhouse SSO, etc.) across restarts. Not exposed to the host
-  # network — both control planes are reverse-proxied through the api
-  # container's cookie auth so only the logged-in user can connect.
-  chromium:
-    build:
-      context: ./apps/chromium
-      dockerfile: Dockerfile
-    container_name: jsp-chromium
-    restart: unless-stopped
-    shm_size: "1gb"
-    environment:
-      PUID: "1000"
-      PGID: "1000"
-      TZ: "${TZ:-America/New_York}"
-      # CHROMIUM_VNC_PASSWORD gates the underlying VNC stream. The api
-      # proxy adds its own cookie-auth layer on top, so this is
-      # defense-in-depth rather than the only auth.
-      PASSWORD: "${CHROMIUM_VNC_PASSWORD:-jobsearchpal}"
-      CHROME_CLI: "--remote-debugging-port=9222 --remote-debugging-address=0.0.0.0"
-    volumes:
-      - chromium_profile:/config
-    # KasmVNC's web app is served on 3000 inside the container.
-    # Bound to loopback by default — Caddy proxies the iframe
-    # through HTTPS on port 6443. Set PUBLIC_CHROMIUM_BIND=0.0.0.0
-    # to expose directly on the LAN over plain HTTP (KasmVNC will
-    # error inside the iframe because secure-context APIs require
-    # HTTPS, so this is dev-only).
-    ports:
-      - "${PUBLIC_CHROMIUM_BIND:-127.0.0.1}:${CHROMIUM_PORT:-6901}:3000"
-
-  # Tiny sidecar that exposes chromium's CDP over the docker network.
-  # The linuxserver/chromium wrapper strips --remote-debugging-address
-  # so Chromium binds CDP to 127.0.0.1 only, which our api container
-  # can't reach. socat shares chromium's network namespace via
-  # network_mode: service:chromium and forwards 0.0.0.0:9223 → the
-  # localhost CDP port. The api container connects to `chromium:9223`.
-  chromium-cdp-proxy:
-    image: alpine/socat:latest
-    container_name: jsp-chromium-cdp-proxy
-    restart: unless-stopped
-    network_mode: "service:chromium"
-    depends_on:
-      - chromium
-    command: ["TCP-LISTEN:9223,fork,reuseaddr", "TCP:127.0.0.1:9222"]
-
-  # HTTPS reverse proxy. Required for remote-host deployments because
-  # modern browsers refuse clipboard / WebRTC / secure-context APIs
-  # over plain HTTP to non-localhost origins (which breaks KasmVNC's
-  # streamed browser inside the /browser iframe). Caddy terminates
-  # TLS for the web app on :443 and the streamed Chromium on :6443
-  # using a self-signed cert generated at container startup by
-  # apps/caddy/entrypoint.sh — no on-demand cert pipeline, no
-  # external dependencies, no chance of a TLS handshake failing
-  # because the api container hasn't booted yet.
+  # HTTPS reverse proxy. The web app on the LAN is only reachable
+  # through here on HTTPS_WEB_PORT (default 443). Caddy terminates
+  # TLS using a self-signed cert generated at container startup by
+  # apps/caddy/entrypoint.sh — no on-demand pipeline, no external
+  # cert authority dependency.
   caddy:
     build:
       context: ./apps/caddy
@@ -160,30 +99,24 @@ services:
     restart: unless-stopped
     environment:
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@local}
-      # Hostname baked into the cert's CN + first SAN. Users on LAN
-      # deployments typically leave this default and add their
-      # server's IP / public hostname to CADDY_EXTRA_SANS instead.
+      # Hostname baked into the cert's CN + first SAN.
       CADDY_HOSTNAME: ${CADDY_HOSTNAME:-jobsearchpal.local}
       # Comma-separated extra SANs in OpenSSL's `DNS:foo,IP:1.2.3.4`
-      # shape. Set this to your remote server's public IP / hostname
-      # for a clean lock icon — without it the browser will warn
-      # about cert mismatch even after you trust the cert once.
+      # shape. Set this to your server's public IP / hostname for a
+      # clean lock icon.
       CADDY_EXTRA_SANS: ${CADDY_EXTRA_SANS:-}
     ports:
       - "${HTTPS_WEB_PORT:-443}:443"
-      - "${HTTPS_CHROMIUM_PORT:-6443}:6443"
     volumes:
       - ./apps/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
       - web
-      - chromium
 
 volumes:
   db_data:
   uploads:
   claude_config:
-  chromium_profile:
   caddy_data:
   caddy_config:

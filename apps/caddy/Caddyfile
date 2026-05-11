@@ -1,45 +1,31 @@
-# Job Search Pal — HTTPS reverse proxy.
+# Job Search Pal — HTTPS reverse proxy for the web app.
 #
-# Two TLS-terminated listeners using a self-signed cert generated at
-# container startup by entrypoint.sh and stored in the caddy_data
-# volume. SAN entries cover localhost / *.local / *.lan / the
+# Listens on :443, terminates TLS using a self-signed cert generated
+# at container startup by entrypoint.sh (stored in the caddy_data
+# volume). SAN entries cover localhost / *.local / *.lan / the
 # CADDY_HOSTNAME env var. Add your server's public IP / hostname to
 # CADDY_EXTRA_SANS in .env (e.g. `IP:203.0.113.5,DNS:my.public.com`)
 # to get a clean lock without warnings.
 #
-#   :443  → web container (port 3000). Next.js's built-in rewrites
-#           still forward /api/* and /health/* to the api container,
-#           so this is one hostname for everything user-facing.
-#
-#   :6443 → chromium container (port 3000). KasmVNC uses absolute
-#           paths from / for its assets and websocket endpoints, so
-#           it can't sit behind a path prefix on the same host. The
-#           streamed-browser iframe inside /browser hits this port
-#           directly.
+# Next.js handles /api/* and /health/* via its own rewrites
+# pointing at api:8000, so this proxy only needs to know about the
+# web container.
 #
 # To use a real domain + Let's Encrypt instead of self-signed:
 #   1. Set CADDY_HOSTNAME in .env to your public hostname
-#   2. Replace the `tls /data/...` lines with `tls {$ADMIN_EMAIL}`
+#   2. Replace the `tls /data/...` line with `tls {$ADMIN_EMAIL}`
 #   3. Make sure ports 80 + 443 are reachable from the internet
 #   4. Delete the volumes/jsp-tls dir to drop the self-signed cert
 
 {
-	# Disable Caddy's "you should set an admin email" warning when the
-	# user hasn't set one yet.
 	email {$ADMIN_EMAIL:admin@local}
-	# Bind admin endpoint to localhost only inside the container — we
-	# don't expose it on the host.
 	admin off
-	# We bring our own TLS cert via the entrypoint script — disable
-	# Caddy's automatic HTTPS (which would otherwise try to provision
-	# certs from LE / internal CA on every hostname it sees, and add
-	# HTTP→HTTPS redirects we don't want).
+	# Bring our own TLS cert via the entrypoint script — disable
+	# Caddy's automatic HTTPS so it doesn't try to provision certs
+	# from LE / internal CA on every hostname it sees.
 	auto_https off
 }
 
-# --- Main app + API --------------------------------------------------------
-# `https://` prefix forces HTTPS on the listen port even with
-# auto_https off, so the static cert below actually gets used.
 https://:443 {
 	bind 0.0.0.0
 	tls /data/jsp-tls/cert.pem /data/jsp-tls/key.pem
@@ -49,24 +35,9 @@ https://:443 {
 		max_size 50MB
 	}
 
-	# Pass everything to the web container. Next.js handles /api/*
-	# and /health/* via its own rewrites pointing at api:8000.
 	reverse_proxy web:3000 {
 		# Keep websocket + SSE upgrades transparent for the
-		# Companion's queue stream and the browser-take-over flow.
+		# Companion's queue stream.
 		flush_interval -1
-	}
-}
-
-# --- Streamed Chromium (KasmVNC) on a separate port ------------------------
-https://:6443 {
-	bind 0.0.0.0
-	tls /data/jsp-tls/cert.pem /data/jsp-tls/key.pem
-
-	reverse_proxy chromium:3000 {
-		flush_interval -1
-		transport http {
-			read_buffer 64KB
-		}
 	}
 }
