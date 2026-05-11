@@ -17,7 +17,6 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { BrowserAutoApplyPanel } from "@/components/BrowserAutoApplyPanel";
 import { PageShell } from "@/components/PageShell";
 import { api, ApiError } from "@/lib/api";
 
@@ -138,8 +137,6 @@ export default function BrowserPage() {
       {err ? (
         <div className="jsp-card p-4 text-sm text-corp-danger mb-3">{err}</div>
       ) : null}
-
-      <BrowserAutoApplyPanel />
 
       {info && !reachable ? (
         <div className="jsp-card p-4 text-sm text-corp-accent2 mb-3 space-y-1">

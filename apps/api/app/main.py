@@ -11,7 +11,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.v1 import api_credentials as api_credentials_router
 from app.api.v1 import auth as auth_router
 from app.api.v1 import auth_claude as auth_claude_router
-from app.api.v1 import auto_apply as auto_apply_router
 from app.api.v1 import browser as browser_router
 from app.api.v1 import companion as companion_router
 from app.api.v1 import cover_letter_library as cover_letter_library_router
@@ -29,7 +28,6 @@ from app.api.v1 import resume_ingest as resume_ingest_router
 from app.api.v1 import sources as sources_router
 from app.core.config import settings
 from app.skills.queue_worker import run_forever as run_queue_worker
-from app.skills.auto_apply import run_forever as run_auto_apply_poller
 from app.sources.poller import run_forever as run_source_poller
 
 log = logging.getLogger(__name__)
@@ -41,18 +39,13 @@ async def lifespan(app: FastAPI):
     # container — if we ever scale out we'll need real coordination.
     task = asyncio.create_task(run_queue_worker(), name="job-fetch-queue")
     poller_task = asyncio.create_task(run_source_poller(), name="source-poller")
-    auto_apply_task = asyncio.create_task(
-        run_auto_apply_poller(), name="auto-apply-poller"
-    )
-    log.info(
-        "Started job-fetch-queue + source-poller + auto-apply-poller background workers"
-    )
+    log.info("Started job-fetch-queue + source-poller background workers")
     try:
         yield
     finally:
-        for t in (task, poller_task, auto_apply_task):
+        for t in (task, poller_task):
             t.cancel()
-        for t in (task, poller_task, auto_apply_task):
+        for t in (task, poller_task):
             try:
                 await t
             except (asyncio.CancelledError, Exception):
@@ -153,6 +146,5 @@ app.include_router(resume_ingest_router.router, prefix="/api/v1")
 app.include_router(companion_router.router, prefix="/api/v1")
 app.include_router(cover_letter_library_router.router, prefix="/api/v1")
 app.include_router(email_ingest_router.router, prefix="/api/v1")
-app.include_router(auto_apply_router.router, prefix="/api/v1")
 sources_router.register(app)
 browser_router.register(app)
