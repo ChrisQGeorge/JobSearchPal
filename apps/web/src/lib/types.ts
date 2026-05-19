@@ -419,6 +419,12 @@ export type GeneratedDocument = {
 export type JdAnalysis = {
   fit_score?: number | null;
   fit_summary?: string | null;
+  recommendation?: string | null; // "go" | "no-go" | "maybe"
+  pros?: string[] | null;
+  cons?: string[] | null;
+  // Legacy fields from the pre-slim prompt — kept so rows analyzed
+  // under the old schema still render. The UI falls back to these
+  // when pros/cons aren't present on the row.
   strengths?: string[] | null;
   gaps?: string[] | null;
   red_flags?: string[] | null;

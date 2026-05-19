@@ -1272,42 +1272,33 @@ async def download_artifact_file(
 
 # --- JD analyzer -----------------------------------------------------------
 
-_JD_ANALYZE_PROMPT = """You are analyzing a job description for a candidate to decide
-whether to apply, and what to emphasize if they do. The user already has this
-posting saved — your job is to produce a structured analysis object.
+_JD_ANALYZE_PROMPT = """You are deciding whether a candidate should apply to this
+job, and producing a short triage card the user can read in under 30 seconds.
 
-Before analyzing, you may curl the user's profile data to tailor the fit
-assessment. The base URL and bearer token for the user's own data are in
-environment variables JSP_API_BASE_URL and JSP_API_TOKEN. Useful endpoints:
+Pull the user's profile data first to ground the fit assessment. Base URL and
+bearer token are in env vars JSP_API_BASE_URL and JSP_API_TOKEN. Useful:
 
-  GET  $JSP_API_BASE_URL/api/v1/history/skills
-  GET  $JSP_API_BASE_URL/api/v1/history/work
-  GET  $JSP_API_BASE_URL/api/v1/history/education
-  GET  $JSP_API_BASE_URL/api/v1/preferences/job         ← includes preferred_locations + remote policy
-  GET  $JSP_API_BASE_URL/api/v1/preferences/authorization  ← current_location_city/region + visa
+  GET $JSP_API_BASE_URL/api/v1/history/skills
+  GET $JSP_API_BASE_URL/api/v1/history/work
+  GET $JSP_API_BASE_URL/api/v1/preferences/job          ← preferred_locations, remote policy
+  GET $JSP_API_BASE_URL/api/v1/preferences/authorization ← location + visa
 
-Fetch them with:
+Fetch with:
 
-  curl -sS -H "Authorization: Bearer $JSP_API_TOKEN" \\
-       "$JSP_API_BASE_URL/api/v1/history/skills"
+  curl -sS -H "Authorization: Bearer $JSP_API_TOKEN" "$JSP_API_BASE_URL/..."
 
-Keep the lookups light — two or three calls is enough.
+Two or three calls max. When scoring location, compare the posting's
+`location` to `preferred_locations` (each entry `{{name, max_distance_miles}}`)
+and to `remote_policies_acceptable`. Onsite outside every preferred radius
+with `willing_to_relocate=false` is a hard con.
 
-When scoring location fit, check the posting's `location` against the user's
-`preferred_locations` list. Each preferred_locations entry is
-`{{name, max_distance_miles}}` — if the posting is within that radius (or the
-posting is remote-friendly and `remote_policies_acceptable` includes the
-posting's remote_policy), count it as a green flag; if the posting is onsite
-and outside every preferred radius, surface it as a red_flag unless the
-user's `willing_to_relocate` is true.
-
-Here is the job description (verbatim from the posting):
+Job description:
 
 ---
 {job_description}
 ---
 
-And here is the structured metadata already extracted from the posting:
+Posting metadata:
 
   title: {title}
   organization: {organization}
@@ -1322,30 +1313,38 @@ And here is the structured metadata already extracted from the posting:
   required_skills: {required_skills}
   nice_to_have_skills: {nice_to_have_skills}
 
-Return ONE single JSON object, no prose and no markdown fences, with this schema:
+Return ONE single JSON object, no prose and no markdown fences:
 
 {{
-  "fit_score": number,              // 0-100, rough match against user's skills/experience
-  "fit_summary": string,            // 1-2 sentence plain summary of fit
-  "strengths": string[],            // concrete things the user should emphasize
-  "gaps": string[],                 // honest skill/experience gaps vs the JD
-  "red_flags": string[],            // JD-side concerns: vague scope, toxic signals, comp mismatch, etc.
-  "green_flags": string[],          // JD-side positives: clear rubric, strong comp, remote, etc.
-  "interview_focus_areas": string[],// topics to prep for, based on the JD
-  "suggested_questions": string[],  // questions the user should ask THEM
-  "resume_emphasis": string[],      // bullets / projects from history to foreground on a tailored resume
-  "cover_letter_hook": string       // one-paragraph opening hook for a cover letter
+  "fit_score": number,         // 0-100, rough match against the user's skills + preferences
+  "recommendation": string,    // "go" | "no-go" | "maybe" — your single verdict
+  "fit_summary": string,       // ONE paragraph, ~60-90 words. Concrete: name the skill match,
+                               //   the dealbreaker if any, the comp / location fit.
+  "pros": string[],            // 3-6 concrete reasons to apply. Specific > generic.
+  "cons": string[]             // 3-6 reasons NOT to apply — INCLUDE both red flags
+                               //   (JD-side concerns: vague scope, comp mismatch, toxic
+                               //   signals) AND resume gaps (skills the user lacks vs JD).
+                               //   Tag with prefix when ambiguous, e.g. "[gap] no AWS depth"
+                               //   or "[red flag] comp band undisclosed".
 }}
 
-All array fields should have at most 6 items. Prefer concrete examples over
-generalities ("Python async with FastAPI" > "backend skills"). If any field
-genuinely does not apply, return an empty array or a short "n/a" string.
+HARD CAP: total output ≤ 250 words across all fields. Be concrete and
+specific — "Python async with FastAPI" beats "backend skills".
 """
 
 
 class JdAnalysis(BaseModel):
+    """Slim triage card. New analyses populate fit_score / recommendation /
+    fit_summary / pros / cons. The legacy fields below stay nullable so
+    rows scored under the older verbose prompt still deserialize cleanly
+    and the UI can fall back to them when pros/cons aren't present."""
+
     fit_score: Optional[int] = None
     fit_summary: Optional[str] = None
+    recommendation: Optional[str] = None  # "go" | "no-go" | "maybe"
+    pros: Optional[list[str]] = None
+    cons: Optional[list[str]] = None
+    # --- legacy (pre-slim) fields, retained for back-compat reads ---
     strengths: Optional[list[str]] = None
     gaps: Optional[list[str]] = None
     red_flags: Optional[list[str]] = None

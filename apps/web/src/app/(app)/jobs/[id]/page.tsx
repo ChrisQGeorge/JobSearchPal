@@ -2944,12 +2944,15 @@ function JdAnalysisPanel({
               {expanded ? "(hide)" : "(show)"}
             </span>
           </button>
+          {analysis.recommendation ? (
+            <RecommendationBadge value={analysis.recommendation} />
+          ) : null}
           {analysis.fit_summary ? (
             <p className="text-sm mt-1">{analysis.fit_summary}</p>
           ) : null}
           {/* The numeric fit-score is now computed deterministically and
-              shown in the Fit-score panel below. JD Analysis is purely
-              qualitative — strengths, gaps, red/green flags, prep focus. */}
+              shown in the Fit-score panel below. JD Analysis is the
+              qualitative triage card — paragraph + pros + cons. */}
         </div>
         <div className="flex flex-col items-end gap-2">
           <button className="jsp-btn-ghost text-xs" onClick={run} disabled={running}>
@@ -2959,45 +2962,60 @@ function JdAnalysisPanel({
       </div>
 
       {!expanded ? null : (
-      <div className="grid grid-cols-2 gap-4">
-        <BulletList label="Strengths" items={analysis.strengths} tone="good" />
-        <BulletList label="Gaps" items={analysis.gaps} tone="warn" />
-        <BulletList
-          label="Green flags (posting)"
-          items={analysis.green_flags}
-          tone="good"
-        />
-        <BulletList
-          label="Red flags (posting)"
-          items={analysis.red_flags}
-          tone="danger"
-        />
-        <BulletList
-          label="Interview focus"
-          items={analysis.interview_focus_areas}
-        />
-        <BulletList
-          label="Questions to ask"
-          items={analysis.suggested_questions}
-        />
-        <BulletList label="Resume emphasis" items={analysis.resume_emphasis} />
-        {analysis.cover_letter_hook ? (
-          <div>
-            <div className="text-[10px] uppercase tracking-wider text-corp-muted mb-1">
-              Cover letter hook
-            </div>
-            <p className="text-sm whitespace-pre-wrap">
-              {analysis.cover_letter_hook}
-            </p>
-          </div>
-        ) : null}
-      </div>
+        <JdAnalysisBody analysis={analysis} />
       )}
 
       {err ? <div className="text-xs text-corp-danger">{err}</div> : null}
     </div>
   );
 }
+
+function RecommendationBadge({ value }: { value: string }) {
+  const v = value.toLowerCase().trim();
+  const isGo = v === "go" || v === "yes" || v === "apply";
+  const isNoGo = v === "no-go" || v === "nogo" || v === "no" || v === "skip";
+  const tone = isGo
+    ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
+    : isNoGo
+      ? "bg-corp-danger/20 text-corp-danger border-corp-danger/40"
+      : "bg-corp-accent/20 text-corp-accent border-corp-accent/40";
+  const label = isGo ? "GO" : isNoGo ? "NO-GO" : value.toUpperCase();
+  return (
+    <span
+      className={`inline-block px-2 py-0.5 rounded-full text-[11px] font-semibold uppercase tracking-wider border mt-1 mr-2 ${tone}`}
+      title="The Companion's single-verdict recommendation."
+    >
+      {label}
+    </span>
+  );
+}
+
+function JdAnalysisBody({ analysis }: { analysis: JdAnalysis }) {
+  // Prefer the slim-prompt fields (pros / cons). Fall back to the
+  // pre-slim shape (strengths + gaps + red_flags) for rows analyzed
+  // under the old verbose prompt so re-analyzing isn't required to
+  // see anything useful.
+  const pros = analysis.pros ?? analysis.strengths ?? null;
+  const cons = analysis.cons ??
+    ([...(analysis.red_flags ?? []), ...(analysis.gaps ?? [])].length > 0
+      ? [...(analysis.red_flags ?? []), ...(analysis.gaps ?? [])]
+      : null);
+  if (!pros && !cons) {
+    return (
+      <p className="text-xs text-corp-muted">
+        No structured pros / cons captured — re-analyze for the new short
+        format.
+      </p>
+    );
+  }
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <BulletList label="Pros" items={pros} tone="good" />
+      <BulletList label="Cons" items={cons} tone="warn" />
+    </div>
+  );
+}
+
 
 function BulletList({
   label,
