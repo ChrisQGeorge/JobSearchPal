@@ -125,41 +125,8 @@ _JSON_OBJECT_RE = re.compile(r"\{[\s\S]*\}", re.MULTILINE)
 
 def _extract_json_object(text: str) -> Optional[dict]:
     """Robust JSON-object extractor — see jobs._extract_json_object."""
-    text = text.strip()
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-    if text.startswith("```"):
-        inner = "\n".join(text.splitlines()[1:])
-        if inner.rstrip().endswith("```"):
-            inner = inner.rsplit("```", 1)[0]
-        try:
-            parsed = json.loads(inner)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-
-    decoder = json.JSONDecoder()
-    best: Optional[dict] = None
-    best_len = -1
-    i = 0
-    while True:
-        i = text.find("{", i)
-        if i < 0:
-            break
-        try:
-            obj, end = decoder.raw_decode(text, i)
-            if isinstance(obj, dict) and (end - i) > best_len:
-                best = obj
-                best_len = end - i
-            i = end
-        except json.JSONDecodeError:
-            i += 1
-    return best
+    from app.api.v1.jobs import _extract_json_object as _impl
+    return _impl(text)
 
 
 async def _get_owned_job(

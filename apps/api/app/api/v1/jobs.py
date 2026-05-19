@@ -1784,6 +1784,24 @@ Schema:
 _JSON_OBJECT_RE = re.compile(r"\{[\s\S]*\}", re.MULTILINE)
 
 
+def _repair_claude_json(text: str) -> str:
+    r"""Fix common Claude-isms that produce technically-invalid JSON:
+
+      - `\'` inside strings: Python escapes single quotes, JSON forbids
+        the escape. Replace with bare `'`.
+      - Smart quotes “ ” ‘ ’ around string delimiters: replace with
+        their ASCII equivalents.
+
+    Cheap to apply unconditionally, so we run it on every fallback
+    attempt instead of trying to detect when it's needed."""
+    return (
+        text
+        .replace("\\'", "'")
+        .replace("“", '"').replace("”", '"')
+        .replace("‘", "'").replace("’", "'")
+    )
+
+
 def _extract_json_object(text: str) -> Optional[dict]:
     """Try hard to pull a JSON object out of Claude's textual output.
 
@@ -1792,49 +1810,57 @@ def _extract_json_object(text: str) -> Optional[dict]:
     last `}` swallows unrelated braces and fails to parse. Instead we
     walk every `{` position and try `raw_decode`, which parses the FIRST
     valid JSON object starting at that position and tells us where it
-    ends. The deepest / longest match wins so we don't accidentally
-    accept a brace inside a prose interpolation."""
-    text = text.strip()
-    # Fast path: the entire text is one JSON object.
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-    # Markdown-fenced JSON (```json ... ``` or just ``` ... ```).
-    if text.startswith("```"):
-        inner = "\n".join(text.splitlines()[1:])
-        if inner.rstrip().endswith("```"):
-            inner = inner.rsplit("```", 1)[0]
+    ends. The longest successful match wins. We also run the text
+    through `_repair_claude_json` to fix Python-style `\\'` escapes
+    and smart-quotes that Claude sometimes emits."""
+    raw = text.strip()
+    candidates = [raw]
+    repaired = _repair_claude_json(raw)
+    if repaired != raw:
+        candidates.append(repaired)
+
+    for candidate in candidates:
+        # Fast path: the entire candidate is one JSON object.
         try:
-            parsed = json.loads(inner)
+            parsed = json.loads(candidate)
             if isinstance(parsed, dict):
                 return parsed
         except json.JSONDecodeError:
             pass
+        # Markdown-fenced JSON (```json ... ``` or just ``` ... ```).
+        if candidate.startswith("```"):
+            inner = "\n".join(candidate.splitlines()[1:])
+            if inner.rstrip().endswith("```"):
+                inner = inner.rsplit("```", 1)[0]
+            try:
+                parsed = json.loads(inner)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
 
-    # Robust path: walk every `{` position and ask the json decoder to
-    # parse from there. Whichever yields the LONGEST valid object wins
-    # (the analysis JSON is always bigger than any incidental braces
-    # in narration).
-    decoder = json.JSONDecoder()
-    best: Optional[dict] = None
-    best_len = -1
-    i = 0
-    while True:
-        i = text.find("{", i)
-        if i < 0:
-            break
-        try:
-            obj, end = decoder.raw_decode(text, i)
-            if isinstance(obj, dict) and (end - i) > best_len:
-                best = obj
-                best_len = end - i
-            i = end
-        except json.JSONDecodeError:
-            i += 1
-    return best
+        # Robust path: walk every `{` position and ask the json decoder
+        # to parse from there. The longest valid object wins so an
+        # incidental brace in narration loses to the actual analysis.
+        decoder = json.JSONDecoder()
+        best: Optional[dict] = None
+        best_len = -1
+        i = 0
+        while True:
+            i = candidate.find("{", i)
+            if i < 0:
+                break
+            try:
+                obj, end = decoder.raw_decode(candidate, i)
+                if isinstance(obj, dict) and (end - i) > best_len:
+                    best = obj
+                    best_len = end - i
+                i = end
+            except json.JSONDecodeError:
+                i += 1
+        if best is not None:
+            return best
+    return None
 
 
 _PAGE_TEXT_BUDGET = 60_000  # chars sent to Claude in the parse step.
