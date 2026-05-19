@@ -344,19 +344,14 @@ async def _enqueue_followups(
     *,
     label_prefix: str = "",
 ) -> None:
-    """After a fetch lands a TrackedJob, queue (1) JD analysis +
-    (2) company research so the user doesn't have to click those
-    manually. Both are best-effort: if no description / no org, we
-    skip silently. Caller is responsible for the surrounding commit.
+    """After a fetch lands a TrackedJob, queue the JD-score Companion
+    task. The heavier follow-ups (company research + application prep)
+    are deferred — they only fire when the user moves the row to
+    `interested` (see `enqueue_interested_followups` below), so they
+    don't run on every fetched row the user might just want to triage
+    and discard. Caller is responsible for the surrounding commit."""
+    from app.models.jobs import JobFetchQueue
 
-    Idempotent-ish: skips org_research when the org already has
-    description + industry filled in (a previous research pass
-    already covered it)."""
-    from app.models.jobs import JobFetchQueue, Organization
-    from sqlalchemy import select
-
-    # JD-analyze (kind=score) — only when there's a description for
-    # the analyzer to actually read.
     if tj.job_description and tj.job_description.strip():
         db.add(
             JobFetchQueue(
@@ -369,9 +364,31 @@ async def _enqueue_followups(
             )
         )
 
-    # org_research — only when the org exists AND is missing the
-    # main enrichment fields. Repeated fetches of jobs at the same
-    # well-known company shouldn't re-research it every time.
+
+async def enqueue_interested_followups(
+    db: "AsyncSession",
+    tj: "TrackedJob",
+    *,
+    label_prefix: str = "",
+    force_prep: bool = False,
+) -> None:
+    """Fired when a TrackedJob moves to `interested`. Queues:
+
+      - org_research — only when the org isn't already enriched
+        (description + industry filled).
+      - prep — generates resume_emphasis / cover_letter_hook /
+        interview_focus_areas hints. Only on the FIRST flip to
+        interested. The presence of an existing prep row (any state,
+        ever) suppresses re-queueing so the user toggling away and
+        back doesn't burn Claude budget. Pass `force_prep=True` to
+        bypass the guard — used by the explicit "Regenerate prep"
+        button on the job detail page.
+
+    Best-effort: missing org_id / missing description → skip the
+    respective task silently. Caller commits."""
+    from app.models.jobs import JobFetchQueue, Organization
+    from sqlalchemy import select
+
     if tj.organization_id:
         org = (
             await db.execute(
@@ -397,6 +414,35 @@ async def _enqueue_followups(
                         state="queued",
                     )
                 )
+
+    if tj.job_description and tj.job_description.strip():
+        # First-flip-only: never re-fire automatically. The user
+        # presses "Regenerate prep" if they want a fresh pass.
+        already = False
+        if not force_prep:
+            existing_rows = (
+                await db.execute(
+                    select(JobFetchQueue).where(
+                        JobFetchQueue.user_id == tj.user_id,
+                        JobFetchQueue.kind == "prep",
+                    )
+                )
+            ).scalars().all()
+            for r in existing_rows:
+                if isinstance(r.payload, dict) and r.payload.get("tracked_job_id") == tj.id:
+                    already = True
+                    break
+        if not already:
+            db.add(
+                JobFetchQueue(
+                    user_id=tj.user_id,
+                    kind="prep",
+                    label=f"{label_prefix}Prep → {tj.title[:80]}"[:512],
+                    url="",
+                    payload={"tracked_job_id": tj.id},
+                    state="queued",
+                )
+            )
 
 
 async def _handle_fetch(item: JobFetchQueue) -> None:
@@ -1160,6 +1206,130 @@ async def _handle_org_research(item: JobFetchQueue) -> None:
         log.info("org_research task %d → enriched Organization %d", row.id, org_id)
 
 
+async def _handle_prep(item: JobFetchQueue) -> None:
+    """Generate resume_emphasis / cover_letter_hook / interview_focus_areas
+    for a TrackedJob the user has flipped to `interested`. Merges the
+    result into job.jd_analysis so the slim triage card and the prep
+    hints share one storage location.
+
+    Like `_handle_score`, this is one-shot — bad inputs fail
+    permanently rather than burning 3 retries to reach the same
+    outcome. Rate-limit cooldowns still retry via _handle_rate_limit."""
+    from app.skills.runner import ClaudeCodeError
+    from app.skills import queue_bus
+
+    async with SessionLocal() as db:
+        row = (
+            await db.execute(select(JobFetchQueue).where(JobFetchQueue.id == item.id))
+        ).scalar_one_or_none()
+        if row is None:
+            return
+        payload = row.payload or {}
+        tracked_job_id = payload.get("tracked_job_id")
+        if not tracked_job_id:
+            await _fail(db, row, "prep task missing tracked_job_id", permanent=True)
+            return
+
+        job = (
+            await db.execute(
+                select(TrackedJob).where(
+                    TrackedJob.id == tracked_job_id,
+                    TrackedJob.user_id == row.user_id,
+                    TrackedJob.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if job is None:
+            await _fail(
+                db, row,
+                f"TrackedJob {tracked_job_id} not found",
+                permanent=True,
+            )
+            return
+        if not (job.job_description and job.job_description.strip()):
+            await _fail(db, row, "job has no description to prep against", permanent=True)
+            return
+
+        from app.api.v1.jobs import _build_jd_prep_prompt, _extract_json_object
+        from app.core.security import create_access_token
+
+        org_name: Optional[str] = None
+        if job.organization_id:
+            from app.models.jobs import Organization as _Org
+            org_row = (
+                await db.execute(
+                    select(_Org.name).where(_Org.id == job.organization_id)
+                )
+            ).first()
+            org_name = org_row[0] if org_row else None
+
+        prompt = _build_jd_prep_prompt(job, org_name)
+        api_token = create_access_token(
+            subject=str(row.user_id), extra={"purpose": "jd_prep"}
+        )
+
+        label = row.label or f"Prep: {job.title}"
+        try:
+            final_text = await queue_bus.run_claude_to_bus(
+                prompt=prompt,
+                source="jd_prep",
+                item_id=f"queue:{row.id}",
+                label=label,
+                allowed_tools=["Bash"],
+                extra_env={
+                    "JSP_API_BASE_URL": "http://localhost:8000",
+                    "JSP_API_TOKEN": api_token,
+                },
+                timeout_seconds=240,
+            )
+        except ClaudeCodeError as exc:
+            err = str(exc)
+            if _is_rate_limited(err):
+                await _handle_rate_limit(db, row, err)
+                return
+            await _fail(db, row, err, permanent=True)
+            return
+        except Exception as exc:  # pragma: no cover
+            await _fail(db, row, f"Unexpected error: {exc}", permanent=True)
+            log.exception("Prep task %d unhandled error", row.id)
+            return
+
+        data = _extract_json_object(final_text) or {}
+        if not data:
+            snippet = (final_text or "").strip()
+            if len(snippet) > 600:
+                snippet = snippet[:300] + " […] " + snippet[-300:]
+            await _fail(
+                db, row,
+                "Prep analyzer returned no parseable JSON. "
+                f"Raw Claude output (truncated): {snippet!r}",
+                permanent=True,
+            )
+            return
+
+        # Merge into job.jd_analysis so the slim triage card (paragraph
+        # / pros / cons) and these prep hints share one column.
+        prior = job.jd_analysis if isinstance(job.jd_analysis, dict) else {}
+        merged = dict(prior)
+        for key in ("resume_emphasis", "cover_letter_hook", "interview_focus_areas"):
+            if key in data:
+                merged[key] = data[key]
+        job.jd_analysis = merged
+
+        row.state = "done"
+        row.result = {"tracked_job_id": job.id, "merged_keys": list(data.keys())}
+        row.error_message = None
+        if isinstance(row.payload, dict) and "rate_limit_count" in row.payload:
+            new_payload = dict(row.payload)
+            new_payload.pop("rate_limit_count", None)
+            row.payload = new_payload or None
+        await db.commit()
+        log.info(
+            "Prep task %d → merged %s into TrackedJob %d",
+            row.id, list(data.keys()), job.id,
+        )
+
+
 # kind → handler. Extensible: add new kinds here.
 _HANDLERS = {
     "fetch": _handle_fetch,
@@ -1167,6 +1337,7 @@ _HANDLERS = {
     "tailor": _handle_tailor,
     "humanize": _handle_humanize,
     "org_research": _handle_org_research,
+    "prep": _handle_prep,
 }
 
 

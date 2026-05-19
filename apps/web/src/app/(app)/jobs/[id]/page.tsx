@@ -805,9 +805,33 @@ function OverviewTab({
     }
   }
 
+  // Company research + application prep cards are only useful once
+  // the user has decided to pursue the role. Pre-`interested`, they're
+  // empty cards that clutter the triage view. After: always relevant.
+  // `not_interested` and closed states render only when there's
+  // already content (history preservation), per the user's spec.
+  const POST_INTERESTED_STATUSES = new Set<JobStatus>([
+    "interested",
+    "applied",
+    "responded",
+    "screening",
+    "interviewing",
+    "assessment",
+    "offer",
+  ]);
+  const showInterestedExtras = POST_INTERESTED_STATUSES.has(job.status);
+  const analysisForPrep = (job.jd_analysis ?? null) as JdAnalysis | null;
+  const hasPrepContent = !!(
+    (analysisForPrep?.resume_emphasis &&
+      analysisForPrep.resume_emphasis.length > 0) ||
+    analysisForPrep?.cover_letter_hook ||
+    (analysisForPrep?.interview_focus_areas &&
+      analysisForPrep.interview_focus_areas.length > 0)
+  );
+
   return (
     <div className="space-y-4">
-      {job.organization_id ? (
+      {(showInterestedExtras || hasPrepContent) && job.organization_id ? (
         <CompanyResearchPanel
           organizationId={job.organization_id}
           organizationName={job.organization_name ?? null}
@@ -818,6 +842,9 @@ function OverviewTab({
         job={job}
         onAnalyzed={onSaved}
       />
+      {showInterestedExtras || hasPrepContent ? (
+        <PrepPanel job={job} onRegenerated={onSaved} />
+      ) : null}
       <FitScoreBreakdownPanel job={job} onRecomputed={onSaved} />
       <AutofillPanel jobId={job.id} />
       {(job.required_skills && job.required_skills.length > 0) ||
@@ -2703,6 +2730,134 @@ function FitScoreBreakdownPanel({
           </ul>
         )
       ) : null}
+    </div>
+  );
+}
+
+
+// ---------- Application prep panel (post-`interested` only) -----------------
+
+function PrepPanel({
+  job,
+  onRegenerated,
+}: {
+  job: TrackedJob;
+  onRegenerated: (j: TrackedJob) => void;
+}) {
+  const [running, setRunning] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<boolean>(() => {
+    if (typeof window === "undefined") return true;
+    const saved = window.localStorage.getItem("jsp:prep_panel:expanded");
+    return saved === null ? true : saved === "1";
+  });
+  function toggleExpanded() {
+    setExpanded((prev) => {
+      const next = !prev;
+      try {
+        window.localStorage.setItem(
+          "jsp:prep_panel:expanded",
+          next ? "1" : "0",
+        );
+      } catch {
+        /* non-fatal */
+      }
+      return next;
+    });
+  }
+
+  const analysis = (job.jd_analysis ?? null) as JdAnalysis | null;
+  const resumeEmphasis = analysis?.resume_emphasis ?? null;
+  const coverLetterHook = analysis?.cover_letter_hook ?? null;
+  const interviewFocus = analysis?.interview_focus_areas ?? null;
+  const hasContent = !!(
+    (resumeEmphasis && resumeEmphasis.length > 0) ||
+    coverLetterHook ||
+    (interviewFocus && interviewFocus.length > 0)
+  );
+
+  async function regenerate() {
+    setRunning(true);
+    setMsg(null);
+    setErr(null);
+    try {
+      const updated = await api.post<TrackedJob>(
+        `/api/v1/jobs/${job.id}/regenerate-prep`,
+        {},
+      );
+      onRegenerated(updated);
+      setMsg(
+        "Prep task re-queued. Refresh in ~30s to see the new content.",
+      );
+    } catch (e) {
+      setErr(
+        e instanceof ApiError ? `HTTP ${e.status}` : "Regenerate failed.",
+      );
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  return (
+    <div className="jsp-card p-5 space-y-3">
+      <div className="flex items-start justify-between gap-4">
+        <button
+          type="button"
+          onClick={toggleExpanded}
+          className="text-sm uppercase tracking-wider text-corp-muted hover:text-corp-text inline-flex items-baseline gap-1.5"
+        >
+          <span>Application prep</span>
+          <span className="text-[10px] normal-case tracking-normal text-corp-muted">
+            {expanded ? "(hide)" : "(show)"}
+          </span>
+        </button>
+        <button
+          type="button"
+          className="jsp-btn-ghost text-xs"
+          onClick={regenerate}
+          disabled={running}
+          title="Re-queue the Companion task that produces this prep material. Auto-runs once on the first flip to Interested; this button forces another pass."
+        >
+          {running ? "Queuing…" : hasContent ? "Regenerate" : "Generate"}
+        </button>
+      </div>
+
+      {msg ? <div className="text-[11px] text-corp-ok">{msg}</div> : null}
+      {err ? <div className="text-[11px] text-corp-danger">{err}</div> : null}
+
+      {!expanded ? null : !hasContent ? (
+        <p className="text-sm text-corp-muted">
+          No prep generated yet — the Companion runs this automatically on
+          the first flip to Interested. If you don&apos;t see anything
+          after a minute, hit the Queue page and check for an errored
+          prep task.
+        </p>
+      ) : (
+        <div className="space-y-4">
+          {resumeEmphasis && resumeEmphasis.length > 0 ? (
+            <BulletList
+              label="Resume emphasis"
+              items={resumeEmphasis}
+              tone="good"
+            />
+          ) : null}
+          {interviewFocus && interviewFocus.length > 0 ? (
+            <BulletList
+              label="Interview focus"
+              items={interviewFocus}
+            />
+          ) : null}
+          {coverLetterHook ? (
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-corp-muted mb-1">
+                Cover letter hook
+              </div>
+              <p className="text-sm whitespace-pre-wrap">{coverLetterHook}</p>
+            </div>
+          ) : null}
+        </div>
+      )}
     </div>
   );
 }

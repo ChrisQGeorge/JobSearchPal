@@ -500,6 +500,7 @@ async def update_job(
 
     # Auto-emit an ApplicationEvent on status transitions so the activity feed
     # has an audit trail without the user having to log anything by hand.
+    flipped_to_interested = False
     if "status" in data and data["status"] != prior_status:
         db.add(
             ApplicationEvent(
@@ -518,6 +519,7 @@ async def update_job(
             and job.date_closed is None
         ):
             job.date_closed = date.today()
+        flipped_to_interested = data["status"] == "interested"
 
     # Recompute deterministic fit_score on every update — the cost is a
     # few small selects, and stale scores were a regular foot-gun before.
@@ -532,6 +534,14 @@ async def update_job(
     if scoring_fields & set(data.keys()):
         result = await compute_fit_score(db, user, job)
         apply_fit_score_to_job(job, result)
+
+    # On the first flip to `interested`, queue follow-up Companion
+    # tasks (org_research if the org isn't enriched, prep if there's
+    # no existing prep row). These were previously fired on fetch but
+    # the user only really needs them once they decide to pursue.
+    if flipped_to_interested:
+        from app.skills.queue_worker import enqueue_interested_followups
+        await enqueue_interested_followups(db, job)
 
     await db.commit()
     await db.refresh(job)
@@ -1355,6 +1365,72 @@ class JdAnalysis(BaseModel):
     cover_letter_hook: Optional[str] = None
 
 
+_JD_PREP_PROMPT = """The candidate has decided to apply to this job. Produce
+the prep material they'll use to tailor a resume, hook a cover letter, and
+prepare for interviews. This runs once on the first flip to `interested`;
+the user has to press "Regenerate" to re-run, so be thorough.
+
+Pull the user's profile data first to ground the suggestions:
+
+  GET $JSP_API_BASE_URL/api/v1/history/skills
+  GET $JSP_API_BASE_URL/api/v1/history/work
+  GET $JSP_API_BASE_URL/api/v1/history/projects
+  GET $JSP_API_BASE_URL/api/v1/preferences/job
+
+Fetch with:
+
+  curl -sS -H "Authorization: Bearer $JSP_API_TOKEN" "$JSP_API_BASE_URL/..."
+
+Job description:
+
+---
+{job_description}
+---
+
+Posting metadata:
+
+  title: {title}
+  organization: {organization}
+  location: {location}
+  remote_policy: {remote_policy}
+  experience_level: {experience_level}
+  employment_type: {employment_type}
+  required_skills: {required_skills}
+  nice_to_have_skills: {nice_to_have_skills}
+
+Return ONE single JSON object, no prose, no markdown fences:
+
+{{
+  "resume_emphasis": string[],        // 4-6 specific bullets / projects from
+                                      //   the user's history to foreground.
+                                      //   Reference actual work / projects by
+                                      //   name when possible.
+  "cover_letter_hook": string,        // ONE paragraph opener (~60-90 words)
+                                      //   that connects the user's history to
+                                      //   this specific role.
+  "interview_focus_areas": string[]   // 4-6 topics the user should brush up on
+                                      //   ahead of an interview, given the JD.
+}}
+
+Concrete > generic. "Python async with FastAPI shown in TekTone ERP work"
+beats "backend skills." Total output ≤ 350 words.
+"""
+
+
+def _build_jd_prep_prompt(job: TrackedJob, org_name: Optional[str] = None) -> str:
+    return _JD_PREP_PROMPT.format(
+        job_description=job.job_description or "",
+        title=job.title or "(untitled)",
+        organization=org_name or "(unknown)",
+        location=job.location or "(unspecified)",
+        remote_policy=job.remote_policy or "(unspecified)",
+        experience_level=job.experience_level or "null",
+        employment_type=job.employment_type or "null",
+        required_skills=", ".join(job.required_skills or []) or "(none)",
+        nice_to_have_skills=", ".join(job.nice_to_have_skills or []) or "(none)",
+    )
+
+
 def _build_jd_analyze_prompt(job: TrackedJob, org_name: Optional[str] = None) -> str:
     """Assemble the JD-analyzer prompt from a TrackedJob. Shared by the
     foreground request-time call and the queue worker's score handler."""
@@ -1472,6 +1548,30 @@ async def analyze_jd(
     # which the deterministic scorer reads — recompute to reflect them.
     result = await compute_fit_score(db, user, job)
     apply_fit_score_to_job(job, result)
+    await db.commit()
+    await db.refresh(job)
+    return job
+
+
+@router.post("/{job_id:int}/regenerate-prep", response_model=TrackedJobOut)
+async def regenerate_prep(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> TrackedJob:
+    """Re-queue the prep Companion task for this job (resume_emphasis,
+    cover_letter_hook, interview_focus_areas). Used by the "Regenerate
+    prep" button on the job detail page. The prep task normally only
+    fires on the first flip to `interested`; this endpoint bypasses
+    the idempotency guard so the user can force a fresh pass."""
+    job = await _get_owned_job(db, job_id, user.id)
+    if not (job.job_description and job.job_description.strip()):
+        raise HTTPException(
+            status_code=422,
+            detail="No job description stored — add one before regenerating prep.",
+        )
+    from app.skills.queue_worker import enqueue_interested_followups
+    await enqueue_interested_followups(db, job, force_prep=True)
     await db.commit()
     await db.refresh(job)
     return job
