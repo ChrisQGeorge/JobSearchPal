@@ -191,7 +191,23 @@ export default function QueuePage() {
   }
 
   async function remove(fetchQueueId: number) {
-    if (!confirm("Remove this queue item?")) return;
+    // Look up the row so we can give the user a state-aware confirm.
+    // Cancelling something mid-flight has a different cost (Claude
+    // subprocess keeps burning budget until it finishes naturally)
+    // than removing a long-finished row, so don't lump them together.
+    const it = items.find((i) => i.fetch_queue_id === fetchQueueId);
+    const isInFlight =
+      it != null &&
+      (it.status === "running" ||
+        it.status === "processing" ||
+        it.status === "queued");
+    const prompt = isInFlight
+      ? "Cancel this task? The row will be dropped immediately. " +
+        "If a Claude subprocess is already in flight it'll finish on " +
+        "its own (Claude budget still spent) but the result will be " +
+        "discarded."
+      : "Remove this queue item?";
+    if (!confirm(prompt)) return;
     await api.delete(`/api/v1/jobs/queue/${fetchQueueId}`);
     await refresh();
   }
@@ -697,24 +713,42 @@ function QueueRow({
         ) : null}
       </div>
       <div className="flex gap-1 shrink-0">
-        {item.kind === "fetch" &&
-        item.status === "error" &&
-        item.fetch_queue_id != null ? (
+        {/* Retry / Cancel / Remove all act on any DB-backed row
+            (fetch / score / tailor / humanize / org_research). The
+            classifier upstream calls non-fetch rows "companion" for
+            grouping, but they all live in job_fetch_queue and the
+            backend endpoints handle any kind. */}
+        {item.status === "error" && item.fetch_queue_id != null ? (
           <button
             className="jsp-btn-ghost text-xs"
             onClick={onRetry}
+            title="Reset state to queued, clear the error, and let the worker pick it up again."
           >
             Retry
           </button>
         ) : null}
-        {item.kind === "fetch" && item.fetch_queue_id != null ? (
-          <button
-            className="jsp-btn-ghost text-xs text-corp-danger border-corp-danger/40"
-            onClick={onRemove}
-            title="Remove from queue"
-          >
-            ×
-          </button>
+        {item.fetch_queue_id != null ? (
+          isActive(item) ? (
+            <button
+              className="jsp-btn-ghost text-xs text-corp-accent2 border-corp-accent2/40"
+              onClick={onRemove}
+              title={
+                item.status === "processing" || item.status === "running"
+                  ? "Cancel — removes the row now. Note: a Claude subprocess already in flight will keep running until it finishes; the result just won't be saved."
+                  : "Cancel — remove this task before it runs."
+              }
+            >
+              Cancel
+            </button>
+          ) : (
+            <button
+              className="jsp-btn-ghost text-xs text-corp-danger border-corp-danger/40"
+              onClick={onRemove}
+              title="Remove from queue history"
+            >
+              ×
+            </button>
+          )
         ) : null}
       </div>
     </li>

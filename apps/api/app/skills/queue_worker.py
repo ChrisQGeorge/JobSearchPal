@@ -313,14 +313,28 @@ async def _handle_rate_limit(
     )
 
 
-async def _fail(db: AsyncSession, row: JobFetchQueue, err: str) -> None:
-    """Mark a row errored (permanent if attempts exhausted, else re-queue)."""
-    row.state = "error" if row.attempts >= MAX_ATTEMPTS else "queued"
+async def _fail(
+    db: AsyncSession,
+    row: JobFetchQueue,
+    err: str,
+    *,
+    permanent: bool = False,
+) -> None:
+    """Mark a row errored. By default re-queues until attempts hit
+    MAX_ATTEMPTS. Pass `permanent=True` to bail after the first
+    attempt — used by handlers (like the JD analyzer) where retrying
+    a bad input usually just costs more Claude turns to reach the
+    same failure."""
+    row.state = "error" if (permanent or row.attempts >= MAX_ATTEMPTS) else "queued"
     row.error_message = err
     await db.commit()
     log.warning(
-        "Queue item %d (%s) failed (attempt %d): %s",
-        row.id, row.kind or "fetch", row.attempts, err,
+        "Queue item %d (%s) failed (attempt %d%s): %s",
+        row.id,
+        row.kind or "fetch",
+        row.attempts,
+        " — permanent" if permanent else "",
+        err,
     )
 
 
@@ -604,7 +618,7 @@ async def _handle_score(item: JobFetchQueue) -> None:
         payload = row.payload or {}
         tracked_job_id = payload.get("tracked_job_id")
         if not tracked_job_id:
-            await _fail(db, row, "score task missing tracked_job_id")
+            await _fail(db, row, "score task missing tracked_job_id", permanent=True)
             return
 
         job = (
@@ -617,10 +631,10 @@ async def _handle_score(item: JobFetchQueue) -> None:
             )
         ).scalar_one_or_none()
         if job is None:
-            await _fail(db, row, f"TrackedJob {tracked_job_id} not found")
+            await _fail(db, row, f"TrackedJob {tracked_job_id} not found", permanent=True)
             return
         if not (job.job_description and job.job_description.strip()):
-            await _fail(db, row, "job has no description to analyze")
+            await _fail(db, row, "job has no description to analyze", permanent=True)
             return
 
         # Import the prompt + JD analyzer helpers from the jobs router.
@@ -659,10 +673,10 @@ async def _handle_score(item: JobFetchQueue) -> None:
             if _is_rate_limited(err):
                 await _handle_rate_limit(db, row, err)
                 return
-            await _fail(db, row, err)
+            await _fail(db, row, err, permanent=True)
             return
         except Exception as exc:  # pragma: no cover
-            await _fail(db, row, f"Unexpected error: {exc}")
+            await _fail(db, row, f"Unexpected error: {exc}", permanent=True)
             log.exception("Score task %d unhandled error", row.id)
             return
 
@@ -678,18 +692,54 @@ async def _handle_score(item: JobFetchQueue) -> None:
                 db, row,
                 "JD analyzer returned no parseable JSON. "
                 f"Raw Claude output (truncated): {snippet!r}",
+                permanent=True,
             )
             return
         _apply_jd_analysis_to_job(job, data)
+
+        # JD analysis usually populates required_skills / nice_to_have_skills
+        # which the deterministic scorer reads. Recompute fit_score
+        # automatically so the user doesn't have to click Score again
+        # after the analyzer finishes. Mirror what the foreground
+        # /analyze-jd endpoint does. Best-effort: a failure here
+        # shouldn't fail the whole score task — the JD analysis is
+        # still useful even without an updated numeric fit_score.
+        try:
+            from app.scoring.fit import apply_fit_score_to_job, compute_fit_score
+            from app.models.user import User as _User
+
+            user = (
+                await db.execute(select(_User).where(_User.id == row.user_id))
+            ).scalar_one_or_none()
+            if user is not None:
+                fit_result = await compute_fit_score(db, user, job)
+                apply_fit_score_to_job(job, fit_result)
+        except Exception as exc:  # pragma: no cover
+            log.warning(
+                "Score task %d: jd_analysis persisted but fit-score recompute "
+                "failed: %s",
+                row.id, exc,
+            )
+
         row.state = "done"
-        row.result = {"tracked_job_id": job.id, "fit_score": data.get("score")}
+        row.result = {
+            "tracked_job_id": job.id,
+            "fit_score": (
+                job.fit_summary.get("score")
+                if isinstance(job.fit_summary, dict)
+                else None
+            ),
+        }
         row.error_message = None
         if isinstance(row.payload, dict) and "rate_limit_count" in row.payload:
             new_payload = dict(row.payload)
             new_payload.pop("rate_limit_count", None)
             row.payload = new_payload or None
         await db.commit()
-        log.info("Score task %d → applied jd_analysis to TrackedJob %d", row.id, job.id)
+        log.info(
+            "Score task %d → applied jd_analysis + fit_score to TrackedJob %d",
+            row.id, job.id,
+        )
 
 
 async def _mark_doc(
