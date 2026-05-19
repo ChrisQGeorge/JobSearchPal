@@ -1,8 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { AnalyzeEntityDetailPanel } from "@/components/AnalyzeEntityDetailPanel";
 import { PageShell } from "@/components/PageShell";
 import { api, ApiError, apiUrl } from "@/lib/api";
 import type {
@@ -252,6 +253,46 @@ export default function CompanionPage() {
     });
   }
 
+  // If the active conversation was started via the History Editor's
+  // "Analyze" button, the first user message carries a tool_calls
+  // payload like { analyze_seed: { entity_type, entity_id } }. Pull it
+  // out so we can render the live-entity-detail side panel alongside
+  // the chat. Conversations created any other way (Companion + New,
+  // etc.) won't have this and the panel doesn't render.
+  const analyzeSeed = useMemo(() => {
+    if (!detail || detail.messages.length === 0) return null;
+    const first = detail.messages[0];
+    const tc = first.tool_calls as
+      | { analyze_seed?: { entity_type?: string; entity_id?: number } }
+      | null
+      | undefined;
+    const seed = tc?.analyze_seed;
+    if (!seed || !seed.entity_type || typeof seed.entity_id !== "number") {
+      return null;
+    }
+    const allowed = new Set([
+      "work",
+      "education",
+      "certification",
+      "publication",
+      "achievement",
+      "volunteer",
+      "custom",
+    ]);
+    if (!allowed.has(seed.entity_type)) return null;
+    return {
+      entity_type: seed.entity_type as
+        | "work"
+        | "education"
+        | "certification"
+        | "publication"
+        | "achievement"
+        | "volunteer"
+        | "custom",
+      entity_id: seed.entity_id,
+    };
+  }, [detail]);
+
   function onStreamingAbort(userTempId: number, assistantTempId: number) {
     setDetail((prev) => {
       if (!prev) return prev;
@@ -281,7 +322,13 @@ export default function CompanionPage() {
           }}
         />
       ) : null}
-      <div className="grid grid-cols-[260px_1fr] gap-4 h-[calc(100vh-12rem)]">
+      <div
+        className={`grid gap-4 h-[calc(100vh-12rem)] ${
+          analyzeSeed
+            ? "grid-cols-[240px_1fr_320px]"
+            : "grid-cols-[260px_1fr]"
+        }`}
+      >
         <ConversationsList
           conversations={conversations}
           loading={loadingList}
@@ -300,6 +347,12 @@ export default function CompanionPage() {
           loading={loadingDetail}
           onNew={createConversation}
         />
+        {analyzeSeed ? (
+          <AnalyzeEntityDetailPanel
+            entityType={analyzeSeed.entity_type}
+            entityId={analyzeSeed.entity_id}
+          />
+        ) : null}
       </div>
     </PageShell>
   );

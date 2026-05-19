@@ -537,10 +537,19 @@ async def analyze_entity(
     user_text = _build_analyze_seed_prompt(entity_label, payload.entity_type)
     entity_block = _format_entity_for_prompt(entity, payload.entity_type)
 
+    # Attach the entity reference to the user message's tool_calls.
+    # The frontend reads this on conversation load to decide whether
+    # to render the live-entity-detail side panel for this chat.
     user_msg = ConversationMessage(
         conversation_id=conv.id,
         role="user",
         content_md=user_text,
+        tool_calls={
+            "analyze_seed": {
+                "entity_type": payload.entity_type,
+                "entity_id": payload.entity_id,
+            },
+        },
     )
     db.add(user_msg)
 
