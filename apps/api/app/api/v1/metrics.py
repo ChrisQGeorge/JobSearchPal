@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -263,28 +262,12 @@ class StrategyOut(BaseModel):
     warning: Optional[str] = None
 
 
-_JSON_RE = re.compile(r"\{[\s\S]*\}", re.MULTILINE)
-
-
 def _extract_json(text: str) -> Optional[dict]:
-    text = text.strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    if text.startswith("```"):
-        inner = "\n".join(text.splitlines()[1:]).rsplit("```", 1)[0]
-        try:
-            return json.loads(inner)
-        except json.JSONDecodeError:
-            pass
-    m = _JSON_RE.search(text)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except json.JSONDecodeError:
-            return None
-    return None
+    """Re-export the canonical robust extractor — same one the JD
+    analyzer uses. Repairs `\\'` and smart quotes, walks every `{`
+    position with raw_decode, dict-only return type."""
+    from app.api.v1.jobs import _extract_json_object
+    return _extract_json_object(text)
 
 
 @router.post("/strategy", response_model=StrategyOut)
@@ -373,18 +356,49 @@ async def job_strategy(
     except ClaudeCodeError as exc:
         log.warning("strategy failed: %s", exc)
         raise HTTPException(status_code=502, detail=f"Claude Code error: {exc}")
+    except Exception as exc:  # pragma: no cover
+        log.exception("strategy unhandled error")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Unexpected error talking to Claude: {type(exc).__name__}: {exc}",
+        )
 
-    data = _extract_json(final_text) or {}
-    headline = (data.get("headline") or "").strip()
+    data = _extract_json(final_text)
+    if not isinstance(data, dict):
+        # Surface what Claude actually returned so this stops being a
+        # mystery 502. Mirrors the score-task error format.
+        snippet = (final_text or "").strip()
+        if len(snippet) > 600:
+            snippet = snippet[:300] + " […] " + snippet[-300:]
+        log.warning("strategy parse failure. Raw: %r", snippet)
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Strategy skill returned no parseable JSON object. "
+                f"Raw Claude output (truncated): {snippet!r}"
+            ),
+        )
+
+    # Defensive coercion: Claude sometimes returns strings where lists
+    # are expected, or vice versa. Normalize to the schema or skip.
+    def _as_str_list(v: Any) -> list[str]:
+        if isinstance(v, list):
+            return [str(x) for x in v if x is not None]
+        if isinstance(v, str) and v.strip():
+            return [v.strip()]
+        return []
+
+    headline = str(data.get("headline") or "").strip()
     if not headline:
         raise HTTPException(
-            status_code=502, detail="Strategy skill returned no headline."
+            status_code=502,
+            detail="Strategy skill returned a JSON object with no headline.",
         )
     return StrategyOut(
         headline=headline,
-        working_well=list(data.get("working_well") or [])[:6],
-        struggling=list(data.get("struggling") or [])[:6],
-        next_actions=list(data.get("next_actions") or [])[:8],
-        risks=list(data.get("risks") or [])[:4],
-        warning=data.get("warning"),
+        working_well=_as_str_list(data.get("working_well"))[:6],
+        struggling=_as_str_list(data.get("struggling"))[:6],
+        next_actions=_as_str_list(data.get("next_actions"))[:8],
+        risks=_as_str_list(data.get("risks"))[:4],
+        warning=(str(data["warning"]) if data.get("warning") else None),
     )
