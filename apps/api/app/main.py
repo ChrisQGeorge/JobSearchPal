@@ -105,8 +105,41 @@ else:
 
 
 @app.get("/health", tags=["health"])
-async def health() -> dict[str, str]:
-    return {"status": "ok", "env": settings.APP_ENV}
+async def health():
+    """Liveness + readiness check.
+
+    Actually pings the DB with a `SELECT 1` so a 200 here means
+    everything downstream of the api process is also up: the api can
+    open a pool connection, MySQL is accepting queries, the network
+    between the two containers is fine. This is what the web
+    HealthGate polls during boot to decide whether to drop the
+    loading overlay and redirect to the dashboard — a static 200
+    would have made the overlay disappear before data endpoints
+    were ready to serve.
+
+    Returns 503 with the underlying error class + message if the
+    probe fails, so log readers + the frontend can distinguish "api
+    is up but DB is dead" from "api is down entirely" (connection
+    refused → fetch error in the browser).
+    """
+    from sqlalchemy import text
+    from fastapi.responses import JSONResponse
+    from app.core.database import SessionLocal
+
+    try:
+        async with SessionLocal() as db:
+            await db.execute(text("SELECT 1"))
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "down",
+                "env": settings.APP_ENV,
+                "db": "error",
+                "detail": f"{type(exc).__name__}: {exc}"[:200],
+            },
+        )
+    return {"status": "ok", "env": settings.APP_ENV, "db": "ok"}
 
 
 @app.get("/health/claude", tags=["health"])
