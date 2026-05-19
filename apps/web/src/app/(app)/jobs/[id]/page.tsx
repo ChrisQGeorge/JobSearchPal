@@ -813,6 +813,7 @@ function OverviewTab({
           organizationName={job.organization_name ?? null}
         />
       ) : null}
+      <AtAGlancePanel job={job} />
       <JdAnalysisPanel
         job={job}
         onAnalyzed={onSaved}
@@ -2702,6 +2703,146 @@ function FitScoreBreakdownPanel({
           </ul>
         )
       ) : null}
+    </div>
+  );
+}
+
+
+// ---------- At-a-glance panel (top of Overview, above JD Analysis) ----------
+
+function AtAGlancePanel({ job }: { job: TrackedJob }) {
+  const fs = (job.fit_summary ?? null) as FitSummaryShape | null;
+  const score = fs?.score ?? null;
+  const vetoed = !!fs?.vetoed;
+
+  // Score color matches the FitScoreBreakdownPanel's conventions: green
+  // ≥70, gold ≥40, dim/red otherwise. Veto displays as danger regardless
+  // of the underlying number.
+  const scoreTone =
+    vetoed
+      ? "bg-corp-danger/20 text-corp-danger border-corp-danger/40"
+      : score == null
+        ? "bg-corp-surface2 text-corp-muted border-corp-border"
+        : score >= 70
+          ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
+          : score >= 40
+            ? "bg-corp-accent/20 text-corp-accent border-corp-accent/40"
+            : "bg-corp-danger/20 text-corp-danger border-corp-danger/40";
+
+  const fmtCurrency = (n: number | null | undefined, cur?: string | null) =>
+    n == null
+      ? null
+      : new Intl.NumberFormat("en-US", {
+          style: "currency",
+          currency: (cur || "USD").toUpperCase(),
+          maximumFractionDigits: 0,
+        }).format(n);
+
+  let salaryText: string | null = null;
+  const lo = fmtCurrency(job.salary_min, job.salary_currency);
+  const hi = fmtCurrency(job.salary_max, job.salary_currency);
+  if (lo && hi) salaryText = lo === hi ? lo : `${lo} – ${hi}`;
+  else if (lo) salaryText = `${lo}+`;
+  else if (hi) salaryText = `up to ${hi}`;
+
+  const remoteText = job.remote_policy
+    ? job.remote_policy.replace(/_/g, " ")
+    : null;
+  const employmentText = job.employment_type
+    ? job.employment_type.replace(/_/g, " ")
+    : null;
+
+  const required = (job.required_skills ?? []) as string[];
+  const nice = (job.nice_to_have_skills ?? []) as string[];
+
+  return (
+    <div className="jsp-card p-4">
+      <div className="flex items-center justify-between gap-3 mb-3">
+        <h3 className="text-sm uppercase tracking-wider text-corp-muted">
+          At a glance
+        </h3>
+        <div
+          className={`inline-flex items-baseline gap-1.5 px-2.5 py-1 rounded-full border text-xs font-semibold ${scoreTone}`}
+          title={vetoed ? "Vetoed by a hard preference" : "Deterministic fit score"}
+        >
+          <span className="uppercase tracking-wider">Fit</span>
+          <span className="text-base leading-none">
+            {vetoed ? "VETO" : score == null ? "—" : score}
+          </span>
+        </div>
+      </div>
+
+      <dl className="grid grid-cols-2 sm:grid-cols-4 gap-x-3 gap-y-2 text-sm">
+        <GlanceField label="Salary" value={salaryText} />
+        <GlanceField label="Location" value={job.location} />
+        <GlanceField label="Remote" value={remoteText} />
+        <GlanceField label="Type" value={employmentText} />
+      </dl>
+
+      {required.length > 0 || nice.length > 0 ? (
+        <div className="mt-3 pt-3 border-t border-corp-border space-y-2">
+          {required.length > 0 ? (
+            <SkillsRow label="Required" items={required} tone="required" />
+          ) : null}
+          {nice.length > 0 ? (
+            <SkillsRow label="Nice to have" items={nice} tone="nice" />
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function GlanceField({
+  label,
+  value,
+}: {
+  label: string;
+  value: string | null | undefined;
+}) {
+  return (
+    <div>
+      <dt className="text-[10px] uppercase tracking-wider text-corp-muted">
+        {label}
+      </dt>
+      <dd
+        className={`text-sm ${value ? "text-corp-text" : "text-corp-muted italic"}`}
+        title={value ?? "Not recorded"}
+      >
+        {value ?? "—"}
+      </dd>
+    </div>
+  );
+}
+
+function SkillsRow({
+  label,
+  items,
+  tone,
+}: {
+  label: string;
+  items: string[];
+  tone: "required" | "nice";
+}) {
+  const chipClass =
+    tone === "required"
+      ? "bg-corp-accent/15 text-corp-accent border-corp-accent/40"
+      : "bg-corp-surface2 text-corp-text border-corp-border";
+  return (
+    <div className="flex items-start gap-2 flex-wrap">
+      <span className="text-[10px] uppercase tracking-wider text-corp-muted shrink-0 mt-1">
+        {label}
+      </span>
+      <div className="flex flex-wrap gap-1.5">
+        {items.map((s) => (
+          <span
+            key={s}
+            className={`inline-block px-2 py-0.5 rounded-full text-xs border ${chipClass}`}
+          >
+            {s}
+          </span>
+        ))}
+      </div>
     </div>
   );
 }
