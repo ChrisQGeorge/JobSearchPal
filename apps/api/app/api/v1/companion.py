@@ -410,6 +410,96 @@ the entry next time they look at it.
 """
 
 
+async def _run_analyze_in_background(
+    *,
+    user_id: int,
+    conv_id: int,
+    user_display_name: str,
+    primer: str,
+    user_text: str,
+    api_token: str,
+) -> None:
+    """Spawned by `analyze_entity`. Lives on after the HTTP request
+    returns and persists the assistant's first reply (or a `system`
+    error message) when Claude finishes. Uses its own session because
+    the request-scoped one has already been closed."""
+    import asyncio
+    from app.core.database import SessionLocal
+
+    try:
+        result = await run_claude_prompt(
+            prompt=user_text,
+            output_format="json",
+            session_id=None,
+            timeout_seconds=240,
+            system_prompt_append=primer,
+            allowed_tools=["Bash", "Read", "Grep", "Glob", "WebFetch", "WebSearch"],
+            extra_env={
+                "JSP_API_BASE_URL": "http://localhost:8000",
+                "JSP_API_TOKEN": api_token,
+            },
+        )
+    except ClaudeCodeError as exc:
+        log.warning("analyze-entity background Claude failure: %s", exc)
+        async with SessionLocal() as db2:
+            db2.add(
+                ConversationMessage(
+                    conversation_id=conv_id,
+                    role="system",
+                    content_md=f"Claude Code error starting the analysis: {exc}",
+                )
+            )
+            await db2.commit()
+        return
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # pragma: no cover
+        log.exception("analyze-entity background unhandled error")
+        async with SessionLocal() as db2:
+            db2.add(
+                ConversationMessage(
+                    conversation_id=conv_id,
+                    role="system",
+                    content_md=f"Unexpected error starting the analysis: {type(exc).__name__}: {exc}",
+                )
+            )
+            await db2.commit()
+        return
+
+    tool_results_blob = {
+        "meta": {
+            "cost_usd": result.cost_usd,
+            "duration_ms": result.duration_ms,
+            "num_turns": result.num_turns,
+        },
+    }
+    skills_hinted = _infer_skills_used(result.result)
+    if skills_hinted:
+        tool_results_blob["skills_inferred"] = skills_hinted
+
+    async with SessionLocal() as db2:
+        db2.add(
+            ConversationMessage(
+                conversation_id=conv_id,
+                role="assistant",
+                content_md=result.result,
+                tool_calls=result.raw.get("tool_use") or result.raw.get("tool_calls"),
+                tool_results=tool_results_blob,
+            )
+        )
+        if result.session_id:
+            conv = (
+                await db2.execute(
+                    select(CompanionConversation).where(
+                        CompanionConversation.id == conv_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if conv is not None:
+                conv.claude_session_id = result.session_id
+        await db2.commit()
+
+
 @router.post(
     "/conversations/analyze-entity",
     response_model=ConversationSummary,
@@ -421,10 +511,18 @@ async def analyze_entity(
     user: User = Depends(get_current_user),
 ) -> CompanionConversation:
     """Start a fresh Companion conversation focused on enriching one
-    history entry. Loads the entity, seeds context into a
-    system_prompt_append block, fires the first Claude turn, and
-    returns the conversation summary so the UI can navigate the user
-    directly into the chat."""
+    history entry. Creates the conversation + the seed user message
+    synchronously, then schedules the first Claude turn as a
+    background task and returns immediately. The Claude turn is too
+    long-running to wait on inside an HTTP handler — Next.js's
+    rewrites proxy resets the upstream socket after a minute or so
+    and the user sees a 500.
+
+    The /companion page polls the conversation detail and the
+    assistant's reply materializes when Claude finishes (typically
+    30-90 seconds)."""
+    import asyncio
+
     entity, entity_label, link_tag = await _load_history_entity(
         db, user.id, payload.entity_type, payload.entity_id
     )
@@ -436,8 +534,6 @@ async def analyze_entity(
     db.add(conv)
     await db.flush()
 
-    # Build the seed message the user will see + the system block the
-    # Companion will see.
     user_text = _build_analyze_seed_prompt(entity_label, payload.entity_type)
     entity_block = _format_entity_for_prompt(entity, payload.entity_type)
 
@@ -447,76 +543,36 @@ async def analyze_entity(
         content_md=user_text,
     )
     db.add(user_msg)
-    await db.flush()
 
     # Ensure the default persona is seeded so the Companion has a tone.
     from app.api.v1.personas import _ensure_default_persona
     await _ensure_default_persona(db, user.id)
-    await db.refresh(user)
+    await db.commit()
+    await db.refresh(conv)
 
     primer = _API_PRIMER.format(display_name=user.display_name, user_id=user.id)
     primer += _build_analyze_system_block(
         payload.entity_type, entity_label, entity_block, link_tag
     )
-
     api_token = create_access_token(
         subject=str(user.id), extra={"purpose": "companion_analyze"}
     )
 
-    try:
-        result = await run_claude_prompt(
-            prompt=user_text,
-            output_format="json",
-            session_id=None,
-            timeout_seconds=180,
-            system_prompt_append=primer,
-            allowed_tools=["Bash", "Read", "Grep", "Glob", "WebFetch", "WebSearch"],
-            extra_env={
-                "JSP_API_BASE_URL": "http://localhost:8000",
-                "JSP_API_TOKEN": api_token,
-            },
-        )
-    except ClaudeCodeError as exc:
-        log.warning("analyze-entity Claude failure: %s", exc)
-        # Still leave the conversation around so the user can retry
-        # via the regular send-message path.
-        err_msg = ConversationMessage(
-            conversation_id=conv.id,
-            role="system",
-            content_md=f"Claude Code error starting the analysis: {exc}",
-        )
-        db.add(err_msg)
-        await db.commit()
-        raise HTTPException(status_code=502, detail=str(exc))
-
-    tool_results_blob = {
-        "meta": {
-            "cost_usd": result.cost_usd,
-            "duration_ms": result.duration_ms,
-            "num_turns": result.num_turns,
-        },
-        "analysis_seed": {
-            "entity_type": payload.entity_type,
-            "entity_id": payload.entity_id,
-        },
-    }
-    skills_hinted = _infer_skills_used(result.result)
-    if skills_hinted:
-        tool_results_blob["skills_inferred"] = skills_hinted
-
-    assistant_msg = ConversationMessage(
-        conversation_id=conv.id,
-        role="assistant",
-        content_md=result.result,
-        tool_calls=result.raw.get("tool_use") or result.raw.get("tool_calls"),
-        tool_results=tool_results_blob,
+    # Fire-and-forget: the task lives on after this request returns.
+    # We don't keep a reference because we don't need to await it
+    # from here. The persister inside the task uses its own session.
+    asyncio.create_task(
+        _run_analyze_in_background(
+            user_id=user.id,
+            conv_id=conv.id,
+            user_display_name=user.display_name,
+            primer=primer,
+            user_text=user_text,
+            api_token=api_token,
+        ),
+        name=f"analyze-entity-{conv.id}",
     )
-    db.add(assistant_msg)
-    if result.session_id:
-        conv.claude_session_id = result.session_id
 
-    await db.commit()
-    await db.refresh(conv)
     return conv
 
 

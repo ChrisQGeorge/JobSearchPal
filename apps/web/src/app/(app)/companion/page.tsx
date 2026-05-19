@@ -119,17 +119,34 @@ export default function CompanionPage() {
       return;
     }
     let cancelled = false;
-    setLoadingDetail(true);
-    api
-      .get<ConversationDetail>(`/api/v1/companion/conversations/${activeId}`)
-      .then((d) => {
-        if (!cancelled) setDetail(d);
-      })
-      .finally(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    async function loadOnce() {
+      try {
+        const d = await api.get<ConversationDetail>(
+          `/api/v1/companion/conversations/${activeId}`,
+        );
+        if (cancelled) return;
+        setDetail(d);
+        // If the most recent message is from the user, the Companion's
+        // reply is still being generated in the background (e.g. for
+        // analyze-entity, which fires Claude asynchronously). Poll
+        // every 3s until an assistant / system message lands.
+        const last = d.messages[d.messages.length - 1];
+        if (last && last.role === "user") {
+          timer = setTimeout(loadOnce, 3_000);
+        }
+      } finally {
         if (!cancelled) setLoadingDetail(false);
-      });
+      }
+    }
+
+    setLoadingDetail(true);
+    loadOnce();
+
     return () => {
       cancelled = true;
+      if (timer) clearTimeout(timer);
     };
   }, [activeId]);
 
