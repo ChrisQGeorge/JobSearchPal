@@ -15,6 +15,7 @@ from app.core.security import create_access_token
 from app.models.companion import CompanionConversation, ConversationMessage
 from app.models.user import User
 from app.schemas.companion import (
+    AnalyzeEntityIn,
     ConversationDetail,
     ConversationSummary,
     CreateConversationIn,
@@ -270,6 +271,252 @@ async def create_conversation(
         related_tracked_job_id=payload.related_tracked_job_id,
     )
     db.add(conv)
+    await db.commit()
+    await db.refresh(conv)
+    return conv
+
+
+# ---------------------------------------------------------------------------
+# Entity-analysis conversations
+# ---------------------------------------------------------------------------
+
+_ANALYZE_ENTITY_MODELS = {
+    # entity_type → (SQLAlchemy model, label-attr, link-type-tag)
+    # The link-type-tag matches EntityLink.from_entity_type so the
+    # Companion can correctly query existing links.
+    "work":          ("WorkExperience", "title",   "work"),
+    "education":     ("Education",      "degree",  "education"),
+    "certification": ("Certification",  "name",    "certification"),
+    "publication":   ("Publication",    "title",   "publication"),
+    "achievement":   ("Achievement",    "title",   "achievement"),
+    "volunteer":     ("VolunteerWork",  "role",    "volunteer"),
+    "custom":        ("CustomEvent",    "title",   "custom"),
+}
+
+
+async def _load_history_entity(
+    db: AsyncSession, user_id: int, entity_type: str, entity_id: int
+):
+    """Load one history row and return (entity, label, link_tag).
+    Raises HTTPException(404) when the row isn't found or isn't owned."""
+    if entity_type not in _ANALYZE_ENTITY_MODELS:
+        raise HTTPException(status_code=422, detail=f"Unknown entity_type: {entity_type}")
+    model_name, label_attr, link_tag = _ANALYZE_ENTITY_MODELS[entity_type]
+    from app.models import history as _hmod
+    model = getattr(_hmod, model_name)
+    stmt = select(model).where(
+        model.id == entity_id,
+        model.user_id == user_id,
+        model.deleted_at.is_(None),
+    )
+    entity = (await db.execute(stmt)).scalar_one_or_none()
+    if entity is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"{entity_type} #{entity_id} not found",
+        )
+    label = getattr(entity, label_attr, None) or f"{entity_type} #{entity_id}"
+    return entity, label, link_tag
+
+
+def _format_entity_for_prompt(entity, entity_type: str) -> str:
+    """Dump an ORM row's column values to a markdown table-ish block
+    Claude can read. Only includes columns with truthy values so the
+    Companion focuses on what's present (and notices the gaps)."""
+    lines: list[str] = [f"## Current {entity_type} entry"]
+    SKIP = {"id", "user_id", "created_at", "updated_at", "deleted_at"}
+    table = type(entity).__table__
+    for col in table.columns:
+        if col.name in SKIP:
+            continue
+        v = getattr(entity, col.name, None)
+        if v in (None, "", [], {}):
+            lines.append(f"- {col.name}: *(empty)*")
+            continue
+        # Truncate huge text columns so the prompt stays reasonable.
+        s = str(v)
+        if len(s) > 600:
+            s = s[:600] + "…"
+        lines.append(f"- {col.name}: {s}")
+    return "\n".join(lines)
+
+
+def _build_analyze_seed_prompt(label: str, entity_type: str) -> str:
+    """The user-visible message that opens the chat. Short and natural —
+    the heavy entity context goes in system_prompt_append instead so
+    it doesn't clutter the chat history."""
+    return (
+        f"Help me build out my {entity_type} entry — **{label}**. "
+        "Look at what's there, look at my skills catalog, and start "
+        "asking the questions that will make this entry as useful as "
+        "possible for job applications. One question at a time, and "
+        "feel free to suggest concrete edits — fill in missing fields, "
+        "link skills, draft a description, add related projects. "
+        "Confirm before writing anything."
+    )
+
+
+def _build_analyze_system_block(
+    entity_type: str, entity_label: str, entity_block: str, link_tag: str
+) -> str:
+    """The system_prompt_append the Companion sees ON TOP of the
+    primer. Frames the conversation as an entity-enrichment session
+    and tells the agent what's good behavior here."""
+    return f"""
+
+Entity-Analysis Mode
+====================
+
+This conversation was started by the user clicking "Analyze" on their
+**{entity_type}** entry: *{entity_label}*. Treat it as a deep dive — your
+job is to enrich this one history record so it pulls weight on the
+user's resume and in interviews.
+
+{entity_block}
+
+Working approach (READ THIS — it's the difference between a useful chat
+and a "looks fine to me" dud):
+
+  1. Curiosity-first. Ask the user about the specifics behind every
+     empty or thin field. Don't accept "I don't remember" as the final
+     answer on the first try — offer scaffolding ("which company was
+     this for?", "what was the team size?", "what shipped because of
+     it?").
+  2. One question per turn. Pick the highest-value gap and ask about
+     it. Don't data-dump a 10-bullet checklist.
+  3. Fact-check against existing data. Curl
+     GET /api/v1/history/{link_tag}/{{id}}  (when applicable) and
+     GET /api/v1/history/skills before claiming something is or isn't
+     in their catalog.
+  4. Propose concrete edits as the chat progresses. When the user
+     gives you a fact, draft the field update (e.g. "I'll write the
+     summary as: …") and confirm before PUTting.
+  5. Link skills. If the user mentions a tool / language / framework
+     they used here, check if it's in their catalog (GET
+     /api/v1/history/skills). If yes, link it via the appropriate
+     endpoint (see the History section of your primer). If no, ask
+     whether they'd like a new Skill row created.
+  6. Surface adjacent assets. If the user describes a project that
+     came out of this work, suggest creating a Project row and
+     linking it via EntityLink (POST /api/v1/history/links). Same for
+     achievements, publications, etc.
+  7. Tone: lightly curious, lightly ironic-corporate (per the
+     Outer-Worlds-aesthetic spec). The user is doing the work; you're
+     the diligent assistant making sure no part of this record gets
+     phoned in.
+
+Stop conditions: when the user says they're done, or every meaningful
+field has either content or an explicit "n/a — couldn't recall".
+Summarize what changed at the end so the user knows what to expect on
+the entry next time they look at it.
+"""
+
+
+@router.post(
+    "/conversations/analyze-entity",
+    response_model=ConversationSummary,
+    status_code=status.HTTP_201_CREATED,
+)
+async def analyze_entity(
+    payload: AnalyzeEntityIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> CompanionConversation:
+    """Start a fresh Companion conversation focused on enriching one
+    history entry. Loads the entity, seeds context into a
+    system_prompt_append block, fires the first Claude turn, and
+    returns the conversation summary so the UI can navigate the user
+    directly into the chat."""
+    entity, entity_label, link_tag = await _load_history_entity(
+        db, user.id, payload.entity_type, payload.entity_id
+    )
+
+    conv = CompanionConversation(
+        user_id=user.id,
+        title=f"Analyze: {entity_label}"[:255],
+    )
+    db.add(conv)
+    await db.flush()
+
+    # Build the seed message the user will see + the system block the
+    # Companion will see.
+    user_text = _build_analyze_seed_prompt(entity_label, payload.entity_type)
+    entity_block = _format_entity_for_prompt(entity, payload.entity_type)
+
+    user_msg = ConversationMessage(
+        conversation_id=conv.id,
+        role="user",
+        content_md=user_text,
+    )
+    db.add(user_msg)
+    await db.flush()
+
+    # Ensure the default persona is seeded so the Companion has a tone.
+    from app.api.v1.personas import _ensure_default_persona
+    await _ensure_default_persona(db, user.id)
+    await db.refresh(user)
+
+    primer = _API_PRIMER.format(display_name=user.display_name, user_id=user.id)
+    primer += _build_analyze_system_block(
+        payload.entity_type, entity_label, entity_block, link_tag
+    )
+
+    api_token = create_access_token(
+        subject=str(user.id), extra={"purpose": "companion_analyze"}
+    )
+
+    try:
+        result = await run_claude_prompt(
+            prompt=user_text,
+            output_format="json",
+            session_id=None,
+            timeout_seconds=180,
+            system_prompt_append=primer,
+            allowed_tools=["Bash", "Read", "Grep", "Glob", "WebFetch", "WebSearch"],
+            extra_env={
+                "JSP_API_BASE_URL": "http://localhost:8000",
+                "JSP_API_TOKEN": api_token,
+            },
+        )
+    except ClaudeCodeError as exc:
+        log.warning("analyze-entity Claude failure: %s", exc)
+        # Still leave the conversation around so the user can retry
+        # via the regular send-message path.
+        err_msg = ConversationMessage(
+            conversation_id=conv.id,
+            role="system",
+            content_md=f"Claude Code error starting the analysis: {exc}",
+        )
+        db.add(err_msg)
+        await db.commit()
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    tool_results_blob = {
+        "meta": {
+            "cost_usd": result.cost_usd,
+            "duration_ms": result.duration_ms,
+            "num_turns": result.num_turns,
+        },
+        "analysis_seed": {
+            "entity_type": payload.entity_type,
+            "entity_id": payload.entity_id,
+        },
+    }
+    skills_hinted = _infer_skills_used(result.result)
+    if skills_hinted:
+        tool_results_blob["skills_inferred"] = skills_hinted
+
+    assistant_msg = ConversationMessage(
+        conversation_id=conv.id,
+        role="assistant",
+        content_md=result.result,
+        tool_calls=result.raw.get("tool_use") or result.raw.get("tool_calls"),
+        tool_results=tool_results_blob,
+    )
+    db.add(assistant_msg)
+    if result.session_id:
+        conv.claude_session_id = result.session_id
+
     await db.commit()
     await db.refresh(conv)
     return conv

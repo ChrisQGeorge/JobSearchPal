@@ -90,6 +90,7 @@ export default function HistoryEditorPage() {
           endpoint="/api/v1/history/achievements"
           title="Achievements"
           entityType="achievement"
+          analyzeEntityType="achievement"
           emptyHint="No achievements recorded. Modesty is not a competitive advantage."
           labelOf={(a) => a.title}
           subtitleOf={(a) =>
@@ -111,6 +112,7 @@ export default function HistoryEditorPage() {
           endpoint="/api/v1/history/certifications"
           title="Certifications"
           entityType="certification"
+          analyzeEntityType="certification"
           labelOf={(c) => c.name}
           subtitleOf={(c) =>
             [c.issuer, c.issued_date].filter(Boolean).join(" · ") || null
@@ -174,6 +176,7 @@ export default function HistoryEditorPage() {
           endpoint="/api/v1/history/publications"
           title="Publications"
           entityType="publication"
+          analyzeEntityType="publication"
           labelOf={(p) => p.title}
           subtitleOf={(p) =>
             [p.venue, p.publication_date].filter(Boolean).join(" · ") || null
@@ -236,6 +239,7 @@ export default function HistoryEditorPage() {
           endpoint="/api/v1/history/volunteer"
           title="Volunteer Work"
           entityType="volunteer"
+          analyzeEntityType="volunteer"
           labelOf={(v) => v.role || v.organization}
           subtitleOf={(v) =>
             [v.organization, v.start_date, v.end_date ?? "present"]
@@ -336,6 +340,7 @@ export default function HistoryEditorPage() {
           endpoint="/api/v1/history/custom-events"
           title="Custom Events"
           entityType="custom"
+          analyzeEntityType="custom"
           labelOf={(e) => e.title}
           subtitleOf={(e) =>
             [e.type_label, e.start_date, e.end_date].filter(Boolean).join(" · ") || null

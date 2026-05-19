@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
+import { AnalyzeEntityButton } from "@/components/AnalyzeEntityButton";
 import { OrganizationCombobox } from "@/components/OrganizationCombobox";
 import {
   RelatedItemsPanel,
@@ -87,6 +88,13 @@ function fromInputValue(field: FieldDef<GenericEntity>, raw: string): unknown {
 // Each item's detail view can also render a RelatedItemsPanel below its form.
 // ---------------------------------------------------------------------------
 
+type AnalyzeEntityKind =
+  | "certification"
+  | "publication"
+  | "achievement"
+  | "volunteer"
+  | "custom";
+
 type Props<T extends GenericEntity> = {
   endpoint: string; // e.g. "/api/v1/history/certifications"
   title: string;
@@ -100,6 +108,10 @@ type Props<T extends GenericEntity> = {
   // and the panel will render a SkillMultiSelect under each row in edit
   // mode plus read-only chips in the collapsed view.
   skillsEndpoint?: (id: number) => string;
+  // When set, each row gets an "Analyze" button that opens a
+  // Companion conversation focused on that entry. Only enabled for
+  // entity types the backend endpoint accepts.
+  analyzeEntityType?: AnalyzeEntityKind;
 };
 
 export function GenericEntityPanel<T extends GenericEntity>({
@@ -111,6 +123,7 @@ export function GenericEntityPanel<T extends GenericEntity>({
   subtitleOf,
   emptyHint,
   skillsEndpoint,
+  analyzeEntityType,
 }: Props<T>) {
   const [items, setItems] = useState<T[]>([]);
   const [loading, setLoading] = useState(true);
@@ -235,6 +248,12 @@ export function GenericEntityPanel<T extends GenericEntity>({
                   />
                 </div>
                 <div className="flex gap-1 shrink-0">
+                  {analyzeEntityType ? (
+                    <AnalyzeEntityButton
+                      entityType={analyzeEntityType}
+                      entityId={it.id}
+                    />
+                  ) : null}
                   <button
                     className="jsp-btn-ghost text-xs"
                     onClick={() => setEditing(it)}

@@ -97,6 +97,22 @@ export default function CompanionPage() {
     });
   }, [refreshList, activeId]);
 
+  // Deep-link: when /companion is opened with ?conv=<id> (from the
+  // History Editor's Analyze button, or any future caller), jump
+  // straight to that conversation. Read straight from
+  // window.location to avoid forcing the route off static prerender,
+  // which `useSearchParams` would do.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const params = new URLSearchParams(window.location.search);
+    const raw = params.get("conv");
+    if (!raw) return;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return;
+    setActiveId(n);
+    refreshList();
+  }, [refreshList]);
+
   useEffect(() => {
     if (activeId == null) {
       setDetail(null);

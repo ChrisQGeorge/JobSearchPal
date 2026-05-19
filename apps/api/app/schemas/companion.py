@@ -39,6 +39,22 @@ class CreateConversationIn(BaseModel):
     related_tracked_job_id: Optional[int] = None
 
 
+class AnalyzeEntityIn(BaseModel):
+    """Start a Companion conversation focused on enriching one history
+    entity. The endpoint loads the entity, seeds context, and fires
+    the first Claude turn so the user lands in a live chat with the
+    Companion already asking a focused question."""
+
+    # Mirrors the EntityLink.from_entity_type values that History
+    # Editor surfaces. Intentionally a subset — projects / languages /
+    # contacts / skills / presentations are excluded per the product
+    # decision to only offer Analyze on the high-value entity types.
+    entity_type: str = Field(
+        pattern=r"^(work|education|certification|publication|achievement|volunteer|custom)$",
+    )
+    entity_id: int
+
+
 class SendMessageIn(BaseModel):
     content: str = Field(min_length=1, max_length=16000)
     # GeneratedDocument ids the user wants inlined for this turn's context.

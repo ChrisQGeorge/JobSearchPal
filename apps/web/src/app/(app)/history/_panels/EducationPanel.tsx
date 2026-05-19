@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { AnalyzeEntityButton } from "@/components/AnalyzeEntityButton";
 import { OrganizationCombobox } from "@/components/OrganizationCombobox";
 import { RelatedItemsPanel } from "@/components/RelatedItemsPanel";
 import { SkillMultiSelect } from "@/components/SkillMultiSelect";
@@ -112,12 +113,13 @@ export function EducationPanel() {
                       />
                     </div>
                   </div>
-                  <div className="flex gap-2 shrink-0">
-                    <button className="jsp-btn-ghost" onClick={() => setEditing(e)}>
+                  <div className="flex flex-col gap-1.5 shrink-0">
+                    <AnalyzeEntityButton entityType="education" entityId={e.id} />
+                    <button className="jsp-btn-ghost text-xs" onClick={() => setEditing(e)}>
                       Edit
                     </button>
                     <button
-                      className="jsp-btn-ghost text-corp-danger border-corp-danger/40"
+                      className="jsp-btn-ghost text-xs text-corp-danger border-corp-danger/40"
                       onClick={() => remove(e.id)}
                     >
                       Delete
