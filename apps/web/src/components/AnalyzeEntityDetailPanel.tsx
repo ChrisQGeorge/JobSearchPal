@@ -16,19 +16,6 @@ type AnalyzeEntityType =
   | "volunteer"
   | "custom";
 
-// Map each supported analyze entity type to the API endpoint that
-// returns its current state. Keep in sync with the backend's
-// _ANALYZE_ENTITY_MODELS table in companion.py.
-const ENDPOINT_FOR: Record<AnalyzeEntityType, string> = {
-  work: "/api/v1/history/work",
-  education: "/api/v1/history/education",
-  certification: "/api/v1/history/certifications",
-  publication: "/api/v1/history/publications",
-  achievement: "/api/v1/history/achievements",
-  volunteer: "/api/v1/history/volunteer",
-  custom: "/api/v1/history/custom-events",
-};
-
 const LABEL_FOR: Record<AnalyzeEntityType, string> = {
   work: "Work Experience",
   education: "Education",
@@ -70,7 +57,7 @@ export function AnalyzeEntityDetailPanel({
     let cancelled = false;
     async function load() {
       try {
-        const url = `${ENDPOINT_FOR[entityType]}/${entityId}`;
+        const url = `/api/v1/history/entity/${entityType}/${entityId}`;
         const data = await api.get<EntityRow>(url);
         if (cancelled) return;
         setEntity(data);

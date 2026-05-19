@@ -1382,6 +1382,68 @@ async def delete_contact(
     await db.commit()
 
 
+# ----- Generic single-entity GET ----------------------------------------------
+# One endpoint covers every history kind. The Analyze panel polls this to
+# show the live state of the entity being discussed; future per-entity edit
+# forms can use it too. The list endpoints already exist for each kind, so
+# we don't need GET-by-id for every type — just this one parameterized read.
+
+_ENTITY_KIND_TO_MODEL = {
+    "work":          WorkExperience,
+    "education":     Education,
+    "certification": Certification,
+    "publication":   Publication,
+    "presentation":  Presentation,
+    "achievement":   Achievement,
+    "volunteer":     VolunteerWork,
+    "project":       Project,
+    "language":      Language,
+    "contact":       Contact,
+    "custom":        CustomEvent,
+    "skill":         Skill,
+    "course":        Course,
+}
+
+
+@router.get("/entity/{entity_kind}/{entity_id}")
+async def get_history_entity(
+    entity_kind: str,
+    entity_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Return any history row by (kind, id). Polymorphic response —
+    columns vary per kind, so we serialize the raw row to a dict
+    rather than declaring a union response_model.
+
+    Read-only; auth-gated to the row's owner. 404 if the row doesn't
+    exist or belongs to someone else. 422 on unknown entity_kind."""
+    model = _ENTITY_KIND_TO_MODEL.get(entity_kind)
+    if model is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown entity_kind: {entity_kind}. "
+            f"Valid: {sorted(_ENTITY_KIND_TO_MODEL.keys())}",
+        )
+    obj = await _get_owned(db, model, entity_id, user.id)
+    # Attach org name where applicable so the panel can display the
+    # employer / school instead of just the foreign-key id.
+    if hasattr(obj, "organization_id"):
+        await _attach_org_names(db, [obj])
+    # Serialize all columns the model declares. SQLAlchemy doesn't
+    # auto-convert datetimes; FastAPI's response serializer handles
+    # those when they're returned from a model, but since we're
+    # returning a plain dict here we keep the values raw and let
+    # FastAPI's jsonable_encoder render them downstream.
+    out: dict = {}
+    for col in type(obj).__table__.columns:
+        out[col.name] = getattr(obj, col.name, None)
+    # Tack the joined org name on so the panel can show it inline.
+    if hasattr(obj, "organization_name"):
+        out["organization_name"] = getattr(obj, "organization_name", None)
+    return out
+
+
 # ----- Timeline ---------------------------------------------------------------
 
 async def _list_in_own_session(model, user_id: int):
