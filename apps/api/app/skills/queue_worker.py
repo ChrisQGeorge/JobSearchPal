@@ -668,7 +668,17 @@ async def _handle_score(item: JobFetchQueue) -> None:
 
         data = _extract_json_object(final_text) or {}
         if not data:
-            await _fail(db, row, "JD analyzer returned no parseable JSON")
+            # Include a snippet of what Claude actually returned so the
+            # user can see whether it's hitting a rate-limit message, a
+            # tool error, or just emitting prose instead of JSON.
+            snippet = (final_text or "").strip()
+            if len(snippet) > 600:
+                snippet = snippet[:300] + " […] " + snippet[-300:]
+            await _fail(
+                db, row,
+                "JD analyzer returned no parseable JSON. "
+                f"Raw Claude output (truncated): {snippet!r}",
+            )
             return
         _apply_jd_analysis_to_job(job, data)
         row.state = "done"

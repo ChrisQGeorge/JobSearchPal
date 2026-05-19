@@ -1785,30 +1785,56 @@ _JSON_OBJECT_RE = re.compile(r"\{[\s\S]*\}", re.MULTILINE)
 
 
 def _extract_json_object(text: str) -> Optional[dict]:
-    """Try hard to pull a JSON object out of Claude's textual output."""
+    """Try hard to pull a JSON object out of Claude's textual output.
+
+    Claude tends to narrate between tool calls — "Let me check {user_id}'s
+    preferences..." — so any approach that just regexes from first `{` to
+    last `}` swallows unrelated braces and fails to parse. Instead we
+    walk every `{` position and try `raw_decode`, which parses the FIRST
+    valid JSON object starting at that position and tells us where it
+    ends. The deepest / longest match wins so we don't accidentally
+    accept a brace inside a prose interpolation."""
     text = text.strip()
-    # First: straight json.loads.
+    # Fast path: the entire text is one JSON object.
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
     except json.JSONDecodeError:
         pass
-    # Strip common markdown code fences.
+    # Markdown-fenced JSON (```json ... ``` or just ``` ... ```).
     if text.startswith("```"):
         inner = "\n".join(text.splitlines()[1:])
         if inner.rstrip().endswith("```"):
             inner = inner.rsplit("```", 1)[0]
         try:
-            return json.loads(inner)
+            parsed = json.loads(inner)
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
             pass
-    # Finally: regex the first {...} blob.
-    m = _JSON_OBJECT_RE.search(text)
-    if m:
+
+    # Robust path: walk every `{` position and ask the json decoder to
+    # parse from there. Whichever yields the LONGEST valid object wins
+    # (the analysis JSON is always bigger than any incidental braces
+    # in narration).
+    decoder = json.JSONDecoder()
+    best: Optional[dict] = None
+    best_len = -1
+    i = 0
+    while True:
+        i = text.find("{", i)
+        if i < 0:
+            break
         try:
-            return json.loads(m.group(0))
+            obj, end = decoder.raw_decode(text, i)
+            if isinstance(obj, dict) and (end - i) > best_len:
+                best = obj
+                best_len = end - i
+            i = end
         except json.JSONDecodeError:
-            return None
-    return None
+            i += 1
+    return best
 
 
 _PAGE_TEXT_BUDGET = 60_000  # chars sent to Claude in the parse step.
