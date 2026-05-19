@@ -1337,6 +1337,7 @@ const BUILTIN_KEYS = [
   "skills",
   "travel",
   "hours",
+  "jd_analysis",
 ] as const;
 
 const BUILTIN_DEFAULTS: Record<string, number> = {
@@ -1348,6 +1349,7 @@ const BUILTIN_DEFAULTS: Record<string, number> = {
   skills: 80,
   travel: 30,
   hours: 30,
+  jd_analysis: 40,
 };
 
 const BUILTIN_LABELS: Record<string, string> = {
@@ -1359,6 +1361,7 @@ const BUILTIN_LABELS: Record<string, string> = {
   skills: "Skill match (required + nice-to-have)",
   travel: "Travel",
   hours: "Hours / week",
+  jd_analysis: "Companion analysis (qualitative 0-100 from Score)",
 };
 
 function CriteriaPanel() {

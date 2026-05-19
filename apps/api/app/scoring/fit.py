@@ -64,6 +64,14 @@ DEFAULT_BUILTIN_WEIGHTS: dict[str, int] = {
     "skills": 80,
     "travel": 30,
     "hours": 30,
+    # Companion's qualitative JD-analyzer rating (0-100). Folded into
+    # the weighted average so subjective signals like "vague scope" /
+    # "compensation looks light for the role" / "your work history
+    # explicitly maps to bullet #3" can bend the score without being
+    # the entire score. Weighted lower than skills by default because
+    # it's LLM-derived and easy to over-trust; the user can crank it
+    # up via builtin_weights override if they find it reliable.
+    "jd_analysis": 40,
 }
 
 # Weight at or above which a matching `unacceptable` criterion becomes a
@@ -659,6 +667,52 @@ def _score_hours(
     )
 
 
+def _score_jd_analysis(job: TrackedJob, weight: int) -> Component:
+    """Fold the JD analyzer's qualitative `fit_score` (0-100) into the
+    deterministic average. The analyzer is allowed to see the user's
+    history + preferences over curl, so its score captures things the
+    structural components can't — vague scope, comp mismatch, "your
+    work history maps directly to bullet 3", etc.
+
+    No analysis available, or no fit_score in it → verdict=unknown,
+    which means the component is skipped entirely (doesn't contribute
+    to either numerator or denominator). The user's score is therefore
+    based on whatever components DO have data, exactly like the other
+    `unknown` paths above."""
+    analysis = job.jd_analysis if isinstance(job.jd_analysis, dict) else None
+    raw = analysis.get("fit_score") if analysis else None
+    if not isinstance(raw, (int, float)):
+        return Component(
+            key="jd_analysis",
+            label="Companion analysis",
+            weight=weight,
+            verdict="unknown",
+            matched_pct=0.0,
+            detail="No JD analysis recorded — run Score on this job.",
+        )
+    score = max(0, min(100, int(raw)))
+    # Bucket into the same verdict vocabulary the other components use
+    # so the UI's color coding works without a special case.
+    if score >= 70:
+        verdict = "match"
+    elif score >= 40:
+        verdict = "partial"
+    else:
+        verdict = "miss"
+    summary = ""
+    if analysis:
+        summary = str(analysis.get("fit_summary") or "").strip()
+    detail = f"Claude rated this {score}/100" + (f": {summary}" if summary else ".")
+    return Component(
+        key="jd_analysis",
+        label="Companion analysis",
+        weight=weight,
+        verdict=verdict,
+        matched_pct=score / 100.0,
+        detail=detail,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Criterion scorer
 # ---------------------------------------------------------------------------
@@ -834,6 +888,9 @@ async def compute_fit_score(
     )
     components.append(_score_travel(job, prefs, _resolve_weight(prefs, "travel")))
     components.append(_score_hours(job, prefs, _resolve_weight(prefs, "hours")))
+    components.append(
+        _score_jd_analysis(job, _resolve_weight(prefs, "jd_analysis"))
+    )
 
     for c in criteria:
         components.append(_score_criterion(c, job, org_name))
