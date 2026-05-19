@@ -169,9 +169,8 @@ similar, audit their data:
   1. GET /history/work, /history/education, /history/skills,
      /history/projects, /history/achievements. Flag entries with missing
      highlights, end_date (if not ongoing), role, technologies_used, etc.
-  2. Ask the user ONE specific question at a time — don't data-dump.
-  3. PUT the entity when they answer.
-  4. After each round, summarize what you updated and ask if they want to
+  2. PUT the entity when they answer.
+  3. After each round, summarize what you updated and ask if they want to
      keep going or stop.
 
 Never write without explicit user confirmation in either workflow.
@@ -349,10 +348,10 @@ def _build_analyze_seed_prompt(label: str, entity_type: str) -> str:
         f"Help me build out my {entity_type} entry — **{label}**. "
         "Look at what's there, look at my skills catalog, and start "
         "asking the questions that will make this entry as useful as "
-        "possible for job applications. One question at a time, and "
-        "feel free to suggest concrete edits — fill in missing fields, "
-        "link skills, draft a description, add related projects. "
-        "Confirm before writing anything."
+        "possible for job applications. Feel free to suggest concrete "
+        "edits — fill in missing fields, link skills, draft a "
+        "description, add related projects. Confirm before writing "
+        "anything."
     )
 
 
