@@ -118,6 +118,28 @@ async def _org_names_for(
 
 # --- TrackedJob list / create / detail / update / delete --------------------
 
+@router.get("/counts")
+async def job_status_counts(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Return per-status job counts via a single GROUP BY. Cheap;
+    the tracker page calls this on every filter change to refresh
+    the pill labels without re-fetching the entire list."""
+    rows = (
+        await db.execute(
+            select(TrackedJob.status, func.count(TrackedJob.id))
+            .where(
+                TrackedJob.user_id == user.id,
+                TrackedJob.deleted_at.is_(None),
+            )
+            .group_by(TrackedJob.status)
+        )
+    ).all()
+    counts: dict[str, int] = {s: int(n) for s, n in rows}
+    return {"counts": counts, "total": sum(counts.values())}
+
+
 @router.get("", response_model=list[TrackedJobSummary])
 async def list_jobs(
     status: Optional[str] = Query(default=None, description="Filter to one status"),

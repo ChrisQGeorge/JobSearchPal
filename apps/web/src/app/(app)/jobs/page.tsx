@@ -92,26 +92,45 @@ export default function JobTrackerPage() {
     }
   }
 
+  // Track each refresh with a request id so a slow earlier fetch can't
+  // overwrite a faster newer one. Symptom this fixes: click "interested"
+  // → request goes out; click another filter → second request goes out;
+  // first response lands AFTER the second and clobbers the visible
+  // rows with stale data. setItems is gated by this counter so only
+  // the latest request wins.
+  const refreshSeqRef = useRef(0);
+  const [refreshErr, setRefreshErr] = useState<string | null>(null);
+
   async function refresh() {
+    const mySeq = ++refreshSeqRef.current;
     setLoading(true);
+    setRefreshErr(null);
+    // Clear immediately on a filter-driven refresh so stale rows from
+    // the previous filter don't visibly persist while the new fetch
+    // is in flight. "Loading..." shows in their place.
+    setItems([]);
     try {
       const params = new URLSearchParams();
       if (statusFilter) params.set("status", statusFilter);
       const data = await api.get<TrackedJobSummary[]>(
         `/api/v1/jobs?${params.toString()}`,
       );
+      if (mySeq !== refreshSeqRef.current) return; // stale response, drop
       // Hide negative-connotation statuses unless the user has explicitly
       // filtered to one of them or flipped the "show closed" toggle on.
-      // Filtering client-side so the backend stays simple and the same
-      // shape works for the dashboard too.
       const visible =
         showNegative ||
         (statusFilter && NEGATIVE_STATUSES.has(statusFilter as JobStatus))
           ? data
           : data.filter((j) => !NEGATIVE_STATUSES.has(j.status));
       setItems(visible);
+    } catch (e) {
+      if (mySeq !== refreshSeqRef.current) return;
+      setRefreshErr(
+        e instanceof ApiError ? `Load failed (HTTP ${e.status}).` : "Load failed.",
+      );
     } finally {
-      setLoading(false);
+      if (mySeq === refreshSeqRef.current) setLoading(false);
     }
   }
 
@@ -165,15 +184,17 @@ export default function JobTrackerPage() {
   const pagedItems = pager.visibleItems;
 
   // Status counts across the full set (unfiltered). Quick-nav to each bucket.
+  // Uses a dedicated /jobs/counts endpoint that returns a single GROUP BY
+  // result, much cheaper than re-fetching the entire job list and counting
+  // in the browser. Re-run whenever the visible items list size changes
+  // (i.e., the user filtered to a different status or added/removed a job).
   const [counts, setCounts] = useState<Partial<Record<JobStatus, number>>>({});
   useEffect(() => {
     api
-      .get<TrackedJobSummary[]>("/api/v1/jobs")
-      .then((all) => {
-        const c: Partial<Record<JobStatus, number>> = {};
-        for (const j of all) c[j.status] = (c[j.status] ?? 0) + 1;
-        setCounts(c);
-      })
+      .get<{ counts: Record<string, number>; total: number }>(
+        "/api/v1/jobs/counts",
+      )
+      .then((res) => setCounts(res.counts as Partial<Record<JobStatus, number>>))
       .catch(() => {});
   }, [items.length]);
 
@@ -545,6 +566,10 @@ export default function JobTrackerPage() {
           onChange={(e) => setSearch(e.target.value)}
         />
       </div>
+
+      {refreshErr ? (
+        <div className="text-xs text-corp-danger mt-2">{refreshErr}</div>
+      ) : null}
 
       {loading ? (
         <p className="text-corp-muted mt-4">Loading...</p>
