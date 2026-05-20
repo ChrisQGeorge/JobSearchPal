@@ -46,11 +46,11 @@ class AnalyzeEntityIn(BaseModel):
     Companion already asking a focused question."""
 
     # Mirrors the EntityLink.from_entity_type values that History
-    # Editor surfaces. Intentionally a subset — projects / languages /
-    # contacts / skills / presentations are excluded per the product
-    # decision to only offer Analyze on the high-value entity types.
+    # Editor surfaces. Intentionally a subset — languages / contacts /
+    # skills / presentations are excluded per the product decision to
+    # only offer Analyze on the high-value entity types.
     entity_type: str = Field(
-        pattern=r"^(work|education|certification|publication|achievement|volunteer|custom)$",
+        pattern=r"^(work|education|certification|publication|achievement|volunteer|project|custom)$",
     )
     entity_id: int
 

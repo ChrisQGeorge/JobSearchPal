@@ -17,6 +17,7 @@ type AnalyzeEntityType =
   | "publication"
   | "achievement"
   | "volunteer"
+  | "project"
   | "custom";
 
 export function AnalyzeEntityButton({

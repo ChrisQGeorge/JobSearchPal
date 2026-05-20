@@ -133,6 +133,7 @@ export default function HistoryEditorPage() {
           endpoint="/api/v1/history/projects"
           title="Projects"
           entityType="project"
+          analyzeEntityType="project"
           skillsEndpoint={(id) => `/api/v1/history/projects/${id}/skills`}
           labelOf={(p) => p.name}
           subtitleOf={(p) =>

@@ -350,6 +350,7 @@ _ANALYZE_ENTITY_MODELS = {
     "publication":   ("Publication",    "title",   "publication"),
     "achievement":   ("Achievement",    "title",   "achievement"),
     "volunteer":     ("VolunteerWork",  "role",    "volunteer"),
+    "project":       ("Project",        "name",    "project"),
     "custom":        ("CustomEvent",    "title",   "custom"),
 }
 

@@ -93,6 +93,7 @@ type AnalyzeEntityKind =
   | "publication"
   | "achievement"
   | "volunteer"
+  | "project"
   | "custom";
 
 type Props<T extends GenericEntity> = {
