@@ -13,6 +13,9 @@ type ReviewItem = {
   location: string | null;
   date_discovered: string | null;
   fit_score: number | null;
+  // Backend now includes both `to_review` (fresh) and `reviewed`
+  // (skipped earlier — cycled to the back of the queue) rows.
+  status: "to_review" | "reviewed";
 };
 
 type ReviewQueueOut = {
@@ -39,18 +42,36 @@ export default function ReviewQueuePage() {
       .finally(() => setLoading(false));
   }, []);
 
-  const total = data?.total ?? 0;
   const items = data?.items ?? [];
+  const freshCount = items.filter((it) => it.status === "to_review").length;
+  const skippedCount = items.filter((it) => it.status === "reviewed").length;
   const firstId = data?.ids?.[0];
+
+  const subtitle = (() => {
+    if (items.length === 0) {
+      return "Nothing waiting — new jobs land here and you clear them from the detail page.";
+    }
+    const parts: string[] = [];
+    if (freshCount > 0) {
+      parts.push(
+        `${freshCount} fresh job${freshCount === 1 ? "" : "s"}`,
+      );
+    }
+    if (skippedCount > 0) {
+      parts.push(
+        `${skippedCount} skipped earlier — cycled to the back`,
+      );
+    }
+    return (
+      parts.join(" · ") +
+      ". Click any to start reviewing, or jump to the first with the button below."
+    );
+  })();
 
   return (
     <PageShell
       title="Review Queue"
-      subtitle={
-        total === 0
-          ? "Nothing waiting — new jobs land here and you clear them from the detail page."
-          : `${total} job${total === 1 ? "" : "s"} waiting on your attention. Click any to start reviewing, or jump to the first with the button below.`
-      }
+      subtitle={subtitle}
       actions={
         firstId ? (
           <Link
@@ -84,44 +105,57 @@ export default function ReviewQueuePage() {
         </div>
       ) : (
         <ul className="jsp-card divide-y divide-corp-border overflow-hidden">
-          {items.map((it, i) => (
-            <li
-              key={it.id}
-              className="flex items-center gap-3 py-2 px-4 hover:bg-corp-surface2"
-            >
-              <span className="text-xs text-corp-muted w-8 text-right shrink-0">
-                #{i + 1}
-              </span>
-              <div className="min-w-0 flex-1">
-                <div className="text-sm truncate">
-                  <Link
-                    href={`/jobs/${it.id}?from=review`}
-                    className="hover:text-corp-accent"
-                  >
-                    {it.title}
-                  </Link>
-                </div>
-                <div className="text-xs text-corp-muted truncate">
-                  {[
-                    it.organization_name,
-                    it.location,
-                    it.date_discovered
-                      ? `discovered ${it.date_discovered}`
-                      : null,
-                    it.fit_score != null ? `fit ${it.fit_score}` : null,
-                  ]
-                    .filter(Boolean)
-                    .join(" · ")}
-                </div>
-              </div>
-              <Link
-                href={`/jobs/${it.id}?from=review`}
-                className="jsp-btn-ghost text-xs shrink-0"
+          {items.map((it, i) => {
+            const isSkipped = it.status === "reviewed";
+            return (
+              <li
+                key={it.id}
+                className={`flex items-center gap-3 py-2 px-4 hover:bg-corp-surface2 ${
+                  isSkipped ? "opacity-60" : ""
+                }`}
               >
-                Review →
-              </Link>
-            </li>
-          ))}
+                <span className="text-xs text-corp-muted w-8 text-right shrink-0">
+                  #{i + 1}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <div className="text-sm truncate flex items-center gap-2">
+                    <Link
+                      href={`/jobs/${it.id}?from=review`}
+                      className="hover:text-corp-accent truncate"
+                    >
+                      {it.title}
+                    </Link>
+                    {isSkipped ? (
+                      <span
+                        className="text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded-full border border-corp-accent2/40 bg-corp-accent2/10 text-corp-accent2 shrink-0"
+                        title="You skipped this job earlier — it's queued at the back so you can revisit it."
+                      >
+                        Skipped
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="text-xs text-corp-muted truncate">
+                    {[
+                      it.organization_name,
+                      it.location,
+                      it.date_discovered
+                        ? `discovered ${it.date_discovered}`
+                        : null,
+                      it.fit_score != null ? `fit ${it.fit_score}` : null,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </div>
+                </div>
+                <Link
+                  href={`/jobs/${it.id}?from=review`}
+                  className="jsp-btn-ghost text-xs shrink-0"
+                >
+                  Review →
+                </Link>
+              </li>
+            );
+          })}
         </ul>
       )}
     </PageShell>

@@ -667,9 +667,76 @@ async def review_queue(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> ReviewQueueOut:
-    """Jobs with status=to_review — fresh, not yet triaged. Drives the
-    `/jobs/review` page and the "Next → " navigation on the detail page."""
-    return await _queue_by_status(db, user.id, "to_review")
+    """Drives the `/jobs/review` page and the "Next → " navigation on
+    the detail page.
+
+    Returns two cohorts merged into one list:
+      * `status=to_review` — fresh, never triaged. Always sorted first.
+      * `status=reviewed`  — jobs the user explicitly skipped via the
+        "Skip" button. They cycle back to the END of the queue rather
+        than disappearing, because the user typically skips when
+        they're waiting on something (re-running JD analysis, deciding
+        later) and wants to see the job again after working through
+        the fresh ones.
+
+    Within each cohort, FIFO by date_discovered then id.
+
+    Items carry their `status` so the frontend can render skipped rows
+    with a muted style. `total` is the union count (everything in the
+    queue, fresh + skipped) — both cohorts genuinely need attention,
+    just at different priorities.
+    """
+    from sqlalchemy import case
+
+    status_priority = case(
+        (TrackedJob.status == "to_review", 0),
+        (TrackedJob.status == "reviewed", 1),
+        else_=2,
+    )
+
+    stmt = (
+        select(TrackedJob)
+        .where(
+            TrackedJob.user_id == user.id,
+            TrackedJob.deleted_at.is_(None),
+            TrackedJob.status.in_(("to_review", "reviewed")),
+        )
+        .order_by(
+            status_priority,
+            TrackedJob.date_discovered.is_(None),
+            TrackedJob.date_discovered.asc(),
+            TrackedJob.id.asc(),
+        )
+    )
+    rows = list((await db.execute(stmt)).scalars().all())
+    org_ids = {r.organization_id for r in rows if r.organization_id}
+    org_names = await _org_names_for(db, org_ids)
+    items = [
+        {
+            "id": r.id,
+            "title": r.title,
+            "organization_id": r.organization_id,
+            "organization_name": (
+                org_names.get(r.organization_id) if r.organization_id else None
+            ),
+            "location": r.location,
+            "date_discovered": (
+                r.date_discovered.isoformat() if r.date_discovered else None
+            ),
+            "fit_score": (
+                (r.fit_summary or {}).get("score")
+                if isinstance(r.fit_summary, dict)
+                else None
+            ),
+            "status": r.status,
+        }
+        for r in rows
+    ]
+    return ReviewQueueOut(
+        total=len(rows),
+        ids=[r.id for r in rows],
+        items=items,
+    )
 
 
 @router.get("/apply-queue", response_model=ReviewQueueOut)
