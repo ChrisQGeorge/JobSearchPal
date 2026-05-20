@@ -371,6 +371,13 @@ export async function importExcel(file: File): Promise<{
   created_count: number;
   skipped_count: number;
   errors: { row: number; error: string }[];
+  skipped_duplicate_count?: number;
+  skipped_duplicates?: {
+    row: number;
+    url: string;
+    existing_job_id: number;
+    existing_title: string;
+  }[];
 }> {
   const form = new FormData();
   form.append("file", file);
@@ -409,6 +416,13 @@ export async function importQueueExcel(file: File): Promise<{
   enqueued_count: number;
   skipped_count: number;
   errors: { row: number; error: string }[];
+  skipped_duplicate_count?: number;
+  skipped_duplicates?: {
+    row: number;
+    url: string;
+    existing_job_id: number;
+    existing_title: string;
+  }[];
 }> {
   const form = new FormData();
   form.append("file", file);

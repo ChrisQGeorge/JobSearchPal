@@ -212,15 +212,30 @@ export default function JobTrackerPage() {
     setImportMsg(null);
     try {
       const res = await importExcel(file);
+      const dupCount = res.skipped_duplicate_count ?? 0;
+      const parts: string[] = [
+        `Imported ${res.created_count} job${res.created_count === 1 ? "" : "s"}`,
+      ];
+      if (dupCount > 0) {
+        parts.push(
+          `skipped ${dupCount} duplicate${dupCount === 1 ? "" : "s"} (URL already tracked)`,
+        );
+      }
+      if (res.skipped_count) {
+        parts.push(`skipped ${res.skipped_count} (see console for row errors)`);
+      }
+      const hadAnySkips = dupCount > 0 || res.skipped_count > 0;
       setImportMsg({
-        kind: res.skipped_count === 0 ? "ok" : "warn",
-        text: `Imported ${res.created_count} job${res.created_count === 1 ? "" : "s"}${
-          res.skipped_count ? `, skipped ${res.skipped_count} (see console for row errors)` : ""
-        }.`,
+        kind: hadAnySkips ? "warn" : "ok",
+        text: parts.join(", ") + ".",
       });
       if (res.errors.length > 0) {
         // eslint-disable-next-line no-console
         console.warn("Excel import row errors:", res.errors);
+      }
+      if (res.skipped_duplicates && res.skipped_duplicates.length > 0) {
+        // eslint-disable-next-line no-console
+        console.info("Excel import duplicates skipped:", res.skipped_duplicates);
       }
       refresh();
     } catch (err) {
@@ -326,14 +341,26 @@ export default function JobTrackerPage() {
     setImportMsg(null);
     try {
       const res = await importQueueExcel(file);
+      const dupCount = res.skipped_duplicate_count ?? 0;
+      const parts: string[] = [
+        `Enqueued ${res.enqueued_count} URL${res.enqueued_count === 1 ? "" : "s"} — the Companion will fetch them in the background`,
+      ];
+      if (dupCount > 0) {
+        parts.push(
+          `skipped ${dupCount} duplicate${dupCount === 1 ? "" : "s"} (URL already tracked)`,
+        );
+      }
+      if (res.skipped_count) {
+        parts.push(`skipped ${res.skipped_count} (see console for row errors)`);
+      }
       setImportMsg({
-        kind: res.skipped_count === 0 ? "ok" : "warn",
-        text: `Enqueued ${res.enqueued_count} URL${res.enqueued_count === 1 ? "" : "s"} — the Companion will fetch them in the background${
-          res.skipped_count
-            ? `, skipped ${res.skipped_count} (see console for row errors)`
-            : ""
-        }.`,
+        kind: dupCount > 0 || res.skipped_count > 0 ? "warn" : "ok",
+        text: parts.join(", ") + ".",
       });
+      if (res.skipped_duplicates && res.skipped_duplicates.length > 0) {
+        // eslint-disable-next-line no-console
+        console.info("Queue import duplicates skipped:", res.skipped_duplicates);
+      }
       if (res.errors.length > 0) {
         // eslint-disable-next-line no-console
         console.warn("Queue import row errors:", res.errors);
@@ -1288,6 +1315,33 @@ function NewJobForm({
       };
       const created = await api.post<TrackedJob>("/api/v1/jobs", payload);
       onSaved(created);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409) {
+        // Backend says this URL is already tracked. Surface a clickable
+        // pointer to the existing job so the user can hop over instead
+        // of double-creating.
+        const detail = (err.detail as
+          | { message?: string; existing_job_id?: number; existing_title?: string }
+          | null
+          | undefined) ?? null;
+        const id = detail?.existing_job_id;
+        const title = detail?.existing_title;
+        setFetchMsg({
+          kind: "warn",
+          text:
+            id != null
+              ? `This URL is already tracked as #${id}${title ? ` — ${title}` : ""}. Open it from the list below to edit instead of creating a duplicate.`
+              : "This URL is already tracked. Find it in the list below to edit instead of creating a duplicate.",
+        });
+      } else {
+        setFetchMsg({
+          kind: "error",
+          text:
+            err instanceof ApiError
+              ? `Save failed (HTTP ${err.status}).`
+              : "Save failed.",
+        });
+      }
     } finally {
       setSaving(false);
     }

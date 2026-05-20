@@ -101,6 +101,62 @@ async def _get_owned_job(
     return job
 
 
+def _normalize_source_url(url: str | None) -> str | None:
+    """Cheap canonicalization for dedup matching. Trims whitespace and
+    a single trailing slash; lower-cases the host. Query string is left
+    alone — `?ref=` etc. can change while still being the same listing,
+    but the user said "different URL → different job", so we don't
+    strip query params here. Returns None for empty input."""
+    if url is None:
+        return None
+    u = url.strip()
+    if not u:
+        return None
+    # Lowercase scheme + host only; preserve case for the path which
+    # some sites actually treat as case-sensitive.
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+
+        parts = urlsplit(u)
+        netloc = parts.netloc.lower()
+        scheme = parts.scheme.lower()
+        path = parts.path.rstrip("/") if parts.path != "/" else parts.path
+        u = urlunsplit((scheme, netloc, path, parts.query, parts.fragment))
+    except Exception:
+        # If urlsplit chokes on something weird, fall back to a literal
+        # trim — don't let canonicalization block the import.
+        u = u.rstrip("/")
+    return u or None
+
+
+async def _find_existing_job_by_url(
+    db: AsyncSession, user_id: int, url: str | None
+) -> Optional[TrackedJob]:
+    """Return the user's existing non-deleted TrackedJob with this
+    `source_url`, or None. Matches against the normalized form so
+    trailing-slash / scheme-case variants collapse to the same row.
+
+    The dedup is intentionally URL-only — same URL = same listing, and
+    if the URL differs we assume the jobs differ (per product call).
+    """
+    norm = _normalize_source_url(url)
+    if not norm:
+        return None
+    rows = (
+        await db.execute(
+            select(TrackedJob).where(
+                TrackedJob.user_id == user_id,
+                TrackedJob.deleted_at.is_(None),
+                TrackedJob.source_url.is_not(None),
+            )
+        )
+    ).scalars().all()
+    for row in rows:
+        if _normalize_source_url(row.source_url) == norm:
+            return row
+    return None
+
+
 async def _org_names_for(
     db: AsyncSession, ids: set[int]
 ) -> dict[int, str]:
@@ -458,6 +514,20 @@ async def create_job(
     )
     if "date_discovered" not in data:
         data["date_discovered"] = date.today()
+
+    # Same-URL dedup. Block import rather than enrich the existing row —
+    # the user controls the existing job and we don't want to surprise-
+    # update its fields.
+    existing = await _find_existing_job_by_url(db, user.id, data.get("source_url"))
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "A job with this URL is already tracked.",
+                "existing_job_id": existing.id,
+                "existing_title": existing.title,
+            },
+        )
 
     job = TrackedJob(user_id=user.id, **data)
     db.add(job)
@@ -2773,6 +2843,7 @@ async def import_jobs_from_xlsx(
 
     created: list[int] = []
     errors: list[dict] = []
+    skipped_duplicates: list[dict] = []
 
     for row_num, row in enumerate(rows, start=2):
         title = row.get("title")
@@ -2786,6 +2857,23 @@ async def import_jobs_from_xlsx(
                 {"row": row_num, "error": f"Unknown status '{status_val}'"}
             )
             continue
+
+        # URL dedup BEFORE we create the org or touch anything else, so a
+        # bulk re-upload of the same spreadsheet is a no-op for already-
+        # imported rows. Existing jobs are left untouched.
+        row_url = row.get("source_url")
+        if row_url:
+            existing = await _find_existing_job_by_url(db, user.id, row_url)
+            if existing is not None:
+                skipped_duplicates.append(
+                    {
+                        "row": row_num,
+                        "url": row_url,
+                        "existing_job_id": existing.id,
+                        "existing_title": existing.title,
+                    }
+                )
+                continue
 
         # Resolve / create Organization by name (case-insensitive).
         org_id: Optional[int] = None
@@ -2834,6 +2922,8 @@ async def import_jobs_from_xlsx(
         "created_count": len(created),
         "skipped_count": len(errors),
         "errors": errors,
+        "skipped_duplicates": skipped_duplicates,
+        "skipped_duplicate_count": len(skipped_duplicates),
     }
 
 
@@ -2878,6 +2968,7 @@ async def import_queue_from_xlsx(
 
     enqueued: list[int] = []
     errors: list[dict] = []
+    skipped_duplicates: list[dict] = []
 
     for row_num, row in enumerate(rows, start=2):
         url = row.get("url")
@@ -2888,6 +2979,20 @@ async def import_queue_from_xlsx(
         if not (url.startswith("http://") or url.startswith("https://")):
             errors.append(
                 {"row": row_num, "error": f"Unrecognized URL: {url[:120]}"}
+            )
+            continue
+
+        # Skip duplicates at enqueue time so we don't burn a Claude fetch
+        # call only to find out downstream that this URL is already tracked.
+        existing = await _find_existing_job_by_url(db, user.id, url)
+        if existing is not None:
+            skipped_duplicates.append(
+                {
+                    "row": row_num,
+                    "url": url,
+                    "existing_job_id": existing.id,
+                    "existing_title": existing.title,
+                }
             )
             continue
 
@@ -2912,6 +3017,8 @@ async def import_queue_from_xlsx(
         "enqueued_count": len(enqueued),
         "skipped_count": len(errors),
         "errors": errors,
+        "skipped_duplicates": skipped_duplicates,
+        "skipped_duplicate_count": len(skipped_duplicates),
     }
 
 

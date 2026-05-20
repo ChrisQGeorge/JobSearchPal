@@ -617,6 +617,56 @@ async def _handle_fetch(item: JobFetchQueue) -> None:
                 )
                 return
 
+        # Same-URL dedup. If the user already has a non-deleted TrackedJob
+        # for this URL, skip the import entirely — don't create a duplicate
+        # row and don't touch the existing one. Back-link any originating
+        # lead onto the existing job so the leads inbox still reflects
+        # "this lead is tracked" rather than "still a lead".
+        from app.api.v1.jobs import _find_existing_job_by_url
+
+        dup_lead_id: Optional[int] = None
+        if isinstance(row.payload, dict):
+            lid = row.payload.get("lead_id")
+            if isinstance(lid, int):
+                dup_lead_id = lid
+
+        duplicate = await _find_existing_job_by_url(db, row.user_id, payload.get("source_url") or row.url)
+        if duplicate is not None:
+            if dup_lead_id is not None:
+                from app.models.sources import JobLead
+
+                lead = (
+                    await db.execute(
+                        select(JobLead).where(
+                            JobLead.id == dup_lead_id,
+                            JobLead.user_id == row.user_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if lead is not None:
+                    lead.tracked_job_id = duplicate.id
+
+            row.state = "done"
+            row.created_tracked_job_id = duplicate.id
+            row.result = {
+                "created_tracked_job_id": duplicate.id,
+                "mode": "duplicate",
+                "note": "URL already tracked — import skipped, existing row left untouched.",
+            }
+            row.error_message = None
+            await db.commit()
+            queue_bus.publish({
+                "item_id": f"queue:{item_id}", "source": "fetch",
+                "label": label, "url": item_url, "kind": "done",
+                "created_tracked_job_id": duplicate.id,
+                "mode": "duplicate",
+            })
+            log.info(
+                "Fetch task %d → duplicate of TrackedJob id=%d, skipped import",
+                row.id, duplicate.id,
+            )
+            return
+
         # Create path (default).
         job = TrackedJob(user_id=row.user_id, **payload)
         db.add(job)
@@ -625,11 +675,7 @@ async def _handle_fetch(item: JobFetchQueue) -> None:
         # If this fetch was triggered by a lead promotion, back-link
         # the new TrackedJob onto the originating JobLead row so the
         # leads inbox reflects the promotion target.
-        lead_id: Optional[int] = None
-        if isinstance(row.payload, dict):
-            lid = row.payload.get("lead_id")
-            if isinstance(lid, int):
-                lead_id = lid
+        lead_id: Optional[int] = dup_lead_id
         if lead_id is not None:
             from app.models.sources import JobLead
 
