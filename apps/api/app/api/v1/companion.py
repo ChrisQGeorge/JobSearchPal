@@ -187,9 +187,70 @@ Style: concise, helpful, lightly ironic-corporate in tone. Stay factual.
 
 log = logging.getLogger(__name__)
 
-log = logging.getLogger(__name__)
-
 router = APIRouter(prefix="/companion", tags=["companion"])
+
+
+# --------------------------------------------------------------------
+# In-flight chat run registry
+# --------------------------------------------------------------------
+# Each in-flight Claude chat lives in `_CHAT_RUNS` keyed by
+# "{conv_id}:{user_msg_id}". The background asyncio task owns the
+# Claude subprocess and persists the assistant message when it finishes —
+# the SSE generator is just a tap that subscribes to a per-run event log,
+# so the user can close the chat tab without killing the chat. Late or
+# returning clients can re-subscribe and replay the buffered events to
+# catch up.
+import asyncio as _asyncio_reg
+from dataclasses import dataclass, field
+
+
+@dataclass
+class _ChatRun:
+    """One in-flight Claude chat turn, decoupled from any HTTP request."""
+
+    task: _asyncio_reg.Task | None = None
+    events: list[dict] = field(default_factory=list)  # replay buffer
+    subscribers: set[_asyncio_reg.Queue] = field(default_factory=set)
+    done: bool = False
+    cleanup_handle: _asyncio_reg.TimerHandle | None = None
+
+
+_CHAT_RUNS: dict[str, _ChatRun] = {}
+# How long to keep a finished run around so late subscribers can still
+# pick up the terminal "done" / "error" frame and the assistant message id.
+_CHAT_RUN_TTL_AFTER_DONE_SECONDS = 60
+
+
+def _chat_run_key(conv_id: int, user_msg_id: int) -> str:
+    return f"{conv_id}:{user_msg_id}"
+
+
+def _publish_chat_event(run_key: str, ev: dict) -> None:
+    """Append `ev` to the run's replay buffer and fan to live subscribers."""
+    run = _CHAT_RUNS.get(run_key)
+    if run is None:
+        return
+    run.events.append(ev)
+    for q in list(run.subscribers):
+        try:
+            q.put_nowait(ev)
+        except _asyncio_reg.QueueFull:
+            # Slow subscriber — drop. They'll still see the replay buffer
+            # on reconnect.
+            pass
+
+
+def _schedule_run_cleanup(run_key: str) -> None:
+    run = _CHAT_RUNS.get(run_key)
+    if run is None:
+        return
+    if run.cleanup_handle is not None:
+        run.cleanup_handle.cancel()
+    loop = _asyncio_reg.get_event_loop()
+    run.cleanup_handle = loop.call_later(
+        _CHAT_RUN_TTL_AFTER_DONE_SECONDS,
+        lambda: _CHAT_RUNS.pop(run_key, None),
+    )
 
 
 import re as _re
@@ -891,6 +952,275 @@ async def _build_primer_for(user: User, db: AsyncSession) -> str:
     return primer
 
 
+async def _run_chat_in_background(
+    *,
+    run_key: str,
+    conv_id: int,
+    user_msg_id: int,
+    session_id_in: str | None,
+    user_content: str,
+    primer: str,
+    api_token: str,
+) -> None:
+    """Run the Claude stream end-to-end. Owns its own SessionLocal and is
+    decoupled from any HTTP request — the chat completes (with the
+    assistant message persisted) whether or not anyone is subscribed.
+
+    Events are pushed to the run's replay buffer + live subscribers via
+    `_publish_chat_event`. Compact tool/result markers are also published
+    onto the Companion Activity (/queue) bus.
+    """
+    import asyncio as _a
+    from app.skills import queue_bus as _bus
+    from datetime import datetime as _dt_bus, timezone as _tz_bus
+    from app.core.database import SessionLocal as _SL
+    from app.skills.runner import stream_claude_prompt as _stream
+
+    _STREAM_TIMEOUT_SECONDS = 900  # 15 min; covers long bulk operations
+
+    collected_text: list[str] = []
+    cost_usd: float | None = None
+    duration_ms: int | None = None
+    num_turns: int | None = None
+    session_id_out: str | None = None
+    tool_calls_log: list[dict] = []
+    had_error: bool = False
+    error_message: str | None = None
+    persisted_msg_id: int | None = None
+    skills_inferred: list[str] = []
+
+    bus_item_id = f"chat:{conv_id}:{user_msg_id}"
+    bus_label = (
+        f"Chat: {user_content.strip().splitlines()[0][:80]}" if user_content else "Chat"
+    )
+
+    def _bus_emit(payload: dict) -> None:
+        try:
+            _bus.publish(
+                {
+                    **payload,
+                    "source": "companion",
+                    "item_id": bus_item_id,
+                    "label": bus_label,
+                    "t": _dt_bus.now(tz=_tz_bus.utc).isoformat(timespec="seconds"),
+                }
+            )
+        except Exception:
+            log.exception("companion stream: bus publish failed")
+
+    _bus_emit({"kind": "start"})
+    _publish_chat_event(run_key, {"type": "user_saved", "message_id": user_msg_id})
+
+    try:
+        async for ev in _stream(
+            prompt=user_content,
+            session_id=session_id_in,
+            system_prompt_append=primer,
+            allowed_tools=["Bash", "Read", "Grep", "Glob", "WebFetch", "WebSearch"],
+            extra_env={
+                "JSP_API_BASE_URL": "http://localhost:8000",
+                "JSP_API_TOKEN": api_token,
+            },
+            timeout_seconds=_STREAM_TIMEOUT_SECONDS,
+        ):
+            ev_type = ev.get("type")
+
+            if ev_type == "error":
+                had_error = True
+                error_message = str(ev.get("message") or "Unknown streaming error")
+                _publish_chat_event(
+                    run_key, {"type": "error", "message": error_message}
+                )
+                continue
+
+            if ev_type == "system":
+                sid = ev.get("session_id")
+                if sid:
+                    session_id_out = sid
+                continue
+
+            if ev_type == "assistant":
+                # CLI wraps Messages-API shape in {type:"assistant", message:{...}}.
+                # With --include-partial-messages, text content is ALSO emitted
+                # as stream_event content_block_delta below — we only consume
+                # tool_use blocks here to avoid doubling every word. Final
+                # `result` event has a `result` field used as a fallback when
+                # partials are absent entirely.
+                msg = ev.get("message") or {}
+                content_blocks = msg.get("content") or []
+                if isinstance(content_blocks, list):
+                    for block in content_blocks:
+                        if block.get("type") == "tool_use":
+                            tu = {
+                                "name": block.get("name"),
+                                "id": block.get("id"),
+                                "input": block.get("input"),
+                            }
+                            tool_calls_log.append(tu)
+                            _publish_chat_event(
+                                run_key, {"type": "tool_use", **tu}
+                            )
+                            inp = tu.get("input") or {}
+                            compact = {
+                                k: (
+                                    (str(v)[:300] + "…")
+                                    if isinstance(v, str) and len(str(v)) > 300
+                                    else v
+                                )
+                                for k, v in (
+                                    inp.items() if isinstance(inp, dict) else []
+                                )
+                            }
+                            _bus_emit(
+                                {
+                                    "kind": "tool_use",
+                                    "tool": tu.get("name"),
+                                    "input": compact,
+                                }
+                            )
+                continue
+
+            if ev_type == "stream_event":
+                sub = ev.get("event") or {}
+                if sub.get("type") == "content_block_delta":
+                    delta = sub.get("delta") or {}
+                    if delta.get("type") == "text_delta":
+                        text = delta.get("text") or ""
+                        if text:
+                            collected_text.append(text)
+                            _publish_chat_event(
+                                run_key, {"type": "text_delta", "text": text}
+                            )
+                continue
+
+            if ev_type == "result":
+                cost_usd = ev.get("total_cost_usd") or ev.get("cost_usd")
+                duration_ms = ev.get("duration_ms")
+                num_turns = ev.get("num_turns")
+                if ev.get("session_id"):
+                    session_id_out = ev["session_id"]
+                if not collected_text and ev.get("result"):
+                    txt = str(ev["result"])
+                    collected_text.append(txt)
+                    _publish_chat_event(
+                        run_key, {"type": "text_delta", "text": txt}
+                    )
+                _bus_emit(
+                    {
+                        "kind": "result",
+                        "cost_usd": cost_usd,
+                        "duration_ms": duration_ms,
+                        "num_turns": num_turns,
+                    }
+                )
+                continue
+    except _a.CancelledError:
+        # The chat run task itself was cancelled (e.g. via the Cancel
+        # button on /queue). Best-effort persist what we have.
+        had_error = True
+        error_message = "Chat task cancelled"
+    except Exception as exc:  # pragma: no cover
+        log.exception("companion stream: producer crashed")
+        had_error = True
+        error_message = f"Streaming failed: {exc}"
+
+    # Persist the assistant turn — succeeds even if every subscriber dropped.
+    try:
+        final_text = "".join(collected_text)
+        skills_inferred = _infer_skills_used(final_text)
+        tool_results_blob = {
+            "meta": {
+                "cost_usd": cost_usd,
+                "duration_ms": duration_ms,
+                "num_turns": num_turns,
+            },
+        }
+        if skills_inferred:
+            tool_results_blob["skills_inferred"] = skills_inferred
+
+        async with _SL() as db2:
+            conv_row = (
+                await db2.execute(
+                    select(CompanionConversation).where(
+                        CompanionConversation.id == conv_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if conv_row is not None and not had_error:
+                msg = ConversationMessage(
+                    conversation_id=conv_row.id,
+                    role="assistant",
+                    content_md=final_text,
+                    tool_calls=tool_calls_log or None,
+                    tool_results=tool_results_blob,
+                )
+                db2.add(msg)
+                if session_id_out:
+                    conv_row.claude_session_id = session_id_out
+                if not conv_row.title:
+                    conv_row.title = user_content.strip().splitlines()[0][:80]
+                await db2.commit()
+                await db2.refresh(msg)
+                persisted_msg_id = msg.id
+            elif had_error and conv_row is not None:
+                if final_text:
+                    db2.add(
+                        ConversationMessage(
+                            conversation_id=conv_row.id,
+                            role="assistant",
+                            content_md=final_text,
+                            tool_calls=tool_calls_log or None,
+                            tool_results=tool_results_blob,
+                        )
+                    )
+                db2.add(
+                    ConversationMessage(
+                        conversation_id=conv_row.id,
+                        role="system",
+                        content_md=error_message or "Streaming error",
+                    )
+                )
+                if session_id_out:
+                    conv_row.claude_session_id = session_id_out
+                await db2.commit()
+    except Exception:
+        log.exception("companion stream: persist failed")
+
+    # Terminal bus + chat events.
+    if had_error:
+        _bus_emit({"kind": "error", "text": error_message or "Stream ended"})
+        _publish_chat_event(
+            run_key,
+            {
+                "type": "done",
+                "assistant_message_id": None,
+                "conversation_id": conv_id,
+                "error": error_message,
+            },
+        )
+    else:
+        _bus_emit({"kind": "done"})
+        _publish_chat_event(
+            run_key,
+            {
+                "type": "done",
+                "assistant_message_id": persisted_msg_id,
+                "conversation_id": conv_id,
+                "cost_usd": cost_usd,
+                "duration_ms": duration_ms,
+                "num_turns": num_turns,
+                "skills_inferred": skills_inferred,
+            },
+        )
+
+    # Mark the run done and schedule cleanup so late subscribers can still
+    # pick up the terminal frames.
+    run = _CHAT_RUNS.get(run_key)
+    if run is not None:
+        run.done = True
+    _schedule_run_cleanup(run_key)
+
+
 @router.post("/conversations/{conv_id}/messages-stream")
 async def send_message_stream(
     conv_id: int,
@@ -899,6 +1229,13 @@ async def send_message_stream(
     user: User = Depends(get_current_user),
 ) -> StreamingResponse:
     """Stream the Companion's response as Server-Sent-Events.
+
+    The Claude run is owned by a fire-and-forget background task — the
+    SSE response is a thin subscriber on top. If the client closes the
+    tab the chat keeps running and the assistant message lands in the
+    DB when it finishes. Late or returning clients can reattach via
+    the `GET /conversations/{conv_id}/messages/{user_msg_id}/stream`
+    endpoint and pick up where they left off via the replay buffer.
 
     Emits these event shapes:
       {"type":"user_saved","message_id":N}                  — user turn persisted
@@ -909,9 +1246,9 @@ async def send_message_stream(
           "conversation_id":N,"cost_usd":0.01,
           "duration_ms":4500,"num_turns":3,
           "skills_inferred":["Bash","WebFetch"]}            — stream complete
-
-    Persists user turn before streaming, assistant turn after streaming.
     """
+    import asyncio as _a
+
     conv = await _get_owned_conversation(db, conv_id, user.id)
 
     user_msg = ConversationMessage(
@@ -930,336 +1267,106 @@ async def send_message_stream(
 
     api_token = create_access_token(subject=str(user.id), extra={"purpose": "companion"})
     primer = await _build_primer_for(user, db)
-
-    # Resolve attachments and inline them as a prompt prefix.
     attachments = await _resolve_attached_documents(
         db, user.id, payload.attached_document_ids
     )
     attachments_prefix = _format_attachments_block(attachments)
 
-    # Capture state inside the generator.
     conv_id_local = conv.id
     session_id_in = conv.claude_session_id
     user_msg_id = user_msg.id
     user_content = attachments_prefix + payload.content
+    run_key = _chat_run_key(conv_id_local, user_msg_id)
 
-    async def event_stream():
-        nonlocal session_id_in
-        collected_text: list[str] = []
-        cost_usd: float | None = None
-        duration_ms: int | None = None
-        num_turns: int | None = None
-        session_id_out: str | None = None
-        tool_calls_log: list[dict] = []
-        had_error: bool = False
-        error_message: str | None = None
-
-        # Variables set inside the finally block but read in the post-finally
-        # done-frame yield. Initialized here so they always exist even if
-        # persist fails before assignment.
-        persisted_msg_id: int | None = None
-        skills_inferred: list[str] = []
-
-        yield _sse({"type": "user_saved", "message_id": user_msg_id})
-
-        # Mirror key events onto the Companion Activity (/queue) live feed so
-        # users can see when chat tasks kick off, which tools the Companion
-        # used, and when they complete. Tool-use + start + result only — the
-        # text deltas stay on the chat page to avoid flooding the activity
-        # log with whole essays.
-        from app.skills import queue_bus as _bus
-        from datetime import datetime as _dt_bus, timezone as _tz_bus
-
-        def _bus_emit(payload: dict) -> None:
-            payload = {
-                **payload,
-                "source": "companion",
-                "item_id": f"chat:{conv_id_local}:{user_msg_id}",
-                "label": f"Chat: {user_content.strip().splitlines()[0][:80]}" if user_content else "Chat",
-                "t": _dt_bus.now(tz=_tz_bus.utc).isoformat(timespec="seconds"),
-            }
-            _bus.publish(payload)
-
-        _bus_emit({"kind": "start"})
-
-        # Pipe events through an intermediate asyncio.Queue so the generator
-        # can emit an SSE keepalive comment every few seconds even when
-        # Claude is silent inside a long tool run (e.g. bulk-adding 80
-        # skills via one big shell loop). Without this, the SSE socket
-        # goes idle, the Next.js proxy cuts it off, and the chat "hangs"
-        # from the user's perspective even though the backend is working.
-        import asyncio as _asyncio
-        ev_queue: _asyncio.Queue = _asyncio.Queue()
-        _DONE_SENTINEL: object = object()
-        _STREAM_TIMEOUT_SECONDS = 900  # 15 min; covers long bulk operations
-
-        async def _producer():
-            try:
-                async for ev in stream_claude_prompt(
-                    prompt=user_content,
-                    session_id=session_id_in,
-                    system_prompt_append=primer,
-                    allowed_tools=["Bash", "Read", "Grep", "Glob", "WebFetch", "WebSearch"],
-                    extra_env={
-                        "JSP_API_BASE_URL": "http://localhost:8000",
-                        "JSP_API_TOKEN": api_token,
-                    },
-                    timeout_seconds=_STREAM_TIMEOUT_SECONDS,
-                ):
-                    await ev_queue.put(ev)
-            except Exception as exc:
-                await ev_queue.put({"type": "error", "message": f"Streaming failed: {exc}"})
-            finally:
-                await ev_queue.put(_DONE_SENTINEL)
-
-        producer_task = _asyncio.create_task(_producer())
-
-        try:
-            while True:
-                try:
-                    ev = await _asyncio.wait_for(ev_queue.get(), timeout=12.0)
-                except _asyncio.TimeoutError:
-                    # 12 s of silence → send an SSE comment so the browser and
-                    # every intermediate proxy know the socket is alive. Comment
-                    # lines (":...") are ignored by EventSource consumers.
-                    yield b": keepalive\n\n"
-                    continue
-                if ev is _DONE_SENTINEL:
-                    break
-                ev_type = ev.get("type")
-
-                if ev_type == "error":
-                    had_error = True
-                    error_message = str(ev.get("message") or "Unknown streaming error")
-                    yield _sse({"type": "error", "message": error_message})
-                    continue
-
-                if ev_type == "system":
-                    sid = ev.get("session_id")
-                    if sid:
-                        session_id_out = sid
-                    continue
-
-                if ev_type == "assistant":
-                    # The CLI wraps Messages-API shape in {type:"assistant", message:{...}}.
-                    # NOTE: with `--include-partial-messages` (set by runner.py),
-                    # text content is ALSO emitted as stream_event content_block_delta
-                    # frames below. We only consume tool_use blocks here — taking
-                    # text from both sources double-counts every word. See bug:
-                    # chat showed each paragraph twice in a row.
-                    #
-                    # As a fallback for the rare case where partials are skipped
-                    # entirely (very short turns), the `result` event handler will
-                    # use its `result` field if `collected_text` is still empty.
-                    msg = ev.get("message") or {}
-                    content_blocks = msg.get("content") or []
-                    if isinstance(content_blocks, list):
-                        for block in content_blocks:
-                            btype = block.get("type")
-                            if btype == "tool_use":
-                                tu = {
-                                    "name": block.get("name"),
-                                    "id": block.get("id"),
-                                    "input": block.get("input"),
-                                }
-                                tool_calls_log.append(tu)
-                                yield _sse({"type": "tool_use", **tu})
-                                # Also send a compact version to the activity bus.
-                                inp = tu.get("input") or {}
-                                compact = {
-                                    k: (
-                                        (str(v)[:300] + "…")
-                                        if isinstance(v, str) and len(str(v)) > 300
-                                        else v
-                                    )
-                                    for k, v in (inp.items() if isinstance(inp, dict) else [])
-                                }
-                                _bus_emit(
-                                    {
-                                        "kind": "tool_use",
-                                        "tool": tu.get("name"),
-                                        "input": compact,
-                                    }
-                                )
-                            # text blocks intentionally skipped — see note above.
-                    continue
-
-                if ev_type == "stream_event":
-                    # Partial message delta — live token streaming. This is the
-                    # ONLY source of text in collected_text. The complete-message
-                    # `assistant` event above ignores text to avoid duplication.
-                    sub = ev.get("event") or {}
-                    sub_type = sub.get("type")
-                    if sub_type == "content_block_delta":
-                        delta = sub.get("delta") or {}
-                        if delta.get("type") == "text_delta":
-                            text = delta.get("text") or ""
-                            if text:
-                                collected_text.append(text)
-                                yield _sse({"type": "text_delta", "text": text})
-                    continue
-
-                if ev_type == "result":
-                    cost_usd = ev.get("total_cost_usd") or ev.get("cost_usd")
-                    duration_ms = ev.get("duration_ms")
-                    num_turns = ev.get("num_turns")
-                    if ev.get("session_id"):
-                        session_id_out = ev["session_id"]
-                    # Final text is sometimes only present on the result event
-                    # (e.g. when partial messages weren't emitted). Use it as a
-                    # fallback, but only if we haven't already collected text.
-                    if not collected_text and ev.get("result"):
-                        txt = str(ev["result"])
-                        collected_text.append(txt)
-                        yield _sse({"type": "text_delta", "text": txt})
-                    _bus_emit(
-                        {
-                            "kind": "result",
-                            "cost_usd": cost_usd,
-                            "duration_ms": duration_ms,
-                            "num_turns": num_turns,
-                        }
-                    )
-                    continue
-        except _asyncio.CancelledError:
-            # Client disconnected (navigated away, closed tab, network blip).
-            # CancelledError does NOT inherit from Exception in py3.10+, so
-            # the broader handler below misses it — without this, the
-            # generator unwinds straight to the finally without ever marking
-            # the task as "done"/"error" on the bus, and it sits in
-            # "running" forever (until the 20-min stale sweep). We treat
-            # disconnect as a terminal error so the activity feed reflects
-            # reality immediately; the partial assistant text we collected
-            # so far is still persisted in the post-finally block.
-            had_error = True
-            error_message = "Client disconnected mid-stream"
-            raise  # let FastAPI complete the disconnect cleanup
-        except Exception as exc:  # pragma: no cover
-            had_error = True
-            error_message = f"Streaming failed: {exc}"
-            try:
-                yield _sse({"type": "error", "message": error_message})
-            except Exception:
-                pass  # client may already be gone
-        finally:
-            # Cancel the background producer (kills the Claude subprocess).
-            if not producer_task.done():
-                producer_task.cancel()
-            try:
-                await producer_task
-            except (_asyncio.CancelledError, Exception):
-                pass
-            # Always emit a terminal bus event so the activity feed never
-            # shows a phantom "running" row, including on client disconnect.
-            try:
-                if had_error:
-                    _bus_emit({"kind": "error", "text": error_message or "Stream ended"})
-                else:
-                    _bus_emit({"kind": "done"})
-            except Exception:
-                pass
-            # Persist whatever we have, regardless of how the stream ended.
-            # Done in the `finally` so a client disconnect doesn't drop the
-            # partial assistant text. No yields from here on — the socket
-            # may already be closed.
-            try:
-                final_text = "".join(collected_text)
-                skills_inferred = _infer_skills_used(final_text)
-                tool_results_blob = {
-                    "meta": {
-                        "cost_usd": cost_usd,
-                        "duration_ms": duration_ms,
-                        "num_turns": num_turns,
-                    },
-                }
-                if skills_inferred:
-                    tool_results_blob["skills_inferred"] = skills_inferred
-
-                from app.core.database import SessionLocal as _SL
-                from app.models.companion import (
-                    CompanionConversation as _Conv,
-                    ConversationMessage as _Msg,
-                )
-                async with _SL() as db2:
-                    conv_row = (
-                        await db2.execute(
-                            select(_Conv).where(_Conv.id == conv_id_local)
-                        )
-                    ).scalar_one_or_none()
-                    if conv_row is not None and not had_error:
-                        msg = _Msg(
-                            conversation_id=conv_row.id,
-                            role="assistant",
-                            content_md=final_text,
-                            tool_calls=tool_calls_log or None,
-                            tool_results=tool_results_blob,
-                        )
-                        db2.add(msg)
-                        if session_id_out:
-                            conv_row.claude_session_id = session_id_out
-                        if not conv_row.title:
-                            conv_row.title = user_content.strip().splitlines()[0][:80]
-                        await db2.commit()
-                        await db2.refresh(msg)
-                        persisted_msg_id = msg.id
-                    elif had_error and conv_row is not None:
-                        # Save whatever partial assistant text we collected,
-                        # plus a system message describing the error. Both
-                        # are visible on chat reload.
-                        if final_text:
-                            partial = _Msg(
-                                conversation_id=conv_row.id,
-                                role="assistant",
-                                content_md=final_text,
-                                tool_calls=tool_calls_log or None,
-                                tool_results=tool_results_blob,
-                            )
-                            db2.add(partial)
-                        sys_msg = _Msg(
-                            conversation_id=conv_row.id,
-                            role="system",
-                            content_md=error_message or "Streaming error",
-                        )
-                        db2.add(sys_msg)
-                        if session_id_out:
-                            conv_row.claude_session_id = session_id_out
-                        await db2.commit()
-            except Exception:
-                log.exception("companion stream: persist failed")
-                persisted_msg_id = None
-
-        # Final SSE frame for clients still connected. Wrapped in try in
-        # case the socket dropped after the finally ran.
-        try:
-            if not had_error:
-                yield _sse(
-                    {
-                        "type": "done",
-                        "assistant_message_id": persisted_msg_id,
-                        "conversation_id": conv_id_local,
-                        "cost_usd": cost_usd,
-                        "duration_ms": duration_ms,
-                        "num_turns": num_turns,
-                        "skills_inferred": skills_inferred,
-                    }
-                )
-            else:
-                yield _sse(
-                    {
-                        "type": "done",
-                        "assistant_message_id": None,
-                        "conversation_id": conv_id_local,
-                        "error": error_message,
-                    }
-                )
-        except Exception:
-            pass
+    # Register the run and kick off the background task. The task lives
+    # on after this request returns.
+    run = _ChatRun()
+    _CHAT_RUNS[run_key] = run
+    run.task = _a.create_task(
+        _run_chat_in_background(
+            run_key=run_key,
+            conv_id=conv_id_local,
+            user_msg_id=user_msg_id,
+            session_id_in=session_id_in,
+            user_content=user_content,
+            primer=primer,
+            api_token=api_token,
+        ),
+        name=f"chat-stream-{run_key}",
+    )
 
     return StreamingResponse(
-        event_stream(),
+        _chat_run_event_stream(run_key),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.get("/conversations/{conv_id}/messages/{user_msg_id}/stream")
+async def reattach_message_stream(
+    conv_id: int,
+    user_msg_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    """Re-subscribe to an in-flight chat run. Used by the front-end when
+    the user navigates back to a chat whose last message is `user` and
+    we want to resume streaming instead of starting a new turn.
+
+    Returns 404 if no run exists for that (conv_id, user_msg_id) — either
+    it finished long enough ago to fall out of the registry, or it never
+    started. Either way the client should fall back to plain conversation
+    polling and read the assistant message from the DB.
+    """
+    await _get_owned_conversation(db, conv_id, user.id)
+    run_key = _chat_run_key(conv_id, user_msg_id)
+    if run_key not in _CHAT_RUNS:
+        raise HTTPException(status_code=404, detail="No live chat for that message")
+    return StreamingResponse(
+        _chat_run_event_stream(run_key),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _chat_run_event_stream(run_key: str):
+    """SSE generator: replays any buffered events for the run then yields
+    live events as they arrive. Detaches cleanly on client disconnect —
+    the background run keeps going."""
+    import asyncio as _a
+
+    run = _CHAT_RUNS.get(run_key)
+    if run is None:
+        # Run finished + cleaned up before anyone connected. Tell the
+        # client to fall back to polling.
+        yield _sse({"type": "error", "message": "Run not found"})
+        return
+
+    q: _a.Queue = _a.Queue(maxsize=512)
+    run.subscribers.add(q)
+    try:
+        # Replay any events that arrived before we subscribed so reconnecting
+        # clients catch up. New events also arrive on `q` going forward.
+        for ev in list(run.events):
+            yield _sse(ev)
+            if ev.get("type") == "done":
+                return
+
+        while True:
+            try:
+                ev = await _a.wait_for(q.get(), timeout=12.0)
+            except _a.TimeoutError:
+                # Keepalive comment — proxies and EventSource ignore it.
+                yield b": keepalive\n\n"
+                continue
+            yield _sse(ev)
+            if ev.get("type") == "done":
+                return
+    finally:
+        run.subscribers.discard(q)

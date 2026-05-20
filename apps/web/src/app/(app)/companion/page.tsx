@@ -531,6 +531,159 @@ function ChatPane({
     }
   }, [detail?.messages.length, sending]);
 
+  // Consume an SSE response body. Shared between `send()` (POST stream)
+  // and the reattach effect (GET stream). Mutates the local accumulators
+  // via the on*-callback signatures the caller passes in. Returns the
+  // final assistant text + inferred skills the stream reported.
+  async function consumeStream(
+    body: ReadableStream<Uint8Array>,
+    onText: (full: string) => void,
+    onTools: (tools: { name: string; input: unknown }[]) => void,
+  ): Promise<{ assistantText: string; skillsInferred: string[] }> {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let assistantText = "";
+    let skillsInferred: string[] = [];
+    const toolsUsed: { name: string; input: unknown }[] = [];
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const frames = buffer.split("\n\n");
+      buffer = frames.pop() ?? "";
+      for (const frame of frames) {
+        const line = frame.trim();
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (!payload) continue;
+        let ev: {
+          type: string;
+          text?: string;
+          name?: string;
+          input?: unknown;
+          message?: string;
+          skills_inferred?: string[];
+          [k: string]: unknown;
+        };
+        try {
+          ev = JSON.parse(payload);
+        } catch {
+          continue;
+        }
+        if (ev.type === "text_delta" && typeof ev.text === "string") {
+          const isFirstTextChunk = assistantText.length === 0;
+          assistantText += ev.text;
+          onText(assistantText);
+          if (isFirstTextChunk) {
+            pushActivity("text", "Writing reply…");
+          }
+        } else if (ev.type === "tool_use") {
+          toolsUsed.push({ name: String(ev.name ?? ""), input: ev.input });
+          onTools(toolsUsed);
+          const toolName = String(ev.name ?? "tool");
+          const inp = (ev.input as Record<string, unknown> | undefined) ?? {};
+          let summary: string;
+          if (toolName === "Bash" && typeof inp.command === "string") {
+            summary = `${toolName} · ${(inp.command as string).slice(0, 80)}`;
+          } else if (toolName === "Read" && typeof inp.file_path === "string") {
+            summary = `${toolName} · ${inp.file_path as string}`;
+          } else if (toolName === "Grep" && typeof inp.pattern === "string") {
+            summary = `${toolName} · /${inp.pattern as string}/`;
+          } else if (toolName === "WebFetch" && typeof inp.url === "string") {
+            summary = `${toolName} · ${inp.url as string}`;
+          } else if (toolName === "WebSearch" && typeof inp.query === "string") {
+            summary = `${toolName} · ${inp.query as string}`;
+          } else {
+            summary = toolName;
+          }
+          pushActivity("tool", summary);
+        } else if (ev.type === "error" && typeof ev.message === "string") {
+          setError(ev.message);
+          pushActivity("info", `Error: ${ev.message.slice(0, 80)}`);
+        } else if (ev.type === "done") {
+          if (Array.isArray(ev.skills_inferred)) {
+            skillsInferred = ev.skills_inferred as string[];
+          }
+        }
+      }
+    }
+    return { assistantText, skillsInferred };
+  }
+
+  // Reattach to an in-flight chat run when the user opens a conversation
+  // whose last message is `user`. The backend's chat task runs detached
+  // from any HTTP request — if it's still going we can subscribe to
+  // its event stream and pick up where the previous tab left off.
+  // Otherwise the run is finished; the assistant message is already in
+  // `detail.messages` on reload and there's nothing to do.
+  const reattachedRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!detail || sending) return;
+    const lastMsg = detail.messages[detail.messages.length - 1];
+    if (!lastMsg || lastMsg.role !== "user") return;
+    // Only attempt once per (conversation, user message) pair so we don't
+    // hammer the endpoint with reconnect attempts.
+    if (reattachedRef.current === lastMsg.id) return;
+    reattachedRef.current = lastMsg.id;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(
+          apiUrl(
+            `/api/v1/companion/conversations/${detail.id}/messages/${lastMsg.id}/stream`,
+          ),
+          { method: "GET", credentials: "include" },
+        );
+        if (cancelled) return;
+        if (!res.ok || !res.body) return; // 404 = no live run; fall through to polling
+        setSending(true);
+        setActivityLog([]);
+        const tempAssistantId = -Date.now();
+        const now = new Date().toISOString();
+        onStreamingStart(lastMsg, {
+          id: tempAssistantId,
+          conversation_id: detail.id,
+          role: "assistant",
+          content_md: "",
+          skill_invoked: null,
+          tool_calls: null,
+          tool_results: null,
+          created_at: now,
+        });
+        const { assistantText, skillsInferred } = await consumeStream(
+          res.body,
+          (txt) => onAssistantDelta(tempAssistantId, txt),
+          (tools) => onAssistantMeta(tempAssistantId, tools),
+        );
+        if (cancelled) return;
+        try {
+          const fresh = await api.get<ConversationDetail>(
+            `/api/v1/companion/conversations/${detail.id}`,
+          );
+          onStreamingDone(fresh);
+        } catch {
+          onStreamingLocalDone(tempAssistantId, assistantText, skillsInferred);
+        }
+      } catch {
+        // Reattach is best-effort. Polling will catch the assistant
+        // message when the background task persists it.
+      } finally {
+        if (!cancelled) {
+          setSending(false);
+          setActivityLog([]);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detail?.id, detail?.messages.length]);
+
   async function send() {
     if (!detail || !input.trim() || sending) return;
     setError(null);
@@ -583,82 +736,11 @@ function ChatPane({
       if (!res.ok || !res.body) {
         throw new Error(`HTTP ${res.status}`);
       }
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let assistantText = "";
-      let skillsInferred: string[] = [];
-      const toolsUsed: { name: string; input: unknown }[] = [];
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const frames = buffer.split("\n\n");
-        buffer = frames.pop() ?? "";
-        for (const frame of frames) {
-          const line = frame.trim();
-          if (!line.startsWith("data:")) continue;
-          const payload = line.slice(5).trim();
-          if (!payload) continue;
-          let ev: {
-            type: string;
-            text?: string;
-            name?: string;
-            input?: unknown;
-            message?: string;
-            skills_inferred?: string[];
-            [k: string]: unknown;
-          };
-          try {
-            ev = JSON.parse(payload);
-          } catch {
-            continue;
-          }
-          if (ev.type === "text_delta" && typeof ev.text === "string") {
-            const isFirstTextChunk = assistantText.length === 0;
-            assistantText += ev.text;
-            onAssistantDelta(tempAssistantId, assistantText);
-            // Drop a single breadcrumb when text generation starts so
-            // the user sees a transition from "tool work" to "writing
-            // reply." Subsequent deltas are noise in the activity log
-            // since they're already visible in the streaming bubble.
-            if (isFirstTextChunk) {
-              pushActivity("text", "Writing reply…");
-            }
-          } else if (ev.type === "tool_use") {
-            toolsUsed.push({ name: String(ev.name ?? ""), input: ev.input });
-            onAssistantMeta(tempAssistantId, toolsUsed);
-            // Distill the tool call into a one-liner. Bash gets the
-            // command (truncated); other tools show the most useful
-            // input field.
-            const toolName = String(ev.name ?? "tool");
-            const inp = (ev.input as Record<string, unknown> | undefined) ?? {};
-            let summary: string;
-            if (toolName === "Bash" && typeof inp.command === "string") {
-              summary = `${toolName} · ${(inp.command as string).slice(0, 80)}`;
-            } else if (toolName === "Read" && typeof inp.file_path === "string") {
-              summary = `${toolName} · ${inp.file_path as string}`;
-            } else if (toolName === "Grep" && typeof inp.pattern === "string") {
-              summary = `${toolName} · /${inp.pattern as string}/`;
-            } else if (toolName === "WebFetch" && typeof inp.url === "string") {
-              summary = `${toolName} · ${inp.url as string}`;
-            } else if (toolName === "WebSearch" && typeof inp.query === "string") {
-              summary = `${toolName} · ${inp.query as string}`;
-            } else {
-              summary = toolName;
-            }
-            pushActivity("tool", summary);
-          } else if (ev.type === "error" && typeof ev.message === "string") {
-            setError(ev.message);
-            pushActivity("info", `Error: ${ev.message.slice(0, 80)}`);
-          } else if (ev.type === "done") {
-            if (Array.isArray(ev.skills_inferred)) {
-              skillsInferred = ev.skills_inferred as string[];
-            }
-          }
-        }
-      }
+      const { assistantText, skillsInferred } = await consumeStream(
+        res.body,
+        (txt) => onAssistantDelta(tempAssistantId, txt),
+        (tools) => onAssistantMeta(tempAssistantId, tools),
+      );
 
       // Reload the full conversation so we get real IDs / persisted metadata.
       try {

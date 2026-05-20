@@ -2611,14 +2611,21 @@ async def cancel_activity_task(
     _: User = Depends(get_current_user),
 ) -> dict:
     """User-initiated cancellation of an in-memory Companion Activity
-    row. Flips the row to status=cancelled in the bus registry; the
-    UI's task subscriber receives the update and rerenders. Does NOT
-    kill any actually-running Claude subprocess — those are scoped to
-    their request and not globally trackable; this is purely a
-    registry cleanup so stuck rows leave the user's view. If the
-    subprocess is still alive, future events from it will re-create
-    the row; the user can cancel again at that point."""
+    row. Flips the row to status=cancelled in the bus registry AND, for
+    Companion chat rows, cancels the detached asyncio task that owns the
+    Claude subprocess — which kills the subprocess for real, not just the
+    UI row."""
     from app.skills import queue_bus as _bus
+
+    # If this row is a chat run, cancel the live task. Bus key is
+    # f"{source}:{item_id}" = "companion:chat:{conv_id}:{user_msg_id}".
+    if payload.key.startswith("companion:chat:"):
+        from app.api.v1.companion import _CHAT_RUNS
+
+        run_key = payload.key[len("companion:chat:") :]
+        run = _CHAT_RUNS.get(run_key)
+        if run is not None and run.task is not None and not run.task.done():
+            run.task.cancel()
 
     task = _bus.cancel_task(payload.key)
     if task is None:
