@@ -954,6 +954,12 @@ async def send_message_stream(
         had_error: bool = False
         error_message: str | None = None
 
+        # Variables set inside the finally block but read in the post-finally
+        # done-frame yield. Initialized here so they always exist even if
+        # persist fails before assignment.
+        persisted_msg_id: int | None = None
+        skills_inferred: list[str] = []
+
         yield _sse({"type": "user_saved", "message_id": user_msg_id})
 
         # Mirror key events onto the Companion Activity (/queue) live feed so
@@ -1115,97 +1121,139 @@ async def send_message_stream(
                         }
                     )
                     continue
+        except _asyncio.CancelledError:
+            # Client disconnected (navigated away, closed tab, network blip).
+            # CancelledError does NOT inherit from Exception in py3.10+, so
+            # the broader handler below misses it — without this, the
+            # generator unwinds straight to the finally without ever marking
+            # the task as "done"/"error" on the bus, and it sits in
+            # "running" forever (until the 20-min stale sweep). We treat
+            # disconnect as a terminal error so the activity feed reflects
+            # reality immediately; the partial assistant text we collected
+            # so far is still persisted in the post-finally block.
+            had_error = True
+            error_message = "Client disconnected mid-stream"
+            raise  # let FastAPI complete the disconnect cleanup
         except Exception as exc:  # pragma: no cover
             had_error = True
             error_message = f"Streaming failed: {exc}"
-            yield _sse({"type": "error", "message": error_message})
-            _bus_emit({"kind": "error", "text": error_message})
+            try:
+                yield _sse({"type": "error", "message": error_message})
+            except Exception:
+                pass  # client may already be gone
         finally:
-            # Make sure the background producer is cleaned up even if the
-            # client disconnects mid-stream.
+            # Cancel the background producer (kills the Claude subprocess).
             if not producer_task.done():
                 producer_task.cancel()
             try:
                 await producer_task
             except (_asyncio.CancelledError, Exception):
                 pass
+            # Always emit a terminal bus event so the activity feed never
+            # shows a phantom "running" row, including on client disconnect.
+            try:
+                if had_error:
+                    _bus_emit({"kind": "error", "text": error_message or "Stream ended"})
+                else:
+                    _bus_emit({"kind": "done"})
+            except Exception:
+                pass
+            # Persist whatever we have, regardless of how the stream ended.
+            # Done in the `finally` so a client disconnect doesn't drop the
+            # partial assistant text. No yields from here on — the socket
+            # may already be closed.
+            try:
+                final_text = "".join(collected_text)
+                skills_inferred = _infer_skills_used(final_text)
+                tool_results_blob = {
+                    "meta": {
+                        "cost_usd": cost_usd,
+                        "duration_ms": duration_ms,
+                        "num_turns": num_turns,
+                    },
+                }
+                if skills_inferred:
+                    tool_results_blob["skills_inferred"] = skills_inferred
 
-        # Publish a terminal "done" to the activity feed so users on /queue
-        # see chat tasks reach completion even when they don't have the chat
-        # open.
-        if not had_error:
-            _bus_emit({"kind": "done"})
-
-        # Persist the assistant turn.
-        final_text = "".join(collected_text)
-        skills_inferred = _infer_skills_used(final_text)
-        tool_results_blob = {
-            "meta": {
-                "cost_usd": cost_usd,
-                "duration_ms": duration_ms,
-                "num_turns": num_turns,
-            },
-        }
-        if skills_inferred:
-            tool_results_blob["skills_inferred"] = skills_inferred
-
-        # Use a fresh session to persist — the request session may already be
-        # closed by the time the generator completes.
-        from app.core.database import SessionLocal as _SL
-
-        async with _SL() as db2:
-            from app.models.companion import (
-                CompanionConversation as _Conv,
-                ConversationMessage as _Msg,
-            )
-            conv_row = (
-                await db2.execute(
-                    select(_Conv).where(_Conv.id == conv_id_local)
+                from app.core.database import SessionLocal as _SL
+                from app.models.companion import (
+                    CompanionConversation as _Conv,
+                    ConversationMessage as _Msg,
                 )
-            ).scalar_one_or_none()
-            if conv_row is not None and not had_error:
-                msg = _Msg(
-                    conversation_id=conv_row.id,
-                    role="assistant",
-                    content_md=final_text,
-                    tool_calls=tool_calls_log or None,
-                    tool_results=tool_results_blob,
-                )
-                db2.add(msg)
-                if session_id_out:
-                    conv_row.claude_session_id = session_id_out
-                if not conv_row.title:
-                    conv_row.title = user_content.strip().splitlines()[0][:80]
-                await db2.commit()
-                await db2.refresh(msg)
+                async with _SL() as db2:
+                    conv_row = (
+                        await db2.execute(
+                            select(_Conv).where(_Conv.id == conv_id_local)
+                        )
+                    ).scalar_one_or_none()
+                    if conv_row is not None and not had_error:
+                        msg = _Msg(
+                            conversation_id=conv_row.id,
+                            role="assistant",
+                            content_md=final_text,
+                            tool_calls=tool_calls_log or None,
+                            tool_results=tool_results_blob,
+                        )
+                        db2.add(msg)
+                        if session_id_out:
+                            conv_row.claude_session_id = session_id_out
+                        if not conv_row.title:
+                            conv_row.title = user_content.strip().splitlines()[0][:80]
+                        await db2.commit()
+                        await db2.refresh(msg)
+                        persisted_msg_id = msg.id
+                    elif had_error and conv_row is not None:
+                        # Save whatever partial assistant text we collected,
+                        # plus a system message describing the error. Both
+                        # are visible on chat reload.
+                        if final_text:
+                            partial = _Msg(
+                                conversation_id=conv_row.id,
+                                role="assistant",
+                                content_md=final_text,
+                                tool_calls=tool_calls_log or None,
+                                tool_results=tool_results_blob,
+                            )
+                            db2.add(partial)
+                        sys_msg = _Msg(
+                            conversation_id=conv_row.id,
+                            role="system",
+                            content_md=error_message or "Streaming error",
+                        )
+                        db2.add(sys_msg)
+                        if session_id_out:
+                            conv_row.claude_session_id = session_id_out
+                        await db2.commit()
+            except Exception:
+                log.exception("companion stream: persist failed")
+                persisted_msg_id = None
+
+        # Final SSE frame for clients still connected. Wrapped in try in
+        # case the socket dropped after the finally ran.
+        try:
+            if not had_error:
                 yield _sse(
                     {
                         "type": "done",
-                        "assistant_message_id": msg.id,
-                        "conversation_id": conv_row.id,
+                        "assistant_message_id": persisted_msg_id,
+                        "conversation_id": conv_id_local,
                         "cost_usd": cost_usd,
                         "duration_ms": duration_ms,
                         "num_turns": num_turns,
                         "skills_inferred": skills_inferred,
                     }
                 )
-            elif had_error and conv_row is not None:
-                # Record error as a system message so it's visible on reload.
-                msg = _Msg(
-                    conversation_id=conv_row.id,
-                    role="system",
-                    content_md=error_message or "Streaming error",
-                )
-                db2.add(msg)
-                await db2.commit()
+            else:
                 yield _sse(
                     {
                         "type": "done",
                         "assistant_message_id": None,
-                        "conversation_id": conv_row.id,
+                        "conversation_id": conv_id_local,
                         "error": error_message,
                     }
                 )
+        except Exception:
+            pass
 
     return StreamingResponse(
         event_stream(),
