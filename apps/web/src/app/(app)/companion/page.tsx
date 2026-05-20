@@ -627,9 +627,31 @@ function ChatPane({
       // Clear attachments after a successful exchange.
       setAttachments([]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unexpected error.");
-      setInput(content);
-      onStreamingAbort(optimisticUserId, tempAssistantId);
+      // Stream died mid-flight (SSE socket dropped, proxy reset, etc.).
+      // The backend persists the assistant message in the stream
+      // generator's finally block, so the DB *may* have the final
+      // text even though our SSE consumer never saw a clean `done`
+      // event. Try one defensive re-fetch — if the persisted
+      // assistant turn is there, surface it; otherwise abort the
+      // optimistic UI bubbles as before so the user can retry.
+      let recovered = false;
+      try {
+        const fresh = await api.get<ConversationDetail>(
+          `/api/v1/companion/conversations/${detail.id}`,
+        );
+        const lastMsg = fresh.messages[fresh.messages.length - 1];
+        if (lastMsg && lastMsg.role === "assistant") {
+          onStreamingDone(fresh);
+          recovered = true;
+        }
+      } catch {
+        /* fall through to abort */
+      }
+      if (!recovered) {
+        setError(err instanceof Error ? err.message : "Unexpected error.");
+        setInput(content);
+        onStreamingAbort(optimisticUserId, tempAssistantId);
+      }
     } finally {
       setSending(false);
     }

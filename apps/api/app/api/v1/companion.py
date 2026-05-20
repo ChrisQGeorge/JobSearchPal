@@ -1036,17 +1036,21 @@ async def send_message_stream(
 
                 if ev_type == "assistant":
                     # The CLI wraps Messages-API shape in {type:"assistant", message:{...}}.
+                    # NOTE: with `--include-partial-messages` (set by runner.py),
+                    # text content is ALSO emitted as stream_event content_block_delta
+                    # frames below. We only consume tool_use blocks here — taking
+                    # text from both sources double-counts every word. See bug:
+                    # chat showed each paragraph twice in a row.
+                    #
+                    # As a fallback for the rare case where partials are skipped
+                    # entirely (very short turns), the `result` event handler will
+                    # use its `result` field if `collected_text` is still empty.
                     msg = ev.get("message") or {}
                     content_blocks = msg.get("content") or []
                     if isinstance(content_blocks, list):
                         for block in content_blocks:
                             btype = block.get("type")
-                            if btype == "text":
-                                text = block.get("text") or ""
-                                if text:
-                                    collected_text.append(text)
-                                    yield _sse({"type": "text_delta", "text": text})
-                            elif btype == "tool_use":
+                            if btype == "tool_use":
                                 tu = {
                                     "name": block.get("name"),
                                     "id": block.get("id"),
@@ -1071,10 +1075,13 @@ async def send_message_stream(
                                         "input": compact,
                                     }
                                 )
+                            # text blocks intentionally skipped — see note above.
                     continue
 
                 if ev_type == "stream_event":
-                    # Partial message delta — live token streaming.
+                    # Partial message delta — live token streaming. This is the
+                    # ONLY source of text in collected_text. The complete-message
+                    # `assistant` event above ignores text to avoid duplication.
                     sub = ev.get("event") or {}
                     sub_type = sub.get("type")
                     if sub_type == "content_block_delta":
