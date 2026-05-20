@@ -3213,6 +3213,7 @@ function DocumentsTab({ jobId }: { jobId: number }) {
   const [writeDocType, setWriteDocType] = useState<DocType>("resume");
   const [writeTitle, setWriteTitle] = useState("");
   const [extraNotes, setExtraNotes] = useState("");
+  const [matchMyVoice, setMatchMyVoice] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadDocType, setUploadDocType] = useState<DocType>("other");
@@ -3272,6 +3273,7 @@ function DocumentsTab({ jobId }: { jobId: number }) {
         doc_type: writeDocType,
         extra_notes: extraNotes.trim() || null,
         title: writeTitle.trim() || null,
+        match_my_voice: matchMyVoice,
       });
       setExtraNotes("");
       setWriteTitle("");
@@ -3401,6 +3403,21 @@ function DocumentsTab({ jobId }: { jobId: number }) {
             disabled={running}
           />
         </div>
+        <label className="flex items-center gap-2 text-xs text-corp-muted cursor-pointer select-none">
+          <input
+            type="checkbox"
+            className="accent-corp-accent"
+            checked={matchMyVoice}
+            onChange={(e) => setMatchMyVoice(e.target.checked)}
+            disabled={running}
+          />
+          <span>
+            <span className="text-corp-text">Match my voice</span> — feed
+            writing samples into the prompt so the first draft already
+            sounds like you (skips a humanize pass). Uncheck for a neutral
+            draft.
+          </span>
+        </label>
         <div className="flex gap-2 justify-end">
           <button
             className="jsp-btn-primary"

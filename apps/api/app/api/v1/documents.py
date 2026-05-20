@@ -114,6 +114,11 @@ class TailorResumeIn(BaseModel):
     title: Optional[str] = Field(default=None, max_length=255)
     extra_notes: Optional[str] = None  # free-form user guidance piped into the prompt
     persona_id: Optional[int] = None
+    # When True (the default) we pull the user's writing samples and append a
+    # "voice reference" block to the prompt so the first draft already
+    # approximates their voice — skipping the separate humanize round-trip.
+    # Set False from the UI checkbox when the user wants a neutral draft.
+    match_my_voice: Optional[bool] = True
 
 
 class TailorCoverLetterIn(TailorResumeIn):
@@ -361,6 +366,8 @@ CANDIDATE PROFILE — raw material you tailor FROM
 ============================================================
 
 {candidate_profile}
+
+{voice_samples_block}
 
 ============================================================
 
@@ -626,6 +633,8 @@ CANDIDATE PROFILE — real history to draw stories from
 
 {candidate_profile}
 
+{voice_samples_block}
+
 ============================================================
 
 What a polished cover letter looks like
@@ -875,6 +884,59 @@ def _fmt_list(items: Optional[list]) -> Optional[str]:
     if not items:
         return None
     return ", ".join(str(x) for x in items if str(x).strip())
+
+
+async def _build_voice_samples_block(
+    db: AsyncSession, user: User, *, max_samples: int = 5, max_chars_each: int = 2000
+) -> str:
+    """Pull the user's writing samples and format them as a voice-reference
+    block the tailor prompts can inject. Returns an empty string when no
+    samples exist (the prompt then naturally falls back to neutral voice).
+
+    Caps the count + per-sample length to keep prompt size bounded — the
+    tailor doesn't need every sample, just enough to read sentence rhythm,
+    word choice, and tone tics. Newest samples first.
+    """
+    rows = (
+        await db.execute(
+            select(WritingSample)
+            .where(
+                WritingSample.user_id == user.id,
+                WritingSample.deleted_at.is_(None),
+            )
+            .order_by(WritingSample.created_at.desc())
+            .limit(max_samples)
+        )
+    ).scalars().all()
+    if not rows:
+        return ""
+
+    parts: list[str] = [
+        "============================================================",
+        "VOICE REFERENCE — match the candidate's own writing style",
+        "============================================================",
+        "",
+        "Below are samples of the candidate's own writing. Match their voice",
+        "in the output: sentence rhythm, contractions, word choice, level of",
+        "formality, sentence-length distribution, and any recurring tics.",
+        "DO NOT lift facts, content, or specific phrases from these samples —",
+        "they are a STYLE reference only. The facts come from the candidate",
+        "profile section. If a sample sounds nothing like what a resume /",
+        "cover letter should sound like (e.g. casual blog vs. formal letter),",
+        "still match the voice tics within the appropriate register.",
+        "",
+    ]
+    for i, s in enumerate(rows, start=1):
+        body = (s.content_md or "").strip()
+        if len(body) > max_chars_each:
+            body = body[: max_chars_each].rstrip() + "…"
+        tag_bit = ""
+        if s.tags:
+            tag_bit = f" · tags: {', '.join(str(t) for t in s.tags)}"
+        parts.append(f"--- Sample {i}: {s.title or '(untitled)'}{tag_bit} ---")
+        parts.append(body)
+        parts.append("")
+    return "\n".join(parts)
 
 
 async def _build_candidate_profile_block(
@@ -1490,6 +1552,7 @@ async def _run_tailor(
     doc_type: str,
     persona_id: Optional[int],
     title_override: Optional[str],
+    match_my_voice: bool = True,
     extra_format_args: Optional[dict] = None,
 ) -> GeneratedDocument:
     if not (job.job_description and job.job_description.strip()):
@@ -1516,6 +1579,9 @@ async def _run_tailor(
 
     candidate_profile = await _build_candidate_profile_block(db, user)
     job_context = _build_job_context_block(job, org)
+    voice_samples_block = (
+        await _build_voice_samples_block(db, user) if match_my_voice else ""
+    )
 
     # User-supplied values may contain literal `{` / `}` (code blocks,
     # `{foo}` template placeholders, JSON examples inside the JD, etc.).
@@ -1537,6 +1603,7 @@ async def _run_tailor(
         "extra_notes": _esc(extra_notes or "(none)"),
         "candidate_profile": _esc(candidate_profile),
         "job_context": _esc(job_context),
+        "voice_samples_block": _esc(voice_samples_block),
     }
     if extra_format_args:
         for k, v in extra_format_args.items():
@@ -1651,6 +1718,9 @@ async def tailor_resume(
         doc_type="resume",
         persona_id=payload.persona_id,
         title_override=payload.title,
+        match_my_voice=(
+            payload.match_my_voice if payload.match_my_voice is not None else True
+        ),
     )
 
 
@@ -1675,6 +1745,9 @@ async def tailor_cover_letter(
         doc_type="cover_letter",
         persona_id=payload.persona_id,
         title_override=payload.title,
+        match_my_voice=(
+            payload.match_my_voice if payload.match_my_voice is not None else True
+        ),
     )
 
 
@@ -1685,6 +1758,7 @@ class TailorAnyIn(BaseModel):
     extra_notes: Optional[str] = None
     title: Optional[str] = Field(default=None, max_length=255)
     persona_id: Optional[int] = None
+    match_my_voice: Optional[bool] = True
 
 
 @router.post(
@@ -1719,6 +1793,9 @@ async def tailor_any(
         doc_type=payload.doc_type,
         persona_id=payload.persona_id,
         title_override=payload.title,
+        match_my_voice=(
+            payload.match_my_voice if payload.match_my_voice is not None else True
+        ),
         extra_format_args=extra_args,
     )
 
