@@ -30,23 +30,39 @@ export function HealthGate({ children }: { children: React.ReactNode }) {
 
     async function probe() {
       try {
-        const res = await fetch("/health", { cache: "no-store" });
+        // Step 1 — basic connectivity + DB SELECT 1 via /health. Cheap,
+        // proves uvicorn is up and the connection pool can reach MySQL.
+        const healthRes = await fetch("/health", { cache: "no-store" });
         if (cancelled) return;
-        if (res.ok) {
-          setAvailable(true);
-          setDownSince(null);
-          if (wasDownRef.current) {
-            // Recovered. Redirect to dashboard, but only if the user
-            // isn't already there — avoids a no-op navigation.
-            wasDownRef.current = false;
-            if (pathRef.current !== "/") {
-              router.push("/");
-            }
-          }
-          timer = setTimeout(probe, POLL_HEALTHY_MS);
-          return;
+        if (!healthRes.ok) {
+          throw new Error(`/health status ${healthRes.status}`);
         }
-        throw new Error(`status ${res.status}`);
+
+        // Step 2 — actually exercise the same dep chain the dashboard
+        // uses on first paint. /api/v1/auth/me runs through the auth
+        // dependency, the SessionLocal session, and a real ORM model
+        // load. If migrations finished but some other piece of the
+        // stack isn't ready, this catches it where a generic SELECT 1
+        // wouldn't. A 401 is fine — it just means no session cookie;
+        // the api is still responsive and serving data. Treat any
+        // non-5xx + non-network-error as "ready".
+        const dataRes = await fetch("/api/v1/auth/me", { cache: "no-store" });
+        if (cancelled) return;
+        if (dataRes.status >= 500) {
+          throw new Error(`/api/v1/auth/me status ${dataRes.status}`);
+        }
+
+        setAvailable(true);
+        setDownSince(null);
+        if (wasDownRef.current) {
+          // Recovered. Redirect to dashboard, but only if the user
+          // isn't already there — avoids a no-op navigation.
+          wasDownRef.current = false;
+          if (pathRef.current !== "/") {
+            router.push("/");
+          }
+        }
+        timer = setTimeout(probe, POLL_HEALTHY_MS);
       } catch {
         if (cancelled) return;
         setAvailable(false);
