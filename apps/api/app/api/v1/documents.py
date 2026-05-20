@@ -1211,11 +1211,17 @@ async def _build_candidate_profile_block(
                 out.append(e.notes.strip())
 
     # --- 7. Projects -------------------------------------------------------
+    # Private projects (visibility == "private") are intentionally excluded
+    # from the resume / cover-letter inputs — the user wants them off the
+    # output documents. Their attached skills still show up in the Skills
+    # catalog, and their duration still feeds skill work-history totals, so
+    # the projects influence the resume indirectly without ever being named.
     projects = (
         await db.execute(
             select(Project).where(
                 Project.user_id == user.id,
                 Project.deleted_at.is_(None),
+                Project.visibility != "private",
             )
         )
     ).scalars().all()
