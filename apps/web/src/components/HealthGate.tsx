@@ -1,26 +1,35 @@
 "use client";
 
-// Wraps the authenticated app layout. Probes /health on mount; if the
-// backend isn't responding (which is the normal state for ~15-30s
-// after `docker compose up` while MySQL warms and alembic migrates),
-// shows a full-screen loading overlay and keeps polling. When the
-// backend comes back, hides the overlay and pushes the user to the
-// dashboard so they land on a known-good page rather than a partly-
-// loaded one they happened to be on when the outage hit.
+// Wraps the authenticated app layout. Probes the backend once on
+// mount. If it answers cleanly → render children immediately and
+// never check again for the rest of the session. If it doesn't →
+// render children with a full-screen loading overlay on top, and
+// keep polling until the first success, at which point the overlay
+// disappears, the user gets redirected to /, and the gate goes
+// dormant permanently.
+//
+// We intentionally do NOT poll on a heartbeat after the first
+// successful probe. The original design did (30s interval) so the
+// overlay would reappear if the backend died mid-session — but in
+// practice that caused flicker during transient slow requests
+// (Companion turns holding the proxy, etc.), which is much worse
+// than the rare "backend genuinely died" case.
 
 import { useEffect, useRef, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 
-const POLL_HEALTHY_MS = 30_000;   // background heartbeat
-const POLL_UNHEALTHY_MS = 2_000;  // recovery polling
+const POLL_UNHEALTHY_MS = 2_000;
 
 export function HealthGate({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
-  const [available, setAvailable] = useState(true);
+  const [overlayActive, setOverlayActive] = useState(false);
   const [downSince, setDownSince] = useState<Date | null>(null);
-  // Track outage state across renders without re-triggering the effect.
-  const wasDownRef = useRef(false);
+  // Once the backend confirms ready ONCE, this stays true for the
+  // life of the page. Probe loop short-circuits on every iteration
+  // and the overlay can never re-appear, no matter what transient
+  // failures the rest of the session produces.
+  const readyRef = useRef(false);
   const pathRef = useRef(pathname);
   pathRef.current = pathname;
 
@@ -29,47 +38,39 @@ export function HealthGate({ children }: { children: React.ReactNode }) {
     let timer: ReturnType<typeof setTimeout> | null = null;
 
     async function probe() {
+      if (readyRef.current) return; // already dismissed; never re-check
       try {
-        // Step 1 — basic connectivity + DB SELECT 1 via /health. Cheap,
-        // proves uvicorn is up and the connection pool can reach MySQL.
+        // 1) Basic connectivity + SELECT 1 via /health.
         const healthRes = await fetch("/health", { cache: "no-store" });
         if (cancelled) return;
-        if (!healthRes.ok) {
-          throw new Error(`/health status ${healthRes.status}`);
-        }
+        if (!healthRes.ok) throw new Error(`/health ${healthRes.status}`);
 
-        // Step 2 — actually exercise the same dep chain the dashboard
-        // uses on first paint. /api/v1/auth/me runs through the auth
-        // dependency, the SessionLocal session, and a real ORM model
-        // load. If migrations finished but some other piece of the
-        // stack isn't ready, this catches it where a generic SELECT 1
-        // wouldn't. A 401 is fine — it just means no session cookie;
-        // the api is still responsive and serving data. Treat any
-        // non-5xx + non-network-error as "ready".
+        // 2) Exercise the auth + ORM model-load chain the dashboard
+        //    uses on mount. 401 is fine — that just means no session,
+        //    not that the api is broken.
         const dataRes = await fetch("/api/v1/auth/me", { cache: "no-store" });
         if (cancelled) return;
         if (dataRes.status >= 500) {
-          throw new Error(`/api/v1/auth/me status ${dataRes.status}`);
+          throw new Error(`/api/v1/auth/me ${dataRes.status}`);
         }
 
-        setAvailable(true);
+        // Both probes passed → ready for good.
+        readyRef.current = true;
+        setOverlayActive(false);
         setDownSince(null);
-        if (wasDownRef.current) {
-          // Recovered. Redirect to dashboard, but only if the user
-          // isn't already there — avoids a no-op navigation.
-          wasDownRef.current = false;
-          if (pathRef.current !== "/") {
-            router.push("/");
-          }
+        // If we ever showed the overlay (recovered from a downtime),
+        // bounce to the dashboard so the user lands on a known-good
+        // page rather than whichever URL they happened to be on.
+        if (downSince !== null && pathRef.current !== "/") {
+          router.push("/");
         }
-        timer = setTimeout(probe, POLL_HEALTHY_MS);
       } catch {
-        if (cancelled) return;
-        setAvailable(false);
-        if (!wasDownRef.current) {
-          wasDownRef.current = true;
-          setDownSince(new Date());
-        }
+        if (cancelled || readyRef.current) return;
+        // Only show overlay on FAILURE before we've confirmed ready
+        // once. After confirmation we never enter this branch (the
+        // guard at the top of probe() short-circuits).
+        setOverlayActive(true);
+        if (downSince === null) setDownSince(new Date());
         timer = setTimeout(probe, POLL_UNHEALTHY_MS);
       }
     }
@@ -79,20 +80,23 @@ export function HealthGate({ children }: { children: React.ReactNode }) {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [router]);
+    // Intentionally empty deps — we want a single probe loop per
+    // page life, not one that restarts on every router change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <>
       {children}
-      {!available ? <LoadingOverlay downSince={downSince} /> : null}
+      {overlayActive ? <LoadingOverlay downSince={downSince} /> : null}
     </>
   );
 }
 
 function LoadingOverlay({ downSince }: { downSince: Date | null }) {
   // Tick a second-resolution clock so the "for Ns" counter updates
-  // visibly while the user waits. Cheap — only mounts when overlay is
-  // showing.
+  // visibly while the user waits. Cheap — only mounts when overlay
+  // is showing.
   const [, force] = useState(0);
   useEffect(() => {
     const id = setInterval(() => force((n) => n + 1), 1_000);
@@ -123,7 +127,6 @@ function LoadingOverlay({ downSince }: { downSince: Date | null }) {
         <div className="text-corp-muted text-[10px] uppercase tracking-wider">
           {seconds > 0 ? `Offline for ${seconds}s` : "Probing…"}
         </div>
-        {/* Soft pulse, no spinner — matches the corp-aesthetic better. */}
         <div className="flex justify-center gap-1.5 pt-1">
           <span className="w-1.5 h-1.5 rounded-full bg-corp-accent animate-pulse" />
           <span
