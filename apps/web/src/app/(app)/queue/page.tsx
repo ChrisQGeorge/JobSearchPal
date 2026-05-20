@@ -45,6 +45,10 @@ const STATUS_STYLES: Record<string, string> = {
   processing: "bg-sky-500/25 text-sky-300 border-sky-500/40 animate-pulse",
   done: "bg-emerald-500/25 text-emerald-300 border-emerald-500/40",
   error: "bg-corp-danger/20 text-corp-danger border-corp-danger/40",
+  // `stale` is the bus's lazy-sweep transition — a task that sat in
+  // `running` past the timeout without a terminal event. Treat it
+  // like `error` for color so the user notices.
+  stale: "bg-corp-accent2/20 text-corp-accent2 border-corp-accent2/40",
 };
 
 const WAITING_STYLE =
@@ -259,7 +263,7 @@ export default function QueuePage() {
         active++;
       } else if (it.status === "queued") active++;
       else if (it.status === "done") done++;
-      else if (it.status === "error") errored++;
+      else if (it.status === "error" || it.status === "stale") errored++;
     }
     return { active, waiting, done, errored, processing, total: items.length };
   }, [items]);
@@ -291,7 +295,9 @@ export default function QueuePage() {
       case "done":
         return trimDone(items.filter((i) => i.status === "done"));
       case "error":
-        return items.filter((i) => i.status === "error");
+        return items.filter(
+          (i) => i.status === "error" || i.status === "stale",
+        );
       default:
         return items;
     }

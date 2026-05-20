@@ -138,6 +138,20 @@ def _apply_event_to_registry(event: dict[str, Any]) -> None:
         task["cost_usd"] = event.get("cost_usd")
         task["duration_ms"] = event.get("duration_ms")
         task["num_turns"] = event.get("num_turns")
+    elif kind == "done":
+        # Several emitters (companion chat stream, fetch handler) publish a
+        # terminal `done` event. Treat it as functionally equivalent to
+        # `result` — without this, those tasks sit in "running" state
+        # forever in the registry. cost/duration/num_turns may already
+        # have been set by a preceding `result` event; don't overwrite.
+        task["status"] = "done"
+        task["finished_at"] = now
+        if event.get("cost_usd") is not None:
+            task["cost_usd"] = event.get("cost_usd")
+        if event.get("duration_ms") is not None:
+            task["duration_ms"] = event.get("duration_ms")
+        if event.get("num_turns") is not None:
+            task["num_turns"] = event.get("num_turns")
     elif kind == "error":
         task["status"] = "error"
         task["finished_at"] = now
@@ -166,17 +180,57 @@ def unsubscribe_tasks(q: asyncio.Queue) -> None:
     _TASK_SUBSCRIBERS.discard(q)
 
 
+# How long a task can sit in `running` with no event before we lazily
+# mark it `stale`. Catches any case where the terminal `done`/`result`/
+# `error` event got lost (uvicorn killed the request mid-stream, client
+# disconnect, producer crash before final emit, etc.). 20 min is well
+# past stream_claude_prompt's 15 min internal timeout, so a genuinely
+# running long task still gets to finish without being prematurely flagged.
+_TASK_STALE_AFTER_SECONDS = 20 * 60
+
+
+def _maybe_mark_stale(task: dict[str, Any]) -> None:
+    """If `task` is `running` and hasn't been updated in
+    _TASK_STALE_AFTER_SECONDS, transition it to status=stale in-place.
+    Pure local helper — caller decides when to invoke."""
+    if task.get("status") != "running":
+        return
+    updated = task.get("updated_at")
+    if not updated:
+        return
+    try:
+        ts = datetime.fromisoformat(updated)
+    except ValueError:
+        return
+    now = datetime.now(tz=timezone.utc)
+    if (now - ts).total_seconds() < _TASK_STALE_AFTER_SECONDS:
+        return
+    task["status"] = "stale"
+    task["finished_at"] = _now_iso()
+    task["error"] = (
+        f"No terminal event after {_TASK_STALE_AFTER_SECONDS // 60} min "
+        "— marked stale by lazy sweep. The Claude subprocess may have "
+        "been killed mid-stream or the SSE connection dropped."
+    )
+
+
 def list_tasks(limit: int = 100) -> list[dict[str, Any]]:
-    """Snapshot of the task registry, most recent first."""
+    """Snapshot of the task registry, most recent first. Lazy-stale any
+    long-running entries on each read."""
     rows = list(_TASKS.values())
     rows.reverse()  # most-recent first
+    for r in rows[:limit]:
+        _maybe_mark_stale(r)
     return rows[:limit]
 
 
 def get_task(source: str, item_id: Any) -> dict[str, Any] | None:
     """Point-lookup of a single task registry entry, or None if absent.
     Callers supply the same (source, item_id) they'd pass to publish()."""
-    return _TASKS.get(_task_key(source, item_id))
+    task = _TASKS.get(_task_key(source, item_id))
+    if task is not None:
+        _maybe_mark_stale(task)
+    return task
 
 
 def publish(event: dict[str, Any]) -> None:
