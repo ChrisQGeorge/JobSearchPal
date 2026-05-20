@@ -323,6 +323,10 @@ You have two inputs below:
   1. TARGET JOB — the posting you're tailoring for. Read this first.
   2. CANDIDATE PROFILE — everything the app knows about the candidate.
      This is your pool of raw material. Do NOT invent anything outside it.
+     The descriptions on each role / project are deliberately COMPREHENSIVE
+     — they cover everything the candidate has on file. You should expect
+     to USE ONLY A FRACTION of any given description on the tailored
+     resume. Pick what's relevant to THIS posting; ignore the rest.
 
 You do NOT need to make API calls. Everything is pre-fetched. If something
 is missing, omit it rather than fabricating.
@@ -448,6 +452,61 @@ Tailoring rules (the important ones — read twice)
 - **Foreground required skills that the candidate actually has.** Put
   them first in their category. If the JD requires a skill the candidate
   doesn't have, DO NOT add it — just omit silently.
+
+Long-form descriptions are raw material, not output
+---------------------------------------------------
+The descriptions stored on each role / project / achievement are an
+intentionally COMPREHENSIVE knowledge base — they capture every fact
+the candidate has on file, often in multiple paragraphs, so you have
+everything you might need to pick from. They are NOT a polished resume
+draft. Treat them accordingly:
+
+- **Do not try to fit everything in.** Most of what's in any given
+  description will NOT appear on this resume. That is correct and
+  expected. The descriptions are deliberately exhaustive precisely so
+  you have raw material to choose from — your job is to pick the
+  subset that matters for THIS posting and leave the rest on the
+  cutting-room floor. Aim for 20–40% of a description's facts making
+  it onto the resume in the highly-relevant case; less for peripheral
+  roles.
+- **Distill, don't reproduce.** A description that's three paragraphs
+  long should produce 3–5 resume bullets if the role is highly JD-
+  relevant, 1–2 if peripheral, and 0 (collapsed to one summary line)
+  if it's an older / off-topic role. Never copy whole paragraphs into
+  the resume.
+- **Mine for specifics.** Extract the concrete bits — technologies
+  used, scope claims, numbers, named systems, named outcomes — and
+  rewrite each into one tight verb-led bullet (~15–25 words). Skip
+  the connective tissue, the narrative framing, the rhetorical
+  scaffolding. The reader is a hiring manager skimming for 6 seconds;
+  prose loses, density wins.
+- **Relevance gate per fact.** Before promoting any fact from a
+  description into a bullet, ask: "does THIS specific posting care
+  about this?" If no — even if the fact is interesting or
+  impressive — skip it. The candidate's strongest impact at a prior
+  job is irrelevant if it's in a domain THIS JD doesn't touch.
+- **Tone shift required.** If a stored description reads like a
+  first-person essay ("I was responsible for…", "Over my time there
+  I…", "Eventually we…"), DO NOT preserve that voice. Convert to
+  crisp third-person-implied bullets: "Architected fault-tolerant
+  order pipeline; reduced P99 latency 40%." beats "Over the course of
+  18 months I led the team in building out a more reliable order
+  processing pipeline, which eventually cut our P99 latency by
+  roughly 40%."
+- **The same fact can support different bullets for different JDs.**
+  A description mentioning "rebuilt CI/CD on GitLab, migrated 200
+  services to Kubernetes, owned on-call rotation" should become one
+  CI/CD bullet for an SRE posting, one Kubernetes bullet for a
+  Platform Engineering posting, and one rotation-ownership bullet
+  for a Senior IC posting — same description, different angles.
+- **Hard length cap.** Total resume body ≤ 650 words. If you're
+  over, the first cut is paragraphs from the LEAST JD-relevant role
+  — not equal trimming across all roles. Less-relevant roles
+  collapse to one line.
+- **If a description doesn't yield any JD-relevant fact, the role
+  still appears** (employment continuity matters), but at the
+  minimum: title + org + dates + one neutral summary line. No
+  bullets.
 
 ATS keyword matching (critical — this resume will be scanned by software
 before a human sees it)
