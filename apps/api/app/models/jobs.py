@@ -38,6 +38,13 @@ class Organization(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     )  # company / university / nonprofit / government / conference / publisher / agency / other
     website: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     industry: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # Finer-grained category (e.g. "Industrial automation" under
+    # industry="Manufacturing"). Filled by the research pipeline.
+    sub_industry: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # Customer type: B2B / B2C / B2G / B2B2C / Mixed
+    business_model: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    # Ownership: public / private / subsidiary / nonprofit / government
+    public_or_private: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     size: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     headquarters_location: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     founded_year: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)

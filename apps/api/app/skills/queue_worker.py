@@ -389,7 +389,13 @@ async def enqueue_interested_followups(
     from app.models.jobs import JobFetchQueue, Organization
     from sqlalchemy import select
 
-    if tj.organization_id:
+    if not tj.organization_id:
+        log.info(
+            "enqueue_interested_followups: tracked_job %d has no "
+            "organization_id, skipping org_research",
+            tj.id,
+        )
+    else:
         org = (
             await db.execute(
                 select(Organization).where(
@@ -398,12 +404,29 @@ async def enqueue_interested_followups(
                 )
             )
         ).scalar_one_or_none()
-        if org is not None:
-            already_researched = bool(
-                (org.description or "").strip()
-                and (org.industry or "").strip()
+        if org is None:
+            log.info(
+                "enqueue_interested_followups: org %s for tracked_job "
+                "%d not found / soft-deleted, skipping org_research",
+                tj.organization_id, tj.id,
             )
-            if not already_researched:
+        else:
+            # `research_notes` is populated only by the research pipeline
+            # (users typically don't fill it manually). Using it as the
+            # signal means: if the org has been researched ONCE — even if
+            # some specific column came back null from that pass — we
+            # don't re-fire. Previous check required both description AND
+            # industry, which was too eager: an org with description but
+            # null industry kept getting re-researched on every interested
+            # flip across multiple jobs at the same company.
+            already_researched = bool((org.research_notes or "").strip())
+            if already_researched:
+                log.info(
+                    "enqueue_interested_followups: org %d (%s) already "
+                    "has research_notes, skipping org_research",
+                    org.id, org.name,
+                )
+            else:
                 db.add(
                     JobFetchQueue(
                         user_id=tj.user_id,
@@ -413,6 +436,11 @@ async def enqueue_interested_followups(
                         payload={"organization_id": org.id},
                         state="queued",
                     )
+                )
+                log.info(
+                    "enqueue_interested_followups: queued org_research "
+                    "for org %d (%s) on behalf of tracked_job %d",
+                    org.id, org.name, tj.id,
                 )
 
     if tj.job_description and tj.job_description.strip():

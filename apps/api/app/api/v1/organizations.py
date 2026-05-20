@@ -211,7 +211,21 @@ Return ONE JSON object, no prose, no markdown fences:
 {{
   "name": string,                 // canonical name (may differ from input)
   "website": string | null,
-  "industry": string | null,      // one or two words
+  "industry": string,             // ALWAYS set. One broad-category word like
+                                  // Technology, Healthcare, Finance,
+                                  // Manufacturing, Retail, Government,
+                                  // Education, Media, Energy, Logistics, etc.
+                                  // Inferred from the company's products /
+                                  // services if not explicit in the corpus.
+                                  // Used by user filter criteria — null
+                                  // means we can't filter it out, which is
+                                  // worse than a best-guess label.
+  "sub_industry": string | null,  // finer category (e.g. "Industrial
+                                  // automation" under industry=Manufacturing,
+                                  // or "B2B SaaS" under industry=Technology).
+  "business_model": string | null, // "B2B" | "B2C" | "B2G" | "B2B2C" | "Mixed"
+  "public_or_private": string | null, // "public" | "private" | "subsidiary" |
+                                  // "nonprofit" | "government" | "pre_ipo"
   "size": "1-10" | "11-50" | "51-200" | "201-500" | "501-1000" |
           "1001-5000" | "5001-10000" | "10000+" | null,
   "headquarters_location": string | null,
@@ -234,8 +248,26 @@ Return ONE JSON object, no prose, no markdown fences:
 }}
 
 Rules:
-- Prefer null over guessing. If a field truly isn't visible in the
-  corpus, null is better than a plausible-sounding fabrication.
+- Prefer null over guessing for most fields. EXCEPTION: `industry`
+  must always be filled — infer from the company's products if the
+  corpus doesn't make it explicit. Null industry breaks user
+  filtering, which downstream cares about more than perfect accuracy.
+- Industries the user filters on aggressively — surface these EXPLICITLY
+  whenever the company touches them, in either `industry` OR
+  `sub_industry`. Use these exact labels:
+    * "AI" / "Machine Learning" — for companies whose primary product
+      or a substantial portion of engineering involves AI/ML (e.g.
+      OpenAI, Anthropic, Cohere, foundation-model wrappers, AI-first
+      SaaS). Don't bury this under generic "Technology".
+    * "Defense" — for defense contractors, weapons manufacturers,
+      war / surveillance / military-government contractors (e.g.
+      Lockheed, Anduril, Palantir government work). Don't bury this
+      under "Aerospace" or "Technology".
+    * "Insurance" — for insurance underwriters, brokers, claims
+      processors, insurtech. Don't bury this under "Finance".
+  If a company is partly in one of these (e.g. a tech company with a
+  defense business unit), put the broad industry in `industry` and
+  the specific area in `sub_industry`.
 - `size` must be a bucket, not a raw number.
 - `source_links` is the URL list under "SOURCES" below — copy them
   verbatim, do not invent any.
@@ -265,7 +297,15 @@ Schema:
 {{
   "name": string,
   "website": string | null,
-  "industry": string | null,
+  "industry": string,             // ALWAYS set — broad one-word category
+                                  // (Technology / Healthcare / Finance /
+                                  // Manufacturing / Retail / Government /
+                                  // Education / Media / Energy / Logistics).
+                                  // Required for downstream filtering.
+  "sub_industry": string | null,  // finer category
+  "business_model": string | null, // "B2B" | "B2C" | "B2G" | "B2B2C" | "Mixed"
+  "public_or_private": string | null, // "public" | "private" | "subsidiary" |
+                                  // "nonprofit" | "government" | "pre_ipo"
   "size": "1-10" | "11-50" | "51-200" | "201-500" | "501-1000" |
           "1001-5000" | "5001-10000" | "10000+" | null,
   "headquarters_location": string | null,
@@ -284,6 +324,17 @@ Schema:
   }} | null,
   "warning": string | null
 }}
+
+Industry-detection priorities (same as the main research path): surface
+these explicitly in either `industry` or `sub_industry` whenever the
+company touches them, using these exact labels:
+  * "AI" / "Machine Learning" — companies primarily delivering AI/ML
+    products or with AI/ML as a substantial part of their engineering.
+    Don't bury under generic "Technology".
+  * "Defense" — defense contractors, weapons / surveillance /
+    military-government work. Don't bury under "Aerospace".
+  * "Insurance" — underwriters, brokers, claims, insurtech. Don't
+    bury under "Finance".
 """
 
 
@@ -465,6 +516,9 @@ def _apply_research_to_org(obj: Organization, data: dict) -> None:
     scalar_fields = [
         "website",
         "industry",
+        "sub_industry",
+        "business_model",
+        "public_or_private",
         "size",
         "headquarters_location",
         "description",

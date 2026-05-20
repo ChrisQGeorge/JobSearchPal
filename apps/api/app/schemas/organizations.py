@@ -22,6 +22,9 @@ class OrganizationIn(BaseModel):
     type: str = Field(default="company", max_length=32)
     website: Optional[str] = None
     industry: Optional[str] = None
+    sub_industry: Optional[str] = None
+    business_model: Optional[str] = None
+    public_or_private: Optional[str] = None
     size: Optional[str] = None
     headquarters_location: Optional[str] = None
     founded_year: Optional[int] = None
