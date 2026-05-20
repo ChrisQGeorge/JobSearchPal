@@ -2601,6 +2601,34 @@ async def list_activity(
     return merged
 
 
+class _CancelActivityIn(BaseModel):
+    key: str = Field(min_length=1, max_length=512)
+
+
+@router.post("/activity/cancel")
+async def cancel_activity_task(
+    payload: _CancelActivityIn,
+    _: User = Depends(get_current_user),
+) -> dict:
+    """User-initiated cancellation of an in-memory Companion Activity
+    row. Flips the row to status=cancelled in the bus registry; the
+    UI's task subscriber receives the update and rerenders. Does NOT
+    kill any actually-running Claude subprocess — those are scoped to
+    their request and not globally trackable; this is purely a
+    registry cleanup so stuck rows leave the user's view. If the
+    subprocess is still alive, future events from it will re-create
+    the row; the user can cancel again at that point."""
+    from app.skills import queue_bus as _bus
+
+    task = _bus.cancel_task(payload.key)
+    if task is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No activity row with key {payload.key!r}.",
+        )
+    return {"status": task["status"], "key": task["key"]}
+
+
 @router.get("/activity/stream")
 async def stream_activity_tasks(
     _: User = Depends(get_current_user),

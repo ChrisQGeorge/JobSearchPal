@@ -49,6 +49,8 @@ const STATUS_STYLES: Record<string, string> = {
   // `running` past the timeout without a terminal event. Treat it
   // like `error` for color so the user notices.
   stale: "bg-corp-accent2/20 text-corp-accent2 border-corp-accent2/40",
+  // `cancelled` is a user-initiated stop from this page's Cancel button.
+  cancelled: "bg-corp-surface2 text-corp-muted border-corp-border",
 };
 
 const WAITING_STYLE =
@@ -214,6 +216,30 @@ export default function QueuePage() {
     if (!confirm(prompt)) return;
     await api.delete(`/api/v1/jobs/queue/${fetchQueueId}`);
     await refresh();
+  }
+
+  async function cancelInMemory(rowId: string) {
+    // ActivityRow.id for companion-bus rows is "task:<source>:<item_id>".
+    // The backend's bus key is "<source>:<item_id>" — strip the prefix.
+    const key = rowId.startsWith("task:") ? rowId.slice("task:".length) : rowId;
+    if (
+      !confirm(
+        "Cancel this chat task? The row will flip to `cancelled` in " +
+          "the activity feed. If the underlying Claude subprocess is " +
+          "still running, it'll finish on its own — this is registry " +
+          "cleanup only.",
+      )
+    ) {
+      return;
+    }
+    try {
+      await api.post("/api/v1/jobs/activity/cancel", { key });
+      await refresh();
+    } catch (e) {
+      alert(
+        e instanceof ApiError ? `HTTP ${e.status}` : "Cancel failed.",
+      );
+    }
   }
 
   async function dismissByStatus(status: "done" | "error") {
@@ -519,6 +545,7 @@ export default function QueuePage() {
               onRemove={() => {
                 if (it.fetch_queue_id != null) void remove(it.fetch_queue_id);
               }}
+              onCancelInMemory={() => void cancelInMemory(it.id)}
             />
           ))}
         </ul>
@@ -603,10 +630,12 @@ function QueueRow({
   item,
   onRetry,
   onRemove,
+  onCancelInMemory,
 }: {
   item: ActivityRow;
   onRetry: () => void;
   onRemove: () => void;
+  onCancelInMemory: () => void;
 }) {
   const waiting = isWaiting(item);
   const pillClass = waiting
@@ -755,6 +784,23 @@ function QueueRow({
               ×
             </button>
           )
+        ) : null}
+        {/* In-memory companion-bus rows (chat tasks, etc.) have no
+            fetch_queue_id but still need a way to clear stuck
+            entries. Cancel flips the bus registry to
+            status=cancelled — the underlying subprocess (if still
+            running) finishes on its own; this is purely a registry
+            cleanup so the user can move on. */}
+        {item.fetch_queue_id == null &&
+        item.kind === "companion" &&
+        isActive(item) ? (
+          <button
+            className="jsp-btn-ghost text-xs text-corp-accent2 border-corp-accent2/40"
+            onClick={onCancelInMemory}
+            title="Mark this stuck chat task as cancelled in the activity registry."
+          >
+            Cancel
+          </button>
         ) : null}
       </div>
     </li>

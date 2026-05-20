@@ -233,6 +233,30 @@ def get_task(source: str, item_id: Any) -> dict[str, Any] | None:
     return task
 
 
+def cancel_task(key: str) -> dict[str, Any] | None:
+    """User-initiated termination of a registry entry. Flips status to
+    "cancelled" with a clear error message and fans the update to
+    subscribers. Returns the updated task, or None if no such key
+    exists.
+
+    Note: this does NOT actually stop a running Claude subprocess —
+    those are tied to their request scope, not globally tracked. This
+    is purely a registry cleanup: removes the stuck row from the
+    Companion Activity feed so the user can move on. If a real
+    subprocess is still alive, it'll finish (or hit its own timeout)
+    on its own; any events it emits after this point will re-create
+    the row, which is fine — the user can cancel again."""
+    task = _TASKS.get(key)
+    if task is None:
+        return None
+    task["status"] = "cancelled"
+    task["finished_at"] = _now_iso()
+    task["updated_at"] = task["finished_at"]
+    task["error"] = "Cancelled from the Companion Activity page."
+    _fan_task_update(task)
+    return task
+
+
 def publish(event: dict[str, Any]) -> None:
     """Fan-out to every subscriber + update the task registry.
     Never blocks; drops for slow consumers."""
