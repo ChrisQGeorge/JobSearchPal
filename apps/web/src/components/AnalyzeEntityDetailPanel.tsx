@@ -14,6 +14,7 @@ type AnalyzeEntityType =
   | "publication"
   | "achievement"
   | "volunteer"
+  | "project"
   | "custom";
 
 const LABEL_FOR: Record<AnalyzeEntityType, string> = {
@@ -23,6 +24,7 @@ const LABEL_FOR: Record<AnalyzeEntityType, string> = {
   publication: "Publication",
   achievement: "Achievement",
   volunteer: "Volunteer Work",
+  project: "Project",
   custom: "Custom Event",
 };
 

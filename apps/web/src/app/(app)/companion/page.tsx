@@ -277,6 +277,7 @@ export default function CompanionPage() {
       "publication",
       "achievement",
       "volunteer",
+      "project",
       "custom",
     ]);
     if (!allowed.has(seed.entity_type)) return null;
@@ -288,6 +289,7 @@ export default function CompanionPage() {
         | "publication"
         | "achievement"
         | "volunteer"
+        | "project"
         | "custom",
       entity_id: seed.entity_id,
     };
