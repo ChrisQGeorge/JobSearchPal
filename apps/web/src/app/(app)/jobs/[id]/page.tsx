@@ -416,7 +416,7 @@ function ReviewAction({
 
   function nextTarget(): string {
     const queue = ids.filter((i) => i !== jobId);
-    if (queue.length === 0) return "/jobs/review";
+    if (queue.length === 0) return "/jobs/pipeline";
     const idx = ids.indexOf(jobId);
     const next = idx >= 0 && idx + 1 < ids.length ? ids[idx + 1] : queue[0];
     return `/jobs/${next}?from=review`;
@@ -438,7 +438,7 @@ function ReviewAction({
   }
 
   function prevTarget(): string {
-    if (ids.length === 0) return "/jobs/review";
+    if (ids.length === 0) return "/jobs/pipeline";
     const idx = ids.indexOf(jobId);
     if (idx > 0) return `/jobs/${ids[idx - 1]}?from=review`;
     return `/jobs/${ids[ids.length - 1]}?from=review`;
@@ -610,7 +610,7 @@ function ApplyAction({
 
   function nextTarget(): string {
     const queue = ids.filter((i) => i !== jobId);
-    if (queue.length === 0) return "/jobs/apply";
+    if (queue.length === 0) return "/jobs/pipeline";
     const idx = ids.indexOf(jobId);
     const next = idx >= 0 && idx + 1 < ids.length ? ids[idx + 1] : queue[0];
     return `/jobs/${next}?from=apply`;
@@ -634,7 +634,7 @@ function ApplyAction({
   }
 
   function prevTarget(): string {
-    if (ids.length === 0) return "/jobs/apply";
+    if (ids.length === 0) return "/jobs/pipeline";
     const idx = ids.indexOf(jobId);
     if (idx > 0) return `/jobs/${ids[idx - 1]}?from=apply`;
     return `/jobs/${ids[ids.length - 1]}?from=apply`;

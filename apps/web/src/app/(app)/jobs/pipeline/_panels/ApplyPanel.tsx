@@ -2,7 +2,6 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { PageShell } from "@/components/PageShell";
 import { api, ApiError } from "@/lib/api";
 
 type ApplyItem = {
@@ -21,7 +20,7 @@ type ApplyQueueOut = {
   items: ApplyItem[];
 };
 
-export default function ApplyQueuePage() {
+export function ApplyPanel() {
   const [data, setData] = useState<ApplyQueueOut | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -43,16 +42,16 @@ export default function ApplyQueuePage() {
   const items = data?.items ?? [];
   const firstId = data?.ids?.[0];
 
+  const subtitle =
+    total === 0
+      ? "Nothing queued — mark jobs as 'interested' in the review queue to stack them here."
+      : `${total} job${total === 1 ? "" : "s"} you've flagged as interested. Work through them one by one with the apply-flow buttons on each detail page.`;
+
   return (
-    <PageShell
-      title="Apply Queue"
-      subtitle={
-        total === 0
-          ? "Nothing queued — mark jobs as 'interested' in the review queue to stack them here."
-          : `${total} job${total === 1 ? "" : "s"} you've flagged as interested. Work through them one by one with the apply-flow buttons on each detail page.`
-      }
-      actions={
-        firstId ? (
+    <>
+      <div className="flex items-baseline justify-between gap-3 flex-wrap mb-3">
+        <p className="text-sm text-corp-muted">{subtitle}</p>
+        {firstId ? (
           <Link
             href={`/jobs/${firstId}?from=apply`}
             className="jsp-btn-primary"
@@ -63,9 +62,9 @@ export default function ApplyQueuePage() {
           <Link href="/jobs" className="jsp-btn-ghost">
             Back to Tracker
           </Link>
-        )
-      }
-    >
+        )}
+      </div>
+
       {err ? (
         <div className="jsp-card p-4 text-sm text-corp-danger">{err}</div>
       ) : null}
@@ -76,15 +75,9 @@ export default function ApplyQueuePage() {
         <div className="jsp-card p-8 text-center">
           <div className="text-3xl mb-2">✓</div>
           <p className="text-sm text-corp-muted">
-            No jobs waiting to apply to. Triage the Review Queue first or
+            No jobs waiting to apply to. Triage the Review tab first or
             mark existing rows "interested" on the tracker.
           </p>
-          <Link
-            href="/jobs/review"
-            className="jsp-btn-ghost mt-4 inline-block"
-          >
-            Open Review Queue
-          </Link>
         </div>
       ) : (
         <ul className="jsp-card divide-y divide-corp-border overflow-hidden">
@@ -128,6 +121,6 @@ export default function ApplyQueuePage() {
           ))}
         </ul>
       )}
-    </PageShell>
+    </>
   );
 }

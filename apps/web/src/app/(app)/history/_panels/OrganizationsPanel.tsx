@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { PageShell } from "@/components/PageShell";
 import { Paginator, usePagination } from "@/components/Paginator";
 import { api, ApiError } from "@/lib/api";
 import {
@@ -12,7 +11,7 @@ import {
   type OrganizationUsage,
 } from "@/lib/types";
 
-export default function OrganizationsPage() {
+export function OrganizationsPanel() {
   const [items, setItems] = useState<OrganizationSummary[]>([]);
   const [q, setQ] = useState("");
   const [typeFilter, setTypeFilter] = useState<OrganizationType | "">("");
@@ -74,15 +73,16 @@ export default function OrganizationsPage() {
   }
 
   return (
-    <PageShell
-      title="Organizations"
-      subtitle="Employers, universities, certifying bodies, conferences — one place for every entity you link your history and applications to."
-      actions={
+    <>
+      <div className="flex items-center justify-between mb-3">
+        <p className="text-sm text-corp-muted">
+          Employers, universities, certifying bodies, conferences — one place
+          for every entity you link your history and applications to.
+        </p>
         <button className="jsp-btn-primary" onClick={() => setCreating(true)}>
           + New Organization
         </button>
-      }
-    >
+      </div>
       <div className="flex flex-wrap gap-3 mb-4 items-end">
         <div className="flex-1 min-w-[16rem]">
           <label className="jsp-label">Search</label>
@@ -156,7 +156,7 @@ export default function OrganizationsPage() {
           />
         </div>
       )}
-    </PageShell>
+    </>
   );
 }
 

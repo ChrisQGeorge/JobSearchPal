@@ -1,11 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { PageShell } from "@/components/PageShell";
 import { api, apiUrl, ApiError } from "@/lib/api";
 import type { WritingSample } from "@/lib/types";
 
-export default function SamplesPage() {
+export function SamplesPanel() {
   const [samples, setSamples] = useState<WritingSample[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -75,10 +74,11 @@ export default function SamplesPage() {
   const selected = samples.find((s) => s.id === selectedId) ?? null;
 
   return (
-    <PageShell
-      title="Writing Samples Library"
-      subtitle="Your own writing — the reference corpus the humanizer will use to rewrite AI output in your voice."
-    >
+    <>
+      <p className="text-sm text-corp-muted mb-3">
+        Your own writing — the reference corpus the humanizer will use to
+        rewrite AI output in your voice.
+      </p>
       {err ? <div className="jsp-card p-4 text-sm text-corp-danger">{err}</div> : null}
 
       <div className="jsp-card p-4 space-y-3">
@@ -229,7 +229,7 @@ export default function SamplesPage() {
           </div>
         </div>
       )}
-    </PageShell>
+    </>
   );
 }
 

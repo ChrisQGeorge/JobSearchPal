@@ -1,49 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { PageShell } from "@/components/PageShell";
 import { api, ApiError } from "@/lib/api";
-
-type Tab = "resume" | "job" | "auth" | "criteria" | "demographics";
-
-const TABS: { key: Tab; label: string }[] = [
-  { key: "resume", label: "Resume Profile" },
-  { key: "job", label: "Job Preferences" },
-  { key: "auth", label: "Work Authorization" },
-  { key: "criteria", label: "Criteria List" },
-  { key: "demographics", label: "Demographics" },
-];
-
-export default function PreferencesPage() {
-  const [tab, setTab] = useState<Tab>("resume");
-  return (
-    <PageShell
-      title="Preferences & Identity"
-      subtitle="What appears on your documents, what you want in a job, what you're authorized to do, and voluntary self-identification."
-    >
-      <div className="flex gap-2 mb-4 border-b border-corp-border">
-        {TABS.map((t) => (
-          <button
-            key={t.key}
-            onClick={() => setTab(t.key)}
-            className={`px-3 py-2 text-sm transition-colors ${
-              tab === t.key
-                ? "text-corp-accent border-b-2 border-corp-accent"
-                : "text-corp-muted hover:text-corp-text"
-            }`}
-          >
-            {t.label}
-          </button>
-        ))}
-      </div>
-      {tab === "resume" && <ResumeProfilePanel />}
-      {tab === "job" && <JobPreferencesPanel />}
-      {tab === "auth" && <WorkAuthorizationPanel />}
-      {tab === "criteria" && <CriteriaPanel />}
-      {tab === "demographics" && <DemographicsPanel />}
-    </PageShell>
-  );
-}
 
 function csvToList(v: string | undefined | null): string[] | null {
   if (!v || !v.trim()) return null;
@@ -265,7 +223,7 @@ type ResumeProfile = {
   professional_summary?: string | null;
 };
 
-function ResumeProfilePanel() {
+export function ResumeProfilePanel() {
   const [data, setData] = useState<ResumeProfile | null>(null);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -673,7 +631,7 @@ type JobPreferences = {
   dream_job_notes?: string | null;
 };
 
-function JobPreferencesPanel() {
+export function JobPreferencesPanel() {
   const [data, setData] = useState<JobPreferences | null>(null);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -1094,7 +1052,7 @@ type WorkAuthorization = {
   export_control_considerations?: string | null;
 };
 
-function WorkAuthorizationPanel() {
+export function WorkAuthorizationPanel() {
   const [data, setData] = useState<WorkAuthorization | null>(null);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -1364,7 +1322,7 @@ const BUILTIN_LABELS: Record<string, string> = {
   jd_analysis: "Companion analysis (qualitative 0-100 from Score)",
 };
 
-function CriteriaPanel() {
+export function CriteriaPanel() {
   const [items, setItems] = useState<Criterion[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -1858,7 +1816,7 @@ type Demographics = {
   first_generation_college_student?: string | null;
 };
 
-function DemographicsPanel() {
+export function DemographicsPanel() {
   const [data, setData] = useState<Demographics | null>(null);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);

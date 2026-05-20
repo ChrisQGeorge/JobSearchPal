@@ -2,7 +2,6 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { PageShell } from "@/components/PageShell";
 import { api, ApiError } from "@/lib/api";
 
 type ReviewItem = {
@@ -24,7 +23,7 @@ type ReviewQueueOut = {
   items: ReviewItem[];
 };
 
-export default function ReviewQueuePage() {
+export function ReviewPanel() {
   const [data, setData] = useState<ReviewQueueOut | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -53,14 +52,10 @@ export default function ReviewQueuePage() {
     }
     const parts: string[] = [];
     if (freshCount > 0) {
-      parts.push(
-        `${freshCount} fresh job${freshCount === 1 ? "" : "s"}`,
-      );
+      parts.push(`${freshCount} fresh job${freshCount === 1 ? "" : "s"}`);
     }
     if (skippedCount > 0) {
-      parts.push(
-        `${skippedCount} skipped earlier — cycled to the back`,
-      );
+      parts.push(`${skippedCount} skipped earlier — cycled to the back`);
     }
     return (
       parts.join(" · ") +
@@ -69,11 +64,10 @@ export default function ReviewQueuePage() {
   })();
 
   return (
-    <PageShell
-      title="Review Queue"
-      subtitle={subtitle}
-      actions={
-        firstId ? (
+    <>
+      <div className="flex items-baseline justify-between gap-3 flex-wrap mb-3">
+        <p className="text-sm text-corp-muted">{subtitle}</p>
+        {firstId ? (
           <Link
             href={`/jobs/${firstId}?from=review`}
             className="jsp-btn-primary"
@@ -84,9 +78,9 @@ export default function ReviewQueuePage() {
           <Link href="/jobs" className="jsp-btn-ghost">
             Back to Tracker
           </Link>
-        )
-      }
-    >
+        )}
+      </div>
+
       {err ? (
         <div className="jsp-card p-4 text-sm text-corp-danger">{err}</div>
       ) : null}
@@ -158,6 +152,6 @@ export default function ReviewQueuePage() {
           })}
         </ul>
       )}
-    </PageShell>
+    </>
   );
 }

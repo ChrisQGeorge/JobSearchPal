@@ -95,7 +95,7 @@ export default function DashboardPage() {
               ? "Click to triage →"
               : "Queue is clear"
           }
-          href="/jobs/review"
+          href="/jobs/pipeline"
           tone={
             (metrics.statusCounts.get("to_review") ?? 0) > 0 ? "warn" : undefined
           }
@@ -108,7 +108,7 @@ export default function DashboardPage() {
               ? "Click to start applying →"
               : "Nothing queued"
           }
-          href="/jobs/apply"
+          href="/jobs/pipeline"
         />
         <Kpi
           label="Active applications"
@@ -210,7 +210,7 @@ export default function DashboardPage() {
           <Link className="jsp-btn-ghost" href="/studio">
             Open Document Studio
           </Link>
-          <Link className="jsp-btn-ghost" href="/samples">
+          <Link className="jsp-btn-ghost" href="/studio">
             Writing samples
           </Link>
         </div>

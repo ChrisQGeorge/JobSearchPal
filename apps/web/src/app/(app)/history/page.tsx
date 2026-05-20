@@ -4,6 +4,7 @@ import { useState } from "react";
 import { PageShell } from "@/components/PageShell";
 import { api, ApiError } from "@/lib/api";
 import { EducationPanel } from "./_panels/EducationPanel";
+import { OrganizationsPanel } from "./_panels/OrganizationsPanel";
 import { SkillsPanel } from "./_panels/SkillsPanel";
 import { WorkPanel } from "./_panels/WorkPanel";
 import { GenericEntityPanel } from "./_panels/shared";
@@ -32,7 +33,8 @@ type Tab =
   | "volunteer"
   | "languages"
   | "contacts"
-  | "custom";
+  | "custom"
+  | "organizations";
 
 const TABS: { key: Tab; label: string }[] = [
   { key: "work", label: "Work" },
@@ -47,6 +49,7 @@ const TABS: { key: Tab; label: string }[] = [
   { key: "languages", label: "Languages" },
   { key: "contacts", label: "Contacts" },
   { key: "custom", label: "Custom Events" },
+  { key: "organizations", label: "Organizations" },
 ];
 
 export default function HistoryEditorPage() {
@@ -356,6 +359,7 @@ export default function HistoryEditorPage() {
           ]}
         />
       )}
+      {tab === "organizations" && <OrganizationsPanel />}
       {ingestOpen ? (
         <ResumeIngestModal onClose={() => setIngestOpen(false)} />
       ) : null}

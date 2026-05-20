@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { PageShell } from "@/components/PageShell";
 import { api, ApiError } from "@/lib/api";
 
 type Snippet = {
@@ -37,7 +36,7 @@ function emptyForm(kind = "hook"): SnippetForm {
   return { kind, title: "", content_md: "", tags: "" };
 }
 
-export default function CoverLetterLibraryPage() {
+export function CoverLetterLibraryPanel() {
   const [items, setItems] = useState<Snippet[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -132,10 +131,13 @@ export default function CoverLetterLibraryPage() {
   }, [items, filterKind]);
 
   return (
-    <PageShell
-      title="Cover Letter Library"
-      subtitle="Reusable hooks, bridges, and closers in your voice. The Companion can pull from this when drafting cover letters so it isn't reinventing every opener."
-      actions={
+    <>
+      <div className="flex items-center justify-between mb-3">
+        <p className="text-sm text-corp-muted">
+          Reusable hooks, bridges, and closers in your voice. The Companion
+          can pull from this when drafting cover letters so it isn't
+          reinventing every opener.
+        </p>
         <button
           className="jsp-btn-primary"
           onClick={() => setEditing(emptyForm())}
@@ -143,8 +145,7 @@ export default function CoverLetterLibraryPage() {
         >
           + New snippet
         </button>
-      }
-    >
+      </div>
       {err ? (
         <div className="jsp-card p-4 text-sm text-corp-danger">{err}</div>
       ) : null}
@@ -343,6 +344,6 @@ export default function CoverLetterLibraryPage() {
           </div>
         ))
       )}
-    </PageShell>
+    </>
   );
 }
