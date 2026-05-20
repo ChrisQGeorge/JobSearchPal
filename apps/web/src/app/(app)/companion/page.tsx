@@ -453,6 +453,22 @@ function ChatPane({
 }) {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  // Live activity log while a turn is streaming. Each entry is a one-line
+  // breadcrumb of something the Companion just did — a tool call, the
+  // start of text generation, etc. Cleared when sending finishes so the
+  // mini activity panel auto-disappears once the response is fully on
+  // screen. Capped to the most recent 8 entries so the panel stays small.
+  type ActivityEntry = { id: number; kind: "tool" | "text" | "info"; label: string };
+  const [activityLog, setActivityLog] = useState<ActivityEntry[]>([]);
+  const activityCounterRef = useRef(0);
+  function pushActivity(kind: ActivityEntry["kind"], label: string) {
+    activityCounterRef.current += 1;
+    const id = activityCounterRef.current;
+    setActivityLog((prev) => {
+      const next = [...prev, { id, kind, label }];
+      return next.length > 8 ? next.slice(next.length - 8) : next;
+    });
+  }
   const [error, setError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<AttachedDoc[]>([]);
   const [attaching, setAttaching] = useState(false);
@@ -519,6 +535,7 @@ function ChatPane({
     if (!detail || !input.trim() || sending) return;
     setError(null);
     setSending(true);
+    setActivityLog([]); // fresh activity log per turn
     const content = input;
     setInput("");
 
@@ -599,13 +616,42 @@ function ChatPane({
             continue;
           }
           if (ev.type === "text_delta" && typeof ev.text === "string") {
+            const isFirstTextChunk = assistantText.length === 0;
             assistantText += ev.text;
             onAssistantDelta(tempAssistantId, assistantText);
+            // Drop a single breadcrumb when text generation starts so
+            // the user sees a transition from "tool work" to "writing
+            // reply." Subsequent deltas are noise in the activity log
+            // since they're already visible in the streaming bubble.
+            if (isFirstTextChunk) {
+              pushActivity("text", "Writing reply…");
+            }
           } else if (ev.type === "tool_use") {
             toolsUsed.push({ name: String(ev.name ?? ""), input: ev.input });
             onAssistantMeta(tempAssistantId, toolsUsed);
+            // Distill the tool call into a one-liner. Bash gets the
+            // command (truncated); other tools show the most useful
+            // input field.
+            const toolName = String(ev.name ?? "tool");
+            const inp = (ev.input as Record<string, unknown> | undefined) ?? {};
+            let summary: string;
+            if (toolName === "Bash" && typeof inp.command === "string") {
+              summary = `${toolName} · ${(inp.command as string).slice(0, 80)}`;
+            } else if (toolName === "Read" && typeof inp.file_path === "string") {
+              summary = `${toolName} · ${inp.file_path as string}`;
+            } else if (toolName === "Grep" && typeof inp.pattern === "string") {
+              summary = `${toolName} · /${inp.pattern as string}/`;
+            } else if (toolName === "WebFetch" && typeof inp.url === "string") {
+              summary = `${toolName} · ${inp.url as string}`;
+            } else if (toolName === "WebSearch" && typeof inp.query === "string") {
+              summary = `${toolName} · ${inp.query as string}`;
+            } else {
+              summary = toolName;
+            }
+            pushActivity("tool", summary);
           } else if (ev.type === "error" && typeof ev.message === "string") {
             setError(ev.message);
+            pushActivity("info", `Error: ${ev.message.slice(0, 80)}`);
           } else if (ev.type === "done") {
             if (Array.isArray(ev.skills_inferred)) {
               skillsInferred = ev.skills_inferred as string[];
@@ -654,6 +700,9 @@ function ChatPane({
       }
     } finally {
       setSending(false);
+      // Auto-hide the activity panel — the final response is now in
+      // the assistant bubble, so the breadcrumbs are no longer useful.
+      setActivityLog([]);
     }
   }
 
@@ -725,8 +774,39 @@ function ChatPane({
         ))}
         {sending ? (
           <div className="flex justify-start">
-            <div className="jsp-card px-3 py-2 text-sm text-corp-muted animate-pulse">
-              Companion is thinking...
+            <div className="jsp-card px-3 py-2 text-xs text-corp-muted min-w-[16rem] max-w-md">
+              <div className="flex items-center gap-2 mb-1">
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-corp-accent animate-pulse" />
+                <span className="uppercase tracking-wider text-corp-accent text-[10px]">
+                  Companion working
+                </span>
+              </div>
+              {activityLog.length === 0 ? (
+                <div className="text-corp-muted">
+                  Starting up — Claude subprocess spinning up…
+                </div>
+              ) : (
+                <ul className="space-y-0.5 max-h-32 overflow-y-auto">
+                  {activityLog.map((a) => (
+                    <li
+                      key={a.id}
+                      className={`truncate ${
+                        a.kind === "tool"
+                          ? "text-corp-text"
+                          : a.kind === "text"
+                            ? "text-corp-accent"
+                            : "text-corp-danger"
+                      }`}
+                      title={a.label}
+                    >
+                      <span className="text-corp-muted mr-1">
+                        {a.kind === "tool" ? "→" : a.kind === "text" ? "✎" : "!"}
+                      </span>
+                      <span className="font-mono text-[11px]">{a.label}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
             </div>
           </div>
         ) : null}
