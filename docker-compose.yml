@@ -8,7 +8,15 @@ services:
       MYSQL_USER: ${MYSQL_USER}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD}
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    # max_connections bumped from MySQL's default 151. The API uses
+    # NullPool — one fresh MySQL connection per session — so the upper
+    # bound is now MySQL's max_connections rather than a fixed pool.
+    # 500 leaves room for bursty traffic (SWR fan-out, worker, poller,
+    # admin) without any chance of hitting the cap in a single-user app.
+    command: >-
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --max-connections=500
     volumes:
       - db_data:/var/lib/mysql
     healthcheck:
