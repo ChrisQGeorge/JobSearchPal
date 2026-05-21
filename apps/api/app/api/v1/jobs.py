@@ -285,9 +285,39 @@ async def list_jobs(
         latest_by_job: dict[int, str] = {}
         for r in latest_rounds:
             latest_by_job.setdefault(r.tracked_job_id, r.outcome)
+
+        # Per-job doc presence: does the user have a non-deleted resume /
+        # cover_letter linked to each job? One grouped query, two booleans
+        # per id. Anything other than these two doc types doesn't drive
+        # row chips, so it's filtered out of the aggregation.
+        from app.models.documents import GeneratedDocument
+
+        doc_rows = (
+            await db.execute(
+                select(
+                    GeneratedDocument.tracked_job_id,
+                    GeneratedDocument.doc_type,
+                )
+                .where(
+                    GeneratedDocument.tracked_job_id.in_(job_ids),
+                    GeneratedDocument.deleted_at.is_(None),
+                    GeneratedDocument.doc_type.in_(["resume", "cover_letter"]),
+                )
+                .distinct()
+            )
+        ).all()
+        has_resume_by_job: dict[int, bool] = {}
+        has_cover_letter_by_job: dict[int, bool] = {}
+        for tj_id, dt in doc_rows:
+            if dt == "resume":
+                has_resume_by_job[tj_id] = True
+            elif dt == "cover_letter":
+                has_cover_letter_by_job[tj_id] = True
     else:
         counts_by_job = {}
         latest_by_job = {}
+        has_resume_by_job = {}
+        has_cover_letter_by_job = {}
 
     out: list[TrackedJobSummary] = []
     for j in jobs:
@@ -359,6 +389,8 @@ async def list_jobs(
                 skill_match_pct=skill_match_pct,
                 skill_match_have=skill_match_have,
                 skill_match_total=skill_match_total,
+                has_resume=has_resume_by_job.get(j.id, False),
+                has_cover_letter=has_cover_letter_by_job.get(j.id, False),
             )
         )
     return out

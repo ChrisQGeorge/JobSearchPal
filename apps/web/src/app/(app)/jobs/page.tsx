@@ -55,6 +55,15 @@ export default function JobTrackerPage() {
   // Free-text search — applied client-side so the backend doesn't have to
   // implement full-text. Matches title, organization name, location, notes.
   const [search, setSearch] = useState("");
+  // Document-presence filter. Tri-state per doc type:
+  //   "any"  — don't filter on this doc type
+  //   "with" — only show jobs that have this doc type
+  //   "without" — only show jobs missing this doc type
+  // Independent for resume and cover letter so the user can ask "which jobs
+  // have a resume but no cover letter yet".
+  type DocFilter = "any" | "with" | "without";
+  const [resumeFilter, setResumeFilter] = useState<DocFilter>("any");
+  const [coverFilter, setCoverFilter] = useState<DocFilter>("any");
   // Multi-select on the tracker table. Selection survives filter-pill
   // switches (so the user can stage a bulk action across statuses) but
   // resets when a bulk action completes or Clear is clicked.
@@ -160,6 +169,14 @@ export default function JobTrackerPage() {
           return false;
         })
       : items;
+    if (resumeFilter !== "any") {
+      const want = resumeFilter === "with";
+      arr = arr.filter((j) => Boolean(j.has_resume) === want);
+    }
+    if (coverFilter !== "any") {
+      const want = coverFilter === "with";
+      arr = arr.filter((j) => Boolean(j.has_cover_letter) === want);
+    }
     if (sortKey === "skill_match_pct") {
       arr = [...arr].sort((a, b) => {
         const av = a.skill_match_pct;
@@ -173,7 +190,7 @@ export default function JobTrackerPage() {
       });
     }
     return arr;
-  }, [items, search, sortKey, sortDir]);
+  }, [items, search, sortKey, sortDir, resumeFilter, coverFilter]);
 
   // Pagination layered on top of filter+search+sort. Page-size choice
   // persists per-page via localStorage (jsp:paginate:jobs). The
@@ -482,6 +499,19 @@ export default function JobTrackerPage() {
         <AutoArchiveButton onArchived={() => refresh()} />
       </div>
 
+      <div className="flex items-center gap-3 flex-wrap mt-2 text-[11px] text-corp-muted">
+        <DocFilterPills
+          label="Resume"
+          value={resumeFilter}
+          onChange={setResumeFilter}
+        />
+        <DocFilterPills
+          label="Cover letter"
+          value={coverFilter}
+          onChange={setCoverFilter}
+        />
+      </div>
+
       {creating ? (
         <div className="jsp-card p-4 mb-4 mt-4">
           <NewJobForm
@@ -725,6 +755,22 @@ export default function JobTrackerPage() {
                       />
                       <SalaryBadge job={j} prefs={prefs} />
                       <LocationFitBadge job={j} prefs={prefs} />
+                      {j.has_resume ? (
+                        <span
+                          className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded-full border border-corp-ok/40 bg-corp-ok/10 text-corp-ok"
+                          title="A tailored resume already exists for this job."
+                        >
+                          Resume
+                        </span>
+                      ) : null}
+                      {j.has_cover_letter ? (
+                        <span
+                          className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded-full border border-corp-ok/40 bg-corp-ok/10 text-corp-ok"
+                          title="A tailored cover letter already exists for this job."
+                        >
+                          Cover letter
+                        </span>
+                      ) : null}
                     </div>
                   </td>
                   <td className="py-2 px-4">
@@ -1104,6 +1150,42 @@ function AutoArchiveButton({ onArchived }: { onArchived: () => void }) {
     >
       {busy === "preview" ? "…" : "Auto-archive stale"}
     </button>
+  );
+}
+
+
+function DocFilterPills({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: "any" | "with" | "without";
+  onChange: (next: "any" | "with" | "without") => void;
+}) {
+  const opts: { v: "any" | "with" | "without"; t: string }[] = [
+    { v: "any", t: "Any" },
+    { v: "with", t: "With" },
+    { v: "without", t: "Missing" },
+  ];
+  return (
+    <div className="inline-flex items-center gap-1.5">
+      <span className="uppercase tracking-wider text-corp-muted">{label}:</span>
+      {opts.map((o) => (
+        <button
+          key={o.v}
+          type="button"
+          onClick={() => onChange(o.v)}
+          className={`px-2 py-0.5 rounded-md text-[10px] uppercase tracking-wider border ${
+            value === o.v
+              ? "bg-corp-accent/25 text-corp-accent border-corp-accent/40"
+              : "bg-corp-surface2 text-corp-muted border-corp-border hover:text-corp-text"
+          }`}
+        >
+          {o.t}
+        </button>
+      ))}
+    </div>
   );
 }
 

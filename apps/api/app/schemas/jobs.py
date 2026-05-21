@@ -126,6 +126,12 @@ class TrackedJobSummary(BaseModel):
     skill_match_pct: Optional[int] = None
     skill_match_have: Optional[int] = None
     skill_match_total: Optional[int] = None
+    # Per-job booleans: does the user already have at least one non-deleted
+    # GeneratedDocument of the given type linked to this job? Surfaces as
+    # chips on the tracker row + drives the "has resume / cover letter"
+    # filter pills.
+    has_resume: bool = False
+    has_cover_letter: bool = False
 
 
 # --------- InterviewRound ----------------------------------------------------

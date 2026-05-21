@@ -237,6 +237,8 @@ export type TrackedJobSummary = {
   skill_match_pct?: number | null;
   skill_match_have?: number | null;
   skill_match_total?: number | null;
+  has_resume?: boolean;
+  has_cover_letter?: boolean;
 };
 
 export type TrackedJob = {
