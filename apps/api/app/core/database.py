@@ -1,8 +1,11 @@
 """Async SQLAlchemy engine and session factory."""
 from __future__ import annotations
 
+import logging
+import traceback
 from typing import AsyncIterator
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -10,6 +13,8 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from app.core.config import settings
+
+log = logging.getLogger(__name__)
 
 engine = create_async_engine(
     settings.async_database_url,
@@ -23,17 +28,46 @@ engine = create_async_engine(
     # it and rely on pool_recycle to drop stale connections instead.
     pool_pre_ping=False,
     pool_recycle=3600,  # MySQL's default wait_timeout is 8h — recycle hourly
-    # Bumped from 10+10 → 20+20. Streaming endpoints used to hold a pool
-    # connection for the whole stream lifetime via Depends(get_db); we've
-    # since moved them onto a self-managed session pattern, but the
-    # larger margin gives a backstop for any new endpoint that
-    # accidentally repeats the old mistake. With a single-user app this
-    # is still cheap.
-    pool_size=20,
-    max_overflow=20,
-    pool_timeout=10,  # was 30 — fail faster so the symptom is visible
+    # Bumped to 50+50=100 max. MySQL's default max_connections is 151 so
+    # this still leaves headroom for the worker / poller / direct admin
+    # access. We still want to fix the underlying "session held during
+    # Claude call" leak — see queue_worker + Claude-calling endpoints —
+    # but the bigger pool gets the app usable while that work lands.
+    pool_size=50,
+    max_overflow=50,
+    pool_timeout=10,
     echo=False,
 )
+
+
+# Pool diagnostics — logs the call site of every checkout that's
+# still holding a connection when the pool is near exhaustion.
+# Triggered only when pool usage crosses a warn threshold so the log
+# isn't spammed in normal operation. Set JSP_POOL_DIAG=1 to enable.
+import os as _os
+
+if _os.environ.get("JSP_POOL_DIAG") == "1":
+    _OPEN_CHECKOUTS: dict[int, str] = {}
+
+    @event.listens_for(engine.sync_engine, "checkout")
+    def _on_checkout(dbapi_conn, connection_record, connection_proxy):
+        _OPEN_CHECKOUTS[id(connection_record)] = "".join(
+            traceback.format_stack(limit=12)
+        )
+        total = engine.pool.checkedout()  # type: ignore[attr-defined]
+        if total >= 30:
+            log.warning(
+                "DB pool checkout count=%d (size=%d, overflow=%d). "
+                "Recent checkout stack:\n%s",
+                total,
+                50,
+                50,
+                _OPEN_CHECKOUTS[id(connection_record)],
+            )
+
+    @event.listens_for(engine.sync_engine, "checkin")
+    def _on_checkin(dbapi_conn, connection_record):
+        _OPEN_CHECKOUTS.pop(id(connection_record), None)
 
 SessionLocal = async_sessionmaker(
     bind=engine,

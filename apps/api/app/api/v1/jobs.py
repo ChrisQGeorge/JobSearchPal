@@ -2193,7 +2193,7 @@ async def _direct_fetch_page(url: str) -> tuple[str, Optional[str]]:
 
 
 async def perform_fetch(
-    db: AsyncSession,
+    db: AsyncSession | None,
     url: str,
     *,
     on_event: "Optional[callable]" = None,
@@ -2361,40 +2361,50 @@ async def perform_fetch(
     )
 
     if out.organization_name:
-        org = (
-            await db.execute(
-                select(Organization).where(
-                    func.lower(Organization.name) == out.organization_name.strip().lower(),
-                    Organization.deleted_at.is_(None),
+        # Resolve / create the Organization in its own short-lived session
+        # rather than borrowing the caller's. Callers that ran perform_fetch
+        # for a queued task used to hold THEIR session for the full 30–120s
+        # Claude call above; that pinned a pool connection per concurrent
+        # fetch and exhausted the 100-slot pool when a few users hit
+        # /fetch-from-url + the queue worker at once. With the session
+        # local to this block, the connection is in-and-out in a single ms.
+        from app.core.database import SessionLocal as _SL
+
+        async with _SL() as _org_db:
+            org = (
+                await _org_db.execute(
+                    select(Organization).where(
+                        func.lower(Organization.name) == out.organization_name.strip().lower(),
+                        Organization.deleted_at.is_(None),
+                    )
                 )
-            )
-        ).scalar_one_or_none()
+            ).scalar_one_or_none()
 
-        if org is None:
-            org = Organization(name=out.organization_name.strip(), type="company")
-            db.add(org)
-            await db.flush()
+            if org is None:
+                org = Organization(name=out.organization_name.strip(), type="company")
+                _org_db.add(org)
+                await _org_db.flush()
 
-        enrichment_map = {
-            "website": out.organization_website,
-            "industry": out.organization_industry,
-            "size": out.organization_size,
-            "headquarters_location": out.organization_headquarters,
-            "description": out.organization_description,
-        }
-        for attr, value in enrichment_map.items():
-            if value and not getattr(org, attr, None):
-                setattr(org, attr, value)
-        if out.research_notes and not org.research_notes:
-            org.research_notes = out.research_notes
-        if out.tech_stack_hints:
-            existing = list(org.tech_stack_hints or [])
-            org.tech_stack_hints = existing + [
-                h for h in out.tech_stack_hints if h not in existing
-            ]
+            enrichment_map = {
+                "website": out.organization_website,
+                "industry": out.organization_industry,
+                "size": out.organization_size,
+                "headquarters_location": out.organization_headquarters,
+                "description": out.organization_description,
+            }
+            for attr, value in enrichment_map.items():
+                if value and not getattr(org, attr, None):
+                    setattr(org, attr, value)
+            if out.research_notes and not org.research_notes:
+                org.research_notes = out.research_notes
+            if out.tech_stack_hints:
+                existing = list(org.tech_stack_hints or [])
+                org.tech_stack_hints = existing + [
+                    h for h in out.tech_stack_hints if h not in existing
+                ]
 
-        await db.commit()
-        out.organization_id = org.id
+            await _org_db.commit()
+            out.organization_id = org.id
 
     if not any(
         [out.title, out.organization_name, out.job_description, out.location]
@@ -2444,16 +2454,21 @@ def build_tracked_job_payload(
 @router.post("/fetch-from-url", response_model=FetchedJobInfo)
 async def fetch_from_url(
     body: FetchFromUrlIn,
-    db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> FetchedJobInfo:
     """Invoke Claude Code's WebFetch to pull structured job info from a URL.
 
     Does NOT create a TrackedJob — the frontend uses this to prefill the
     New Job form. The user can review and edit before saving.
+
+    No `Depends(get_db)` on purpose: `perform_fetch` is a 30–120s Claude
+    call and any dep-injected session would be pinned for that entire
+    duration, draining the pool. perform_fetch manages its own
+    short-lived session internally when it needs to resolve / create
+    the Organization row.
     """
     try:
-        return await perform_fetch(db, body.url)
+        return await perform_fetch(None, body.url)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     except ClaudeCodeError as exc:

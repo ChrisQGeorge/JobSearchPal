@@ -491,6 +491,7 @@ async def _handle_fetch(item: JobFetchQueue) -> None:
     from app.skills.runner import ClaudeCodeError
     from app.skills import queue_bus
 
+    # Phase 1: read the queue row state. Session held briefly.
     async with SessionLocal() as db:
         row = (
             await db.execute(select(JobFetchQueue).where(JobFetchQueue.id == item.id))
@@ -505,32 +506,55 @@ async def _handle_fetch(item: JobFetchQueue) -> None:
             tj_id = row.payload.get("tracked_job_id")
             if isinstance(tj_id, int):
                 existing_job_id = tj_id
+        row_user_id = row.user_id
+        row_url = row.url
 
-        def _on_event(ev: dict) -> None:
-            p = dict(ev)
-            p.setdefault("item_id", f"queue:{item_id}")
-            p.setdefault("source", "fetch")
-            p.setdefault("label", label)
-            p.setdefault("url", item_url)
-            queue_bus.publish(p)
+    def _on_event(ev: dict) -> None:
+        p = dict(ev)
+        p.setdefault("item_id", f"queue:{item_id}")
+        p.setdefault("source", "fetch")
+        p.setdefault("label", label)
+        p.setdefault("url", item_url)
+        queue_bus.publish(p)
 
-        queue_bus.publish({
-            "item_id": f"queue:{item_id}", "source": "fetch",
-            "label": label, "url": item_url, "kind": "start",
-        })
+    queue_bus.publish({
+        "item_id": f"queue:{item_id}", "source": "fetch",
+        "label": label, "url": item_url, "kind": "start",
+    })
 
-        try:
-            fetched = await perform_fetch(db, row.url, on_event=_on_event)
-        except ClaudeCodeError as exc:
-            err = str(exc)
+    # Phase 2: long Claude call. NO session held — perform_fetch now
+    # manages its own session internally for the org-resolution write.
+    try:
+        fetched = await perform_fetch(None, row_url, on_event=_on_event)
+    except ClaudeCodeError as exc:
+        err = str(exc)
+        async with SessionLocal() as db:
+            row = (
+                await db.execute(select(JobFetchQueue).where(JobFetchQueue.id == item.id))
+            ).scalar_one_or_none()
+            if row is None:
+                return
             if _is_rate_limited(err):
                 await _handle_rate_limit(db, row, err)
                 return
             await _fail(db, row, err)
-            return
-        except Exception as exc:  # pragma: no cover
-            await _fail(db, row, f"Unexpected error: {exc}")
-            log.exception("Fetch task %d unhandled error", row.id)
+        return
+    except Exception as exc:  # pragma: no cover
+        async with SessionLocal() as db:
+            row = (
+                await db.execute(select(JobFetchQueue).where(JobFetchQueue.id == item.id))
+            ).scalar_one_or_none()
+            if row is not None:
+                await _fail(db, row, f"Unexpected error: {exc}")
+        log.exception("Fetch task %d unhandled error", item.id)
+        return
+
+    # Phase 3: writes. Fresh session.
+    async with SessionLocal() as db:
+        row = (
+            await db.execute(select(JobFetchQueue).where(JobFetchQueue.id == item.id))
+        ).scalar_one_or_none()
+        if row is None:
             return
 
         if fetched.warning:
