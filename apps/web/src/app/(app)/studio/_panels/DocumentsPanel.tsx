@@ -2,9 +2,8 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api, apiUrl, ApiError } from "@/lib/api";
-import { useApi } from "@/lib/swr";
 import {
   DOC_TYPES,
   type DocType,
@@ -16,6 +15,10 @@ type DocFilter = "all" | DocType;
 
 export function DocumentsPanel() {
   const router = useRouter();
+  const [docs, setDocs] = useState<GeneratedDocument[]>([]);
+  const [jobs, setJobs] = useState<TrackedJobSummary[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
   const [filterType, setFilterType] = useState<DocFilter>("all");
   const [filterJob, setFilterJob] = useState<number | "all">("all");
   const [filterTag, setFilterTag] = useState<string | "all">("all");
@@ -26,31 +29,30 @@ export function DocumentsPanel() {
   const [batchRunning, setBatchRunning] = useState(false);
   const [batchMsg, setBatchMsg] = useState<string | null>(null);
 
-  // SWR cache both lists so re-entering Studio after popping into a doc
-  // editor shows the previous results instantly while a fresh fetch
-  // revalidates in the background.
-  const {
-    data: docsData,
-    error: docsErr,
-    isLoading: docsLoading,
-    mutate: mutateDocs,
-  } = useApi<GeneratedDocument[]>("/api/v1/documents");
-  const { data: jobsData, mutate: mutateJobs } =
-    useApi<TrackedJobSummary[]>("/api/v1/jobs");
-
-  const docs = docsData ?? [];
-  const jobs = jobsData ?? [];
-  const loading = docsLoading && !docsData;
-  const err =
-    docsErr instanceof ApiError
-      ? `Failed to load documents (HTTP ${docsErr.status}).`
-      : docsErr
-        ? "Failed to load documents."
-        : null;
-
   async function refresh() {
-    await Promise.all([mutateDocs(), mutateJobs()]);
+    setLoading(true);
+    setErr(null);
+    try {
+      const [d, j] = await Promise.all([
+        api.get<GeneratedDocument[]>("/api/v1/documents"),
+        api.get<TrackedJobSummary[]>("/api/v1/jobs"),
+      ]);
+      setDocs(d);
+      setJobs(j);
+    } catch (e) {
+      setErr(
+        e instanceof ApiError
+          ? `Failed to load documents (HTTP ${e.status}).`
+          : "Failed to load documents.",
+      );
+    } finally {
+      setLoading(false);
+    }
   }
+
+  useEffect(() => {
+    refresh();
+  }, []);
 
   const jobById = useMemo(
     () => new Map(jobs.map((j) => [j.id, j])),
@@ -91,12 +93,7 @@ export function DocumentsPanel() {
       `/api/v1/documents/${id}`,
       { tags },
     );
-    // Patch the SWR cache in place — no revalidation needed since we already
-    // have the authoritative server response in `updated`.
-    await mutateDocs(
-      (prev) => (prev ? prev.map((d) => (d.id === id ? updated : d)) : prev),
-      { revalidate: false },
-    );
+    setDocs((prev) => prev.map((d) => (d.id === id ? updated : d)));
   }
 
   function toggleSelected(id: number) {

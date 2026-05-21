@@ -11,7 +11,6 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { PageShell } from "@/components/PageShell";
 import { api, ApiError } from "@/lib/api";
-import { useApi } from "@/lib/swr";
 import { type JobStatus, type TrackedJobSummary } from "@/lib/types";
 
 type Classification = {
@@ -61,6 +60,9 @@ const STATE_LABELS: Record<ParsedEmail["state"], string> = {
 };
 
 export default function EmailInboxPage() {
+  const [items, setItems] = useState<ParsedEmail[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
   const [stateFilter, setStateFilter] = useState<"all" | ParsedEmail["state"]>("new");
 
   // Paste form
@@ -73,32 +75,40 @@ export default function EmailInboxPage() {
 
   // Selection
   const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [jobs, setJobs] = useState<TrackedJobSummary[]>([]);
 
-  // List + jobs lookup. SWR keys off the URL so flipping `stateFilter`
-  // swaps cache slots — returning to a previously-visited filter is
-  // instant, with a background revalidation kicking in to catch updates.
-  const inboxKey = (() => {
-    const params = new URLSearchParams();
-    if (stateFilter !== "all") params.set("state", stateFilter);
-    return `/api/v1/email-ingest?${params.toString()}`;
-  })();
-  const {
-    data: itemsData,
-    error: itemsErr,
-    isLoading: itemsLoading,
-    mutate: refresh,
-  } = useApi<ParsedEmail[]>(inboxKey);
-  const items = itemsData ?? [];
-  const loading = itemsLoading && !itemsData;
-  const err =
-    itemsErr instanceof ApiError
-      ? `Load failed (HTTP ${itemsErr.status}).`
-      : itemsErr
-        ? "Load failed."
-        : null;
+  async function refresh() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const params = new URLSearchParams();
+      if (stateFilter !== "all") params.set("state", stateFilter);
+      const rows = await api.get<ParsedEmail[]>(
+        `/api/v1/email-ingest?${params.toString()}`,
+      );
+      setItems(rows);
+    } catch (e) {
+      setErr(
+        e instanceof ApiError
+          ? `Load failed (HTTP ${e.status}).`
+          : "Load failed.",
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
 
-  const { data: jobsData } = useApi<TrackedJobSummary[]>("/api/v1/jobs");
-  const jobs = jobsData ?? [];
+  useEffect(() => {
+    refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stateFilter]);
+
+  useEffect(() => {
+    api
+      .get<TrackedJobSummary[]>("/api/v1/jobs")
+      .then(setJobs)
+      .catch(() => setJobs([]));
+  }, []);
 
   async function parsePaste() {
     if (!body.trim()) {
