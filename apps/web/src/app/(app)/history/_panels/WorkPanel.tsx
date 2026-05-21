@@ -1,30 +1,29 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { AnalyzeEntityButton } from "@/components/AnalyzeEntityButton";
 import { OrganizationCombobox } from "@/components/OrganizationCombobox";
 import { RelatedItemsPanel } from "@/components/RelatedItemsPanel";
 import { SkillMultiSelect } from "@/components/SkillMultiSelect";
 import { api } from "@/lib/api";
+import { useApi } from "@/lib/swr";
 import type { WorkExperience } from "@/lib/types";
 
 export function WorkPanel() {
-  const [items, setItems] = useState<WorkExperience[]>([]);
-  const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<WorkExperience | null>(null);
 
+  const {
+    data: itemsData,
+    isLoading,
+    mutate,
+  } = useApi<WorkExperience[]>("/api/v1/history/work");
+  const items = itemsData ?? [];
+  const loading = isLoading && !itemsData;
+
   async function refresh() {
-    setLoading(true);
-    try {
-      setItems(await api.get<WorkExperience[]>("/api/v1/history/work"));
-    } finally {
-      setLoading(false);
-    }
+    await mutate();
   }
-  useEffect(() => {
-    refresh();
-  }, []);
 
   async function save(payload: Partial<WorkExperience>, id?: number) {
     if (id) await api.put(`/api/v1/history/work/${id}`, payload);
@@ -59,9 +58,10 @@ export function WorkPanel() {
             onCancel={() => setCreating(false)}
             onSaved={async (id) => {
               setCreating(false);
-              await refresh();
-              // After creating, open edit so user can immediately add skills to it.
-              const fresh = await api.get<WorkExperience[]>("/api/v1/history/work");
+              // After creating, refresh then open edit so user can
+              // immediately add skills to the new entry. `mutate` returns
+              // the revalidated data so we don't need a second api.get.
+              const fresh = (await mutate()) ?? [];
               const newItem = fresh.find((w) => w.id === id) ?? null;
               setEditing(newItem);
             }}

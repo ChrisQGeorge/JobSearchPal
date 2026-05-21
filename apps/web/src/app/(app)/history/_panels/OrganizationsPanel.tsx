@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { Paginator, usePagination } from "@/components/Paginator";
 import { api, ApiError } from "@/lib/api";
+import { useApi } from "@/lib/swr";
 import {
   ORG_TYPES,
   type Organization,
@@ -12,39 +13,39 @@ import {
 } from "@/lib/types";
 
 export function OrganizationsPanel() {
-  const [items, setItems] = useState<OrganizationSummary[]>([]);
   const [q, setQ] = useState("");
+  const [debouncedQ, setDebouncedQ] = useState("");
   const [typeFilter, setTypeFilter] = useState<OrganizationType | "">("");
   const [editing, setEditing] = useState<Organization | null>(null);
   const [creating, setCreating] = useState(false);
-  const [loading, setLoading] = useState(true);
+
+  // 200ms debounce on the search box — without it every keystroke
+  // becomes a separate SWR cache key, which thrashes the cache and
+  // refetches more than necessary.
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedQ(q), 200);
+    return () => clearTimeout(t);
+  }, [q]);
+
+  const orgsKey = (() => {
+    const params = new URLSearchParams();
+    if (debouncedQ.trim()) params.set("q", debouncedQ.trim());
+    if (typeFilter) params.set("type", typeFilter);
+    params.set("limit", "1000");
+    return `/api/v1/organizations?${params.toString()}`;
+  })();
+  const {
+    data: itemsData,
+    isLoading,
+    mutate,
+  } = useApi<OrganizationSummary[]>(orgsKey);
+  const items = itemsData ?? [];
+  const loading = isLoading && !itemsData;
   const pager = usePagination(items, "organizations");
 
   async function refresh() {
-    const params = new URLSearchParams();
-    if (q.trim()) params.set("q", q.trim());
-    if (typeFilter) params.set("type", typeFilter);
-    // Larger page so client-side pagination has the whole set; the
-    // backend has a hard upper bound it'll honor.
-    params.set("limit", "1000");
-    setLoading(true);
-    try {
-      setItems(await api.get<OrganizationSummary[]>(`/api/v1/organizations?${params.toString()}`));
-    } finally {
-      setLoading(false);
-    }
+    await mutate();
   }
-
-  useEffect(() => {
-    refresh();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [typeFilter]);
-
-  useEffect(() => {
-    const t = setTimeout(refresh, 200);
-    return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [q]);
 
   async function openEdit(summary: OrganizationSummary) {
     const full = await api.get<Organization>(`/api/v1/organizations/${summary.id}`);

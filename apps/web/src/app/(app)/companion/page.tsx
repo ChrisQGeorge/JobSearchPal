@@ -6,6 +6,7 @@ import remarkGfm from "remark-gfm";
 import { AnalyzeEntityDetailPanel } from "@/components/AnalyzeEntityDetailPanel";
 import { PageShell } from "@/components/PageShell";
 import { api, ApiError, apiUrl } from "@/lib/api";
+import { useApi } from "@/lib/swr";
 import type {
   ConversationDetail,
   ConversationMessage,
@@ -70,33 +71,42 @@ type ClaudeHealth = {
 };
 
 export default function CompanionPage() {
-  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [activeId, setActiveId] = useState<number | null>(null);
   const [detail, setDetail] = useState<ConversationDetail | null>(null);
-  const [loadingList, setLoadingList] = useState(true);
   const [loadingDetail, setLoadingDetail] = useState(false);
-  const [claudeHealth, setClaudeHealth] = useState<ClaudeHealth | null>(null);
 
+  // Conversation list + Claude health: both cached so re-entering /companion
+  // shows the sidebar instantly while a background revalidation refreshes it.
+  const {
+    data: conversationsData,
+    isLoading: convListLoading,
+    mutate: mutateConversations,
+  } = useApi<ConversationSummary[]>("/api/v1/companion/conversations");
+  const conversations = useMemo(
+    () => conversationsData ?? [],
+    [conversationsData],
+  );
+  const loadingList = convListLoading && !conversationsData;
+
+  const { data: claudeHealth, mutate: mutateClaudeHealth } =
+    useApi<ClaudeHealth>("/health/claude");
+
+  // `refreshList` returns the latest list so callers can act on it
+  // (auto-select first conversation on initial load, etc.). Backed by
+  // SWR's mutate so it shares the cache with the hook above.
   const refreshList = useCallback(async () => {
-    try {
-      const rs = await api.get<ConversationSummary[]>(
-        "/api/v1/companion/conversations",
-      );
-      setConversations(rs);
-      return rs;
-    } finally {
-      setLoadingList(false);
-    }
-  }, []);
+    const rs = (await mutateConversations()) ?? [];
+    return rs;
+  }, [mutateConversations]);
 
+  // Auto-select the first conversation once the list arrives, if nothing
+  // is selected yet. The list itself is hydrated by SWR — no explicit
+  // refresh needed here.
   useEffect(() => {
-    refreshList().then((rs) => {
-      if (rs.length > 0 && activeId == null) setActiveId(rs[0].id);
-    });
-    api.get<ClaudeHealth>("/health/claude").then(setClaudeHealth).catch(() => {
-      /* non-fatal */
-    });
-  }, [refreshList, activeId]);
+    if (activeId == null && conversations.length > 0) {
+      setActiveId(conversations[0].id);
+    }
+  }, [conversations, activeId]);
 
   // Deep-link: when /companion is opened with ?conv=<id> (from the
   // History Editor's Analyze button, or any future caller), jump
@@ -210,22 +220,26 @@ export default function CompanionPage() {
 
   function onStreamingDone(fresh: ConversationDetail) {
     setDetail(fresh);
-    setConversations((prev) =>
-      prev
-        .map((c) =>
-          c.id === fresh.id
-            ? {
-                id: fresh.id,
-                title: fresh.title,
-                summary: fresh.summary,
-                pinned: fresh.pinned,
-                related_tracked_job_id: fresh.related_tracked_job_id,
-                created_at: fresh.created_at,
-                updated_at: fresh.updated_at,
-              }
-            : c,
-        )
-        .sort((a, b) => b.updated_at.localeCompare(a.updated_at)),
+    mutateConversations(
+      (prev) =>
+        prev
+          ? prev
+              .map((c) =>
+                c.id === fresh.id
+                  ? {
+                      id: fresh.id,
+                      title: fresh.title,
+                      summary: fresh.summary,
+                      pinned: fresh.pinned,
+                      related_tracked_job_id: fresh.related_tracked_job_id,
+                      created_at: fresh.created_at,
+                      updated_at: fresh.updated_at,
+                    }
+                  : c,
+              )
+              .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+          : prev,
+      { revalidate: false },
     );
   }
 
@@ -320,7 +334,7 @@ export default function CompanionPage() {
       {claudeHealth && !claudeHealth.authenticated ? (
         <ClaudeLoginPanel
           onAuthed={() => {
-            api.get<ClaudeHealth>("/health/claude").then(setClaudeHealth).catch(() => {});
+            mutateClaudeHealth();
           }}
         />
       ) : null}

@@ -1,8 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
-import { api, ApiError } from "@/lib/api";
+import { ApiError } from "@/lib/api";
+import { useApi } from "@/lib/swr";
 
 type ReviewItem = {
   id: number;
@@ -24,22 +24,20 @@ type ReviewQueueOut = {
 };
 
 export function ReviewPanel() {
-  const [data, setData] = useState<ReviewQueueOut | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState<string | null>(null);
-
-  useEffect(() => {
-    api
-      .get<ReviewQueueOut>("/api/v1/jobs/review-queue")
-      .then((d) => {
-        setData(d);
-        setErr(null);
-      })
-      .catch((e) =>
-        setErr(e instanceof ApiError ? `HTTP ${e.status}` : "Load failed."),
-      )
-      .finally(() => setLoading(false));
-  }, []);
+  // Cache key matches the prefetch in usePrefetchHotLists so the data
+  // is usually already in memory by the time the user lands here.
+  const {
+    data,
+    error: swrErr,
+    isLoading,
+  } = useApi<ReviewQueueOut>("/api/v1/jobs/review-queue");
+  const loading = isLoading && !data;
+  const err =
+    swrErr instanceof ApiError
+      ? `HTTP ${swrErr.status}`
+      : swrErr
+        ? "Load failed."
+        : null;
 
   const items = data?.items ?? [];
   const freshCount = items.filter((it) => it.status === "to_review").length;

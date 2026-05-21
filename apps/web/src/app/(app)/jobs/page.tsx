@@ -16,6 +16,7 @@ import { Paginator, usePagination } from "@/components/Paginator";
 import { SkillsAnalysis } from "@/components/SkillsAnalysis";
 import { StatusBadge, STATUS_STYLES } from "@/components/StatusBadge";
 import { api, ApiError } from "@/lib/api";
+import { useApi } from "@/lib/swr";
 import {
   EDUCATION_REQUIRED,
   EMPLOYMENT_TYPES,
@@ -44,8 +45,6 @@ const NEGATIVE_STATUSES: ReadonlySet<JobStatus> = new Set<JobStatus>([
 ]);
 
 export default function JobTrackerPage() {
-  const [items, setItems] = useState<TrackedJobSummary[]>([]);
-  const [loading, setLoading] = useState(true);
   const [statusFilter, setStatusFilter] = useState<JobStatus | "">("");
   const [showNegative, setShowNegative] = useState<boolean>(() => {
     if (typeof window === "undefined") return false;
@@ -74,20 +73,16 @@ export default function JobTrackerPage() {
   // User's job preferences — hydrated lazily for the salary + location
   // badges. We only need a small subset, so the failure case is fine
   // (badges just don't render).
-  const [prefs, setPrefs] = useState<{
+  type JobPrefs = {
     salary_acceptable_min?: number | null;
     salary_preferred_target?: number | null;
     salary_currency?: string | null;
     willing_to_relocate?: boolean;
     preferred_locations?: { name: string; max_distance_miles: number | null }[] | null;
     remote_policies_acceptable?: string[] | null;
-  } | null>(null);
-  useEffect(() => {
-    api
-      .get<typeof prefs>("/api/v1/preferences/job")
-      .then((p) => setPrefs(p ?? {}))
-      .catch(() => setPrefs({}));
-  }, []);
+  } | null;
+  const { data: prefsData } = useApi<JobPrefs>("/api/v1/preferences/job");
+  const prefs: JobPrefs = prefsData ?? {};
 
   function toggleShowNegative(next: boolean) {
     setShowNegative(next);
@@ -101,52 +96,61 @@ export default function JobTrackerPage() {
     }
   }
 
-  // Track each refresh with a request id so a slow earlier fetch can't
-  // overwrite a faster newer one. Symptom this fixes: click "interested"
-  // → request goes out; click another filter → second request goes out;
-  // first response lands AFTER the second and clobbers the visible
-  // rows with stale data. setItems is gated by this counter so only
-  // the latest request wins.
-  const refreshSeqRef = useRef(0);
-  const [refreshErr, setRefreshErr] = useState<string | null>(null);
+  // SWR keys off the URL, so flipping `statusFilter` swaps cache slots
+  // automatically. The library handles stale-response races for us — no
+  // sequence counter needed. The previous data stays on screen during
+  // revalidation (keepPreviousData in SwrProvider).
+  const jobsKey = (() => {
+    const params = new URLSearchParams();
+    if (statusFilter) params.set("status", statusFilter);
+    return `/api/v1/jobs?${params.toString()}`;
+  })();
+  const {
+    data: rawJobs,
+    error: jobsErr,
+    isLoading: jobsLoading,
+    mutate: mutateJobs,
+  } = useApi<TrackedJobSummary[]>(jobsKey);
+  // Hide negative-connotation statuses unless the user has explicitly
+  // filtered to one of them or flipped the "show closed" toggle on.
+  const fetchedItems = useMemo<TrackedJobSummary[]>(() => {
+    const data = rawJobs ?? [];
+    if (
+      showNegative ||
+      (statusFilter && NEGATIVE_STATUSES.has(statusFilter as JobStatus))
+    ) {
+      return data;
+    }
+    return data.filter((j) => !NEGATIVE_STATUSES.has(j.status));
+  }, [rawJobs, showNegative, statusFilter]);
+  // `items` keeps the old name for the rest of the file (filter pills,
+  // bulk actions). Local optimistic mutations go through `setItems`
+  // which the patch below wires onto SWR's mutate.
+  const items = fetchedItems;
+  const setItems: React.Dispatch<React.SetStateAction<TrackedJobSummary[]>> = (
+    next,
+  ) => {
+    mutateJobs(
+      (prev) => {
+        const base = prev ?? [];
+        return typeof next === "function"
+          ? (next as (p: TrackedJobSummary[]) => TrackedJobSummary[])(base)
+          : next;
+      },
+      { revalidate: false },
+    );
+  };
+  const loading = jobsLoading && rawJobs === undefined;
+  const refreshErr =
+    jobsErr instanceof ApiError
+      ? `Load failed (HTTP ${jobsErr.status}).`
+      : jobsErr
+        ? "Load failed."
+        : null;
 
   async function refresh() {
-    const mySeq = ++refreshSeqRef.current;
-    setLoading(true);
-    setRefreshErr(null);
-    // Clear immediately on a filter-driven refresh so stale rows from
-    // the previous filter don't visibly persist while the new fetch
-    // is in flight. "Loading..." shows in their place.
-    setItems([]);
-    try {
-      const params = new URLSearchParams();
-      if (statusFilter) params.set("status", statusFilter);
-      const data = await api.get<TrackedJobSummary[]>(
-        `/api/v1/jobs?${params.toString()}`,
-      );
-      if (mySeq !== refreshSeqRef.current) return; // stale response, drop
-      // Hide negative-connotation statuses unless the user has explicitly
-      // filtered to one of them or flipped the "show closed" toggle on.
-      const visible =
-        showNegative ||
-        (statusFilter && NEGATIVE_STATUSES.has(statusFilter as JobStatus))
-          ? data
-          : data.filter((j) => !NEGATIVE_STATUSES.has(j.status));
-      setItems(visible);
-    } catch (e) {
-      if (mySeq !== refreshSeqRef.current) return;
-      setRefreshErr(
-        e instanceof ApiError ? `Load failed (HTTP ${e.status}).` : "Load failed.",
-      );
-    } finally {
-      if (mySeq === refreshSeqRef.current) setLoading(false);
-    }
+    await mutateJobs();
   }
-
-  useEffect(() => {
-    refresh();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [statusFilter, showNegative]);
 
   // Sort key for the tracker table. "none" keeps the backend's
   // updated_at-desc ordering; "skill_match_pct" is the heatmap sort the

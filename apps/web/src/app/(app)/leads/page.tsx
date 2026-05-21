@@ -13,6 +13,7 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { PageShell } from "@/components/PageShell";
 import { api, ApiError } from "@/lib/api";
+import { useApi } from "@/lib/swr";
 
 type SourceKindExample = { label: string; value: string };
 
@@ -135,11 +136,6 @@ function formPayload(f: SourceForm) {
 }
 
 export default function LeadsPage() {
-  const [kinds, setKinds] = useState<SourceKind[]>([]);
-  const [sources, setSources] = useState<Source[]>([]);
-  const [leads, setLeads] = useState<Lead[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState<string | null>(null);
   const [editing, setEditing] = useState<SourceForm | null>(null);
   const [savingSource, setSavingSource] = useState(false);
   const [seeding, setSeeding] = useState(false);
@@ -150,58 +146,77 @@ export default function LeadsPage() {
   );
   const [sourceFilter, setSourceFilter] = useState<number | "all">("all");
   const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
   const [remoteOnly, setRemoteOnly] = useState(false);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [actionRunning, setActionRunning] = useState(false);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
+  // Action-time errors (save / poll / dismiss / etc). The SWR-derived
+  // `err` below covers load failures separately; we prefer the action
+  // err when set so the user sees the most recent issue.
+  const [actionErr, setActionErr] = useState<string | null>(null);
+
+  // 200ms debounce so the SWR cache key doesn't change on every keystroke.
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(search), 200);
+    return () => clearTimeout(t);
+  }, [search]);
+
+  const { data: kindsData } = useApi<SourceKind[]>("/api/v1/job-sources/kinds");
+  const {
+    data: sourcesData,
+    error: sourcesErr,
+    isLoading: sourcesLoading,
+    mutate: mutateSources,
+  } = useApi<Source[]>("/api/v1/job-sources");
+  const kinds = kindsData ?? [];
+  const sources = sourcesData ?? [];
+  const sourcesLoadingNow = sourcesLoading && !sourcesData;
+
+  const leadsKey = (() => {
+    const params = new URLSearchParams();
+    params.set("state", stateFilter);
+    if (sourceFilter !== "all") params.set("source_id", String(sourceFilter));
+    if (debouncedSearch.trim()) params.set("q", debouncedSearch.trim());
+    if (remoteOnly) params.set("remote_only", "true");
+    return `/api/v1/job-leads?${params.toString()}`;
+  })();
+  const {
+    data: leadsData,
+    error: leadsErr,
+    mutate: mutateLeads,
+  } = useApi<Lead[]>(leadsKey);
+  const leads = leadsData ?? [];
+
+  const loading = sourcesLoadingNow;
+  const loadErr =
+    sourcesErr instanceof ApiError
+      ? `Failed to load sources (HTTP ${sourcesErr.status}).`
+      : sourcesErr
+        ? "Failed to load sources."
+        : leadsErr instanceof ApiError
+          ? `Failed to load leads (HTTP ${leadsErr.status}).`
+          : leadsErr
+            ? "Failed to load leads."
+            : null;
+  // Action errors win — they're the most recent thing the user just did.
+  const err = actionErr ?? loadErr;
+  // Shim so existing `setErr(...)` calls in action handlers still compile.
+  const setErr = setActionErr;
 
   async function loadAll() {
-    setLoading(true);
-    setErr(null);
-    try {
-      const [k, s] = await Promise.all([
-        api.get<SourceKind[]>("/api/v1/job-sources/kinds"),
-        api.get<Source[]>("/api/v1/job-sources"),
-      ]);
-      setKinds(k);
-      setSources(s);
-    } catch (e) {
-      setErr(
-        e instanceof ApiError
-          ? `Failed to load sources (HTTP ${e.status}).`
-          : "Failed to load sources.",
-      );
-    } finally {
-      setLoading(false);
-    }
+    await mutateSources();
   }
 
   async function loadLeads() {
-    try {
-      const params = new URLSearchParams();
-      params.set("state", stateFilter);
-      if (sourceFilter !== "all") params.set("source_id", String(sourceFilter));
-      if (search.trim()) params.set("q", search.trim());
-      if (remoteOnly) params.set("remote_only", "true");
-      const rows = await api.get<Lead[]>(
-        `/api/v1/job-leads?${params.toString()}`,
-      );
-      setLeads(rows);
-    } catch (e) {
-      setErr(
-        e instanceof ApiError
-          ? `Failed to load leads (HTTP ${e.status}).`
-          : "Failed to load leads.",
-      );
-    }
+    await mutateLeads();
   }
 
+  // Filter-change refetch is implicit (SWR keys off `leadsKey`). The
+  // useEffect below is preserved only for legacy callers that explicitly
+  // call loadLeads() inline after mutations.
   useEffect(() => {
-    loadAll();
-  }, []);
-
-  useEffect(() => {
-    loadLeads();
+    // no-op — SWR handles it
     setSelected(new Set());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stateFilter, sourceFilter, remoteOnly]);

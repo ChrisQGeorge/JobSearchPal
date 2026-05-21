@@ -1,8 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
-import { api, ApiError } from "@/lib/api";
+import { ApiError } from "@/lib/api";
+import { useApi } from "@/lib/swr";
 
 type ApplyItem = {
   id: number;
@@ -21,22 +21,20 @@ type ApplyQueueOut = {
 };
 
 export function ApplyPanel() {
-  const [data, setData] = useState<ApplyQueueOut | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState<string | null>(null);
-
-  useEffect(() => {
-    api
-      .get<ApplyQueueOut>("/api/v1/jobs/apply-queue")
-      .then((d) => {
-        setData(d);
-        setErr(null);
-      })
-      .catch((e) =>
-        setErr(e instanceof ApiError ? `HTTP ${e.status}` : "Load failed."),
-      )
-      .finally(() => setLoading(false));
-  }, []);
+  // Cache key matches the prefetch in usePrefetchHotLists so the queue
+  // is hydrated before the user clicks into it.
+  const {
+    data,
+    error: swrErr,
+    isLoading,
+  } = useApi<ApplyQueueOut>("/api/v1/jobs/apply-queue");
+  const loading = isLoading && !data;
+  const err =
+    swrErr instanceof ApiError
+      ? `HTTP ${swrErr.status}`
+      : swrErr
+        ? "Load failed."
+        : null;
 
   const total = data?.total ?? 0;
   const items = data?.items ?? [];
