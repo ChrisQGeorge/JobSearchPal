@@ -31,7 +31,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.core.config import settings
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user, get_current_user_streaming
 from app.models.user import User
 from app.skills.token_store import clear_token, save_token
 
@@ -300,7 +300,7 @@ async def start_login(_: User = Depends(get_current_user)) -> dict[str, str]:
 async def stream_login(
     session_id: str,
     request: Request,
-    _: User = Depends(get_current_user),
+    _: User = Depends(get_current_user_streaming),
 ) -> StreamingResponse:
     sess = _SESSIONS.get(session_id)
     if sess is None:

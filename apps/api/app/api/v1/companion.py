@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user, get_current_user_streaming
 from app.core.security import create_access_token
 from app.models.companion import CompanionConversation, ConversationMessage
 from app.models.user import User
@@ -1226,8 +1226,7 @@ async def _run_chat_in_background(
 async def send_message_stream(
     conv_id: int,
     payload: SendMessageIn,
-    db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user_streaming),
 ) -> StreamingResponse:
     """Stream the Companion's response as Server-Sent-Events.
 
@@ -1249,33 +1248,41 @@ async def send_message_stream(
           "skills_inferred":["Bash","WebFetch"]}            — stream complete
     """
     import asyncio as _a
+    from app.core.database import SessionLocal as _SL
 
-    conv = await _get_owned_conversation(db, conv_id, user.id)
+    # Wrap all synchronous DB work in a self-managed session so the
+    # connection is returned to the pool BEFORE we hand back the
+    # StreamingResponse. With `Depends(get_db)` the connection would
+    # be held for the full chat lifetime (often minutes), which
+    # exhausts the 20-slot pool when multiple chat tabs are open.
+    async with _SL() as db:
+        conv = await _get_owned_conversation(db, conv_id, user.id)
 
-    user_msg = ConversationMessage(
-        conversation_id=conv.id,
-        role="user",
-        content_md=payload.content,
-        tool_calls=(
-            {"attached_document_ids": payload.attached_document_ids}
-            if payload.attached_document_ids
-            else None
-        ),
-    )
-    db.add(user_msg)
-    await db.commit()
-    await db.refresh(user_msg)
+        user_msg = ConversationMessage(
+            conversation_id=conv.id,
+            role="user",
+            content_md=payload.content,
+            tool_calls=(
+                {"attached_document_ids": payload.attached_document_ids}
+                if payload.attached_document_ids
+                else None
+            ),
+        )
+        db.add(user_msg)
+        await db.commit()
+        await db.refresh(user_msg)
+
+        primer = await _build_primer_for(user, db)
+        attachments = await _resolve_attached_documents(
+            db, user.id, payload.attached_document_ids
+        )
+        attachments_prefix = _format_attachments_block(attachments)
+
+        conv_id_local = conv.id
+        session_id_in = conv.claude_session_id
+        user_msg_id = user_msg.id
 
     api_token = create_access_token(subject=str(user.id), extra={"purpose": "companion"})
-    primer = await _build_primer_for(user, db)
-    attachments = await _resolve_attached_documents(
-        db, user.id, payload.attached_document_ids
-    )
-    attachments_prefix = _format_attachments_block(attachments)
-
-    conv_id_local = conv.id
-    session_id_in = conv.claude_session_id
-    user_msg_id = user_msg.id
     user_content = attachments_prefix + payload.content
     run_key = _chat_run_key(conv_id_local, user_msg_id)
 
@@ -1310,8 +1317,7 @@ async def send_message_stream(
 async def reattach_message_stream(
     conv_id: int,
     user_msg_id: int,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user_streaming),
 ) -> StreamingResponse:
     """Re-subscribe to an in-flight chat run. Used by the front-end when
     the user navigates back to a chat whose last message is `user` and
@@ -1322,7 +1328,12 @@ async def reattach_message_stream(
     started. Either way the client should fall back to plain conversation
     polling and read the assistant message from the DB.
     """
-    await _get_owned_conversation(db, conv_id, user.id)
+    from app.core.database import SessionLocal as _SL
+
+    # Self-managed session so we don't hold a pool connection for the
+    # whole SSE lifetime — same reasoning as send_message_stream above.
+    async with _SL() as db:
+        await _get_owned_conversation(db, conv_id, user.id)
     run_key = _chat_run_key(conv_id, user_msg_id)
     if run_key not in _CHAT_RUNS:
         raise HTTPException(status_code=404, detail="No live chat for that message")

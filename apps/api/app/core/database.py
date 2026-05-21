@@ -23,8 +23,15 @@ engine = create_async_engine(
     # it and rely on pool_recycle to drop stale connections instead.
     pool_pre_ping=False,
     pool_recycle=3600,  # MySQL's default wait_timeout is 8h — recycle hourly
-    pool_size=10,
-    max_overflow=10,
+    # Bumped from 10+10 → 20+20. Streaming endpoints used to hold a pool
+    # connection for the whole stream lifetime via Depends(get_db); we've
+    # since moved them onto a self-managed session pattern, but the
+    # larger margin gives a backstop for any new endpoint that
+    # accidentally repeats the old mistake. With a single-user app this
+    # is still cheap.
+    pool_size=20,
+    max_overflow=20,
+    pool_timeout=10,  # was 30 — fail faster so the symptom is visible
     echo=False,
 )
 

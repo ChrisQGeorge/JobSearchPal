@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.database import get_db
+from app.core.database import SessionLocal, get_db
 from app.core.security import decode_access_token
 from app.models.user import User
 
@@ -54,6 +54,54 @@ async def get_current_user(
 
 
 CurrentUser = Depends(get_current_user)
+
+
+async def get_current_user_streaming(request: Request) -> User:
+    """Auth dependency for SSE / streaming endpoints.
+
+    Identical contract to `get_current_user`, but owns its own DB
+    session via `async with` so the connection is returned to the pool
+    BEFORE the StreamingResponse starts emitting. Without this, every
+    open SSE tab (queue activity, companion chat, etc.) holds a pool
+    connection for the full stream lifetime — easily exhausting the
+    20-slot pool when the user has a few tabs open.
+    """
+    token = request.cookies.get(settings.COOKIE_NAME)
+    if not token:
+        auth = request.headers.get("authorization") or request.headers.get("Authorization")
+        if auth and auth.lower().startswith("bearer "):
+            token = auth.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+        )
+    payload = decode_access_token(token)
+    if not payload or "sub" not in payload:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid session",
+        )
+    try:
+        user_id = int(payload["sub"])
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid session",
+        )
+    # Short-lived session — closes when this `async with` exits, before
+    # the StreamingResponse generator ever runs.
+    async with SessionLocal() as db:
+        result = await db.execute(
+            select(User).where(User.id == user_id, User.deleted_at.is_(None))
+        )
+        user = result.scalar_one_or_none()
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unknown user",
+        )
+    return user
 
 
 async def _resolve_user_from_request(

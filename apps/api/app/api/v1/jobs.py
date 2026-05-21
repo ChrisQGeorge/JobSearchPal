@@ -28,7 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 log = logging.getLogger(__name__)
 
 from app.core.database import get_db
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user, get_current_user_streaming
 from app.models.history import Skill
 from app.models.jobs import (
     ApplicationEvent,
@@ -2466,7 +2466,7 @@ async def fetch_from_url(
 
 @router.get("/queue/stream")
 async def stream_queue_activity(
-    _: User = Depends(get_current_user),
+    _: User = Depends(get_current_user_streaming),
 ):
     """Server-Sent-Events feed of live queue-worker activity.
 
@@ -2740,7 +2740,7 @@ async def cancel_activity_task(
 
 @router.get("/activity/stream")
 async def stream_activity_tasks(
-    _: User = Depends(get_current_user),
+    _: User = Depends(get_current_user_streaming),
 ):
     """SSE stream of task-registry row updates. Each event is one row's
     current state (the frontend replaces by id). A separate, lighter-weight
