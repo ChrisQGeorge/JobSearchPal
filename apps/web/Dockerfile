@@ -1,7 +1,14 @@
 FROM node:20-alpine AS deps
 WORKDIR /app
-COPY package.json ./
-RUN npm install --no-audit --no-fund
+# Copy the lock file when present so `npm ci` produces a deterministic
+# install across rebuilds. Falls back to `npm install` for early dev
+# builds before a lock has been generated.
+COPY package.json package-lock.json* ./
+RUN if [ -f package-lock.json ]; then \
+      npm ci --no-audit --no-fund; \
+    else \
+      npm install --no-audit --no-fund; \
+    fi
 
 FROM node:20-alpine AS builder
 WORKDIR /app
