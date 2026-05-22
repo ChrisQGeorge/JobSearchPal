@@ -196,13 +196,19 @@ async def job_status_counts(
     return {"counts": counts, "total": sum(counts.values())}
 
 
-@router.get("", response_model=list[TrackedJobSummary])
-async def list_jobs(
-    status: Optional[str] = Query(default=None, description="Filter to one status"),
-    q: Optional[str] = Query(default=None, description="Prefix search on title"),
-    db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
+async def _compute_job_summaries(
+    db: AsyncSession,
+    user: User,
+    status: Optional[str],
+    q: Optional[str],
 ) -> list[TrackedJobSummary]:
+    """Build the tracker list rows for one user.
+
+    Extracted from the route handler so the new consolidated
+    /tracker-view endpoint can reuse the exact same hydration logic
+    inside a single session (jobs + counts + prefs in one round-trip)
+    without us forking and drifting two implementations.
+    """
     stmt = select(TrackedJob).where(
         TrackedJob.user_id == user.id, TrackedJob.deleted_at.is_(None)
     )
@@ -394,6 +400,87 @@ async def list_jobs(
             )
         )
     return out
+
+
+@router.get("", response_model=list[TrackedJobSummary])
+async def list_jobs(
+    status: Optional[str] = Query(default=None, description="Filter to one status"),
+    q: Optional[str] = Query(default=None, description="Prefix search on title"),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[TrackedJobSummary]:
+    return await _compute_job_summaries(db, user, status, q)
+
+
+@router.get("/tracker-view")
+async def tracker_view(
+    status: Optional[str] = Query(default=None, description="Filter to one status"),
+    q: Optional[str] = Query(default=None, description="Prefix search on title"),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Consolidated payload for the /jobs tracker page.
+
+    Replaces three parallel HTTP calls (`/jobs`, `/jobs/counts`,
+    `/preferences/job`) with one round-trip and one DB session. The
+    tracker page used to fan out 4–5 simultaneous requests on mount,
+    each grabbing its own pool connection; under retries that produced
+    the ECONNRESET storm. Now: 1 HTTP call → 1 session → returns
+    everything the page needs to render.
+
+    Shape:
+      {
+        jobs:   list[TrackedJobSummary],
+        counts: { counts: {status: int}, total: int },
+        prefs:  JobPreferences | null
+      }
+    """
+    from app.models.preferences import JobPreferences
+
+    jobs = await _compute_job_summaries(db, user, status, q)
+
+    count_rows = (
+        await db.execute(
+            select(TrackedJob.status, func.count(TrackedJob.id))
+            .where(
+                TrackedJob.user_id == user.id,
+                TrackedJob.deleted_at.is_(None),
+            )
+            .group_by(TrackedJob.status)
+        )
+    ).all()
+    counts_by_status: dict[str, int] = {s: int(n) for s, n in count_rows}
+
+    prefs_row = (
+        await db.execute(
+            select(JobPreferences).where(
+                JobPreferences.user_id == user.id,
+                JobPreferences.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+
+    prefs_dict = None
+    if prefs_row is not None:
+        # Serialize only the keys the tracker badges need so we don't
+        # leak unrelated preference fields on every page load.
+        prefs_dict = {
+            "salary_acceptable_min": prefs_row.salary_acceptable_min,
+            "salary_preferred_target": prefs_row.salary_preferred_target,
+            "salary_currency": prefs_row.salary_currency,
+            "willing_to_relocate": prefs_row.willing_to_relocate,
+            "preferred_locations": prefs_row.preferred_locations,
+            "remote_policies_acceptable": prefs_row.remote_policies_acceptable,
+        }
+
+    return {
+        "jobs": [j.model_dump() for j in jobs],
+        "counts": {
+            "counts": counts_by_status,
+            "total": sum(counts_by_status.values()),
+        },
+        "prefs": prefs_dict,
+    }
 
 
 # --- Tracked-job archiving --------------------------------------------------

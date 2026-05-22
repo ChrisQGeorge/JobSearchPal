@@ -71,9 +71,9 @@ export default function JobTrackerPage() {
   const [bulkRunning, setBulkRunning] = useState(false);
   const [bulkMsg, setBulkMsg] = useState<string | null>(null);
   const [bulkStatusTarget, setBulkStatusTarget] = useState<JobStatus | "">("");
-  // User's job preferences — hydrated lazily for the salary + location
-  // badges. We only need a small subset, so the failure case is fine
-  // (badges just don't render).
+  // User's job preferences — hydrated by the consolidated tracker-view
+  // call below. Only a small subset is read here for the salary + location
+  // badges; the rest of the preferences page owns the full shape.
   const [prefs, setPrefs] = useState<{
     salary_acceptable_min?: number | null;
     salary_preferred_target?: number | null;
@@ -82,12 +82,6 @@ export default function JobTrackerPage() {
     preferred_locations?: { name: string; max_distance_miles: number | null }[] | null;
     remote_policies_acceptable?: string[] | null;
   } | null>(null);
-  useEffect(() => {
-    api
-      .get<typeof prefs>("/api/v1/preferences/job")
-      .then((p) => setPrefs(p ?? {}))
-      .catch(() => setPrefs({}));
-  }, []);
 
   function toggleShowNegative(next: boolean) {
     setShowNegative(next);
@@ -119,10 +113,19 @@ export default function JobTrackerPage() {
     // is in flight. "Loading..." shows in their place.
     setItems([]);
     try {
+      // ONE round-trip — backend builds jobs + counts + prefs in a single
+      // session. Previous version fanned out three parallel calls, each
+      // grabbing its own pool connection. The fan-out compounded retries
+      // and produced ECONNRESET cascades on this page specifically.
       const params = new URLSearchParams();
       if (statusFilter) params.set("status", statusFilter);
-      const data = await api.get<TrackedJobSummary[]>(
-        `/api/v1/jobs?${params.toString()}`,
+      type TrackerView = {
+        jobs: TrackedJobSummary[];
+        counts: { counts: Record<string, number>; total: number };
+        prefs: typeof prefs;
+      };
+      const data = await api.get<TrackerView>(
+        `/api/v1/jobs/tracker-view?${params.toString()}`,
       );
       if (mySeq !== refreshSeqRef.current) return; // stale response, drop
       // Hide negative-connotation statuses unless the user has explicitly
@@ -130,9 +133,11 @@ export default function JobTrackerPage() {
       const visible =
         showNegative ||
         (statusFilter && NEGATIVE_STATUSES.has(statusFilter as JobStatus))
-          ? data
-          : data.filter((j) => !NEGATIVE_STATUSES.has(j.status));
+          ? data.jobs
+          : data.jobs.filter((j) => !NEGATIVE_STATUSES.has(j.status));
       setItems(visible);
+      setCounts(data.counts.counts as Partial<Record<JobStatus, number>>);
+      setPrefs(data.prefs ?? {});
     } catch (e) {
       if (mySeq !== refreshSeqRef.current) return;
       setRefreshErr(
@@ -201,19 +206,10 @@ export default function JobTrackerPage() {
   const pagedItems = pager.visibleItems;
 
   // Status counts across the full set (unfiltered). Quick-nav to each bucket.
-  // Uses a dedicated /jobs/counts endpoint that returns a single GROUP BY
-  // result, much cheaper than re-fetching the entire job list and counting
-  // in the browser. Re-run whenever the visible items list size changes
-  // (i.e., the user filtered to a different status or added/removed a job).
+  // Hydrated by the consolidated `/tracker-view` call in refresh() above —
+  // no separate request. Stays in state here so the filter pills can
+  // optimistically update when the user mutates a job inline.
   const [counts, setCounts] = useState<Partial<Record<JobStatus, number>>>({});
-  useEffect(() => {
-    api
-      .get<{ counts: Record<string, number>; total: number }>(
-        "/api/v1/jobs/counts",
-      )
-      .then((res) => setCounts(res.counts as Partial<Record<JobStatus, number>>))
-      .catch(() => {});
-  }, [items.length]);
 
   const fileInput = useRef<HTMLInputElement>(null);
   const queueFileInput = useRef<HTMLInputElement>(null);
