@@ -33,16 +33,30 @@ export function FetchQueuePanel({ onJobCreated }: Props) {
   const [adding, setAdding] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const seenDoneIds = useRef<Set<number>>(new Set());
+  // First poll just snapshots which items are already "done" so we
+  // don't fire onJobCreated for every historical row. Without this,
+  // mounting the panel against a queue with 20 done items would fire
+  // 20 parallel refreshes on the parent — which is exactly what was
+  // pushing the tracker page into pool-timeout territory.
+  const isFirstPollRef = useRef(true);
 
   const refresh = useCallback(async () => {
     try {
       const data = await api.get<JobFetchQueueItem[]>("/api/v1/jobs/queue");
       setItems(data);
-      // Notify parent when new "done" items appear since last poll.
-      for (const it of data) {
-        if (it.state === "done" && !seenDoneIds.current.has(it.id)) {
-          seenDoneIds.current.add(it.id);
-          onJobCreated?.();
+      if (isFirstPollRef.current) {
+        for (const it of data) {
+          if (it.state === "done") seenDoneIds.current.add(it.id);
+        }
+        isFirstPollRef.current = false;
+      } else {
+        // Subsequent polls: only fire on actual queued/processing → done
+        // transitions we hadn't seen yet.
+        for (const it of data) {
+          if (it.state === "done" && !seenDoneIds.current.has(it.id)) {
+            seenDoneIds.current.add(it.id);
+            onJobCreated?.();
+          }
         }
       }
     } catch {
