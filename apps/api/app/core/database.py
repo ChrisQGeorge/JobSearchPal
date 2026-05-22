@@ -1,24 +1,21 @@
 """Async SQLAlchemy engine and session factory.
 
-Pool sizing note: this used to use the default QueuePool with size 10
-(then 20, then 50). It kept exhausting. The root cause was structural,
-not numeric — every FastAPI endpoint with `Depends(get_db)` pins a
-pool connection for the ENTIRE request duration, including the
-30–180 s window when the handler is sitting inside an `await
-run_claude_prompt(...)` call. With ~165 such endpoints, no fixed pool
-size survives bursty traffic. Auditing every endpoint to release its
-session before Claude calls is doable but tedious and easy to regress.
+Pooling history (because it took several iterations):
+  - Original 10+10 QueuePool exhausted because endpoints calling Claude
+    held their dep-injected session for the full 30–180 s Claude call.
+  - Bumping to 50+50 just delayed the exhaustion under burst load.
+  - NullPool removed the QueuePool errors but created a new problem:
+    every request opened a fresh MySQL connection, every handler ran a
+    little slower, and Node's HTTP keepalive agent caught stale sockets
+    after uvicorn's 5 s idle close, producing ECONNRESETs on the tracker
+    page (which fans out 4–5 parallel requests at once).
 
-So we use `NullPool` instead. Each session opens a fresh MySQL
-connection on first use and closes it on session exit. No pool, no
-ceiling — the only cap is MySQL's `max_connections` (bumped to 500
-in docker-compose.yml). The cost is ~5–10 ms per request for the
-TCP + auth handshake against localhost MySQL, which is unnoticeable
-in this single-user, container-local setup. If we ever need to
-optimize this back, the right move is to switch the Claude-calling
-endpoints to a self-managed-session pattern (a few have already been
-converted; see perform_fetch, queue_worker._handle_fetch, the SSE
-endpoints) rather than re-introduce a fixed-size pool.
+What's here now: a modest QueuePool. The real connection-leak culprits
+(perform_fetch + queue_worker._handle_fetch + the SSE endpoints) were
+already converted to self-managed sessions in earlier commits, so the
+pool actually gets reused properly now. 15+15=30 is plenty for a
+single-user app — and we're also adding a consolidated /jobs/tracker-view
+endpoint so the tracker page stops fanning out parallel requests.
 """
 from __future__ import annotations
 
@@ -29,13 +26,17 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
 
 engine = create_async_engine(
     settings.async_database_url,
-    poolclass=NullPool,
+    # pool_pre_ping=True is broken on aiomysql — see history above.
+    pool_pre_ping=False,
+    pool_recycle=3600,  # MySQL wait_timeout default is 8 h; recycle hourly.
+    pool_size=15,
+    max_overflow=15,
+    pool_timeout=10,
     echo=False,
 )
 

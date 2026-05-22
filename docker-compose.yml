@@ -8,15 +8,14 @@ services:
       MYSQL_USER: ${MYSQL_USER}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD}
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-    # max_connections bumped from MySQL's default 151. The API uses
-    # NullPool — one fresh MySQL connection per session — so the upper
-    # bound is now MySQL's max_connections rather than a fixed pool.
-    # 500 leaves room for bursty traffic (SWR fan-out, worker, poller,
-    # admin) without any chance of hitting the cap in a single-user app.
+    # max_connections at 200 leaves room for the api's 30-slot pool plus the
+    # worker, poller, healthcheck pings, and the occasional admin shell
+    # without ever hitting the cap. MySQL's default 151 is a hair tight
+    # for a long-running interactive session.
     command: >-
       --character-set-server=utf8mb4
       --collation-server=utf8mb4_unicode_ci
-      --max-connections=500
+      --max-connections=200
     volumes:
       - db_data:/var/lib/mysql
     healthcheck:

@@ -21,4 +21,13 @@ if [[ -d /app/skills ]]; then
 fi
 
 echo "[start] Launching API..."
-exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers
+# --timeout-keep-alive=60: the Next.js proxy holds keepalive sockets to api in
+# Node's HTTP agent and reuses them. uvicorn's default 5 s close means the
+# agent often grabs a socket the server already discarded → ECONNRESET on the
+# next reuse. 60 s matches Node's typical default and stops the cascading
+# socket-hang-up errors on the tracker page.
+exec uvicorn app.main:app \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --proxy-headers \
+  --timeout-keep-alive 60
