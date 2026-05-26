@@ -143,8 +143,9 @@ export default function JobDetailPage({
           />
           <MoveToApplyButton
             status={job.status}
+            sourceUrl={job.source_url ?? null}
             disabled={saving}
-            onApply={() => patch({ status: "interested" })}
+            onApply={() => patch({ status: "in_progress" })}
           />
           <ApplyAction
             jobId={job.id}
@@ -573,39 +574,44 @@ function ReviewAction({
  * when the user came via `?from=apply` but this row is no longer
  * `interested` (they already acted), so they don't lose their place.
  */
-// Header "Apply" button. Moves a job from pre-application states into
-// `interested` — the schema's name for "I'm working on this application
-// right now." Once a job hits `interested`, the existing ApplyAction
-// takes over with the Applied / Not interested / Skip buttons.
+// Header "Apply" button. Renders only for `interested` rows — the
+// queued-to-apply state. Clicking pops open the posting in a new tab so
+// the user can fill out the actual application, and moves the row to
+// `in_progress` so the detail page swaps to the Applied / Not interested
+// triage buttons (those live in ApplyAction and key off `in_progress`
+// after this commit).
 function MoveToApplyButton({
   status,
+  sourceUrl,
   disabled,
   onApply,
 }: {
   status: JobStatus;
+  sourceUrl: string | null | undefined;
   disabled: boolean;
   onApply: () => void;
 }) {
-  // Show on early-pipeline and revivable states. Hide once the job is
-  // already in the apply lane (ApplyAction handles those) or past it
-  // (`responded`, `interviewing`, etc — moving back is a manual choice
-  // via the status select, not a one-click action).
-  const PRE_APPLY: ReadonlySet<JobStatus> = new Set<JobStatus>([
-    "to_review",
-    "reviewed",
-    "watching",
-    "not_interested",
-  ]);
-  if (!PRE_APPLY.has(status)) return null;
+  if (status !== "interested") return null;
+  function go() {
+    if (sourceUrl) {
+      // noopener for safety; rel="noreferrer" isn't reachable from
+      // window.open, but window.opener gets nulled on `noopener`.
+      window.open(sourceUrl, "_blank", "noopener");
+    }
+    onApply();
+  }
+  const title = sourceUrl
+    ? "Open the posting in a new tab and move this row to in-progress."
+    : "Move this row to in-progress (no source URL on file — open the posting manually).";
   return (
     <button
       type="button"
       className="jsp-btn-primary text-xs"
-      onClick={onApply}
+      onClick={go}
       disabled={disabled}
-      title="Move this job into the apply queue (status → interested)."
+      title={title}
     >
-      Apply
+      Apply →
     </button>
   );
 }
@@ -627,8 +633,11 @@ function ApplyAction({
   const [busy, setBusy] = useState<string | null>(null);
 
   // Only run when relevant — avoids hammering the endpoint on every job
-  // detail page even though the component is always mounted.
-  const active = inApplyFlow || status === "interested";
+  // detail page even though the component is always mounted. Active for
+  // `in_progress` (the new "I clicked Apply, the posting is open in a
+  // tab, am I done?" state) and for inApplyFlow (so the user can still
+  // navigate through `interested` rows from the apply queue).
+  const active = inApplyFlow || status === "in_progress";
 
   useEffect(() => {
     if (!active) return;
@@ -647,7 +656,7 @@ function ApplyAction({
   }, [jobId, active]);
 
   const remaining =
-    status === "interested"
+    status === "interested" || status === "in_progress"
       ? Math.max(0, ids.filter((i) => i !== jobId).length)
       : ids.length;
 
@@ -698,13 +707,17 @@ function ApplyAction({
     function onKey(e: KeyboardEvent) {
       if (isTextish(e.target)) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
-      if (e.key === "1" && status === "interested" && busy === null) {
+      // Triage keyboard nav only fires once the user has clicked Apply
+      // (status moved to in_progress). On `interested` rows from the
+      // Apply Queue, the user clicks Apply first.
+      const triageable = status === "in_progress";
+      if (e.key === "1" && triageable && busy === null) {
         e.preventDefault();
         void triage("applied", "applied", false);
-      } else if (e.key === "2" && status === "interested" && busy === null) {
+      } else if (e.key === "2" && triageable && busy === null) {
         e.preventDefault();
         void triage("not_interested", "not_interested", false);
-      } else if (e.key === "3" && status === "interested" && busy === null) {
+      } else if (e.key === "3" && triageable && busy === null) {
         e.preventDefault();
         void triage(status, "skip", true);
       } else if (e.key === "j") {
@@ -731,7 +744,7 @@ function ApplyAction({
       </span>
     ) : null;
 
-  if (status === "interested") {
+  if (status === "in_progress") {
     return (
       <div className="flex items-center gap-1.5">
         <button
@@ -739,7 +752,7 @@ function ApplyAction({
           className="jsp-btn-primary text-xs"
           onClick={() => triage("applied", "applied", false)}
           disabled={busy !== null}
-          title="Mark as applied and jump to the next interested row (key: 1)"
+          title="Mark as applied and jump to the next row (key: 1)"
         >
           {busy === "applied" ? "…" : "Applied"}
           {inApplyFlow ? <kbd className="ml-1 opacity-60 text-[10px]">1</kbd> : null}
@@ -759,7 +772,7 @@ function ApplyAction({
           className="jsp-btn-ghost text-xs"
           onClick={() => triage(status, "skip", true)}
           disabled={busy !== null}
-          title="Leave this one as interested for now and jump to the next (key: 3)"
+          title="Leave this one alone and jump to the next (key: 3)"
         >
           {busy === "skip" ? "…" : "Skip"}
           {inApplyFlow ? <kbd className="ml-1 opacity-60 text-[10px]">3</kbd> : null}
@@ -774,7 +787,7 @@ function ApplyAction({
     );
   }
 
-  // Already triaged out of `interested` — user is still in apply flow
+  // Already triaged out of the apply lane — user is still in apply flow
   // but this row has moved on. Offer a nav button only.
   if (!inApplyFlow || remaining === 0) return null;
   return (

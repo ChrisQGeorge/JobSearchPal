@@ -7,6 +7,7 @@ const STATUS_STYLES: Record<JobStatus, string> = {
   reviewed: "bg-slate-500/20 text-slate-300 border-slate-500/40",
   watching: "bg-corp-surface2 text-corp-muted border-corp-border",
   interested: "bg-sky-500/20 text-sky-300 border-sky-500/40",
+  in_progress: "bg-amber-500/25 text-amber-300 border-amber-500/50 animate-pulse",
   not_interested: "bg-zinc-500/20 text-zinc-400 border-zinc-500/40 line-through decoration-zinc-500/60",
   applied: "bg-corp-accent/25 text-corp-accent border-corp-accent/40",
   responded: "bg-sky-500/25 text-sky-200 border-sky-500/50",
@@ -25,6 +26,7 @@ const STATUS_STYLES: Record<JobStatus, string> = {
 const STATUS_LABELS: Partial<Record<JobStatus, string>> = {
   not_interested: "not interested",
   to_review: "to review",
+  in_progress: "in progress",
 };
 
 export function StatusBadge({ status }: { status: JobStatus }) {

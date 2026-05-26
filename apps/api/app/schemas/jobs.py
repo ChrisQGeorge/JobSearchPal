@@ -17,6 +17,11 @@ JOB_STATUSES = {
     "reviewed",
     "watching",
     "interested",
+    # Active applying state — the user clicked "Apply" on the detail page,
+    # which opens the posting in a new tab and parks the row here until
+    # they confirm Applied or change their mind (Not interested). Distinct
+    # from `interested` (queued to apply) and `applied` (submitted).
+    "in_progress",
     "not_interested",
     "applied",
     "responded",
