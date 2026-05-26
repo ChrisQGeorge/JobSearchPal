@@ -933,10 +933,71 @@ async def apply_queue(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> ReviewQueueOut:
-    """Jobs with status=interested — triaged as worth pursuing, not yet
-    applied to. Drives the `/jobs/apply` page; the detail page's apply-flow
-    buttons move rows from here to status=applied."""
-    return await _queue_by_status(db, user.id, "interested")
+    """Drives the `/jobs/apply` page and the apply-flow "Next →" nav.
+
+    Returns two cohorts in one list:
+      * `status=in_progress` — applications the user started (clicked
+        Apply) but didn't confirm Applied/Not interested on yet. These
+        sort FIRST because they're loose-ended work: an open tab,
+        possibly half-filled forms. Finishing them is higher priority
+        than starting new ones.
+      * `status=interested` — triaged-as-worth-pursuing but not started.
+
+    Items carry their `status` so the frontend can render the two
+    cohorts differently if it wants to. Within each cohort, FIFO by
+    date_discovered then id.
+    """
+    from sqlalchemy import case
+
+    status_priority = case(
+        (TrackedJob.status == "in_progress", 0),
+        (TrackedJob.status == "interested", 1),
+        else_=2,
+    )
+
+    stmt = (
+        select(TrackedJob)
+        .where(
+            TrackedJob.user_id == user.id,
+            TrackedJob.deleted_at.is_(None),
+            TrackedJob.status.in_(("in_progress", "interested")),
+        )
+        .order_by(
+            status_priority,
+            TrackedJob.date_discovered.is_(None),
+            TrackedJob.date_discovered.asc(),
+            TrackedJob.id.asc(),
+        )
+    )
+    rows = list((await db.execute(stmt)).scalars().all())
+    org_ids = {r.organization_id for r in rows if r.organization_id}
+    org_names = await _org_names_for(db, org_ids)
+    items = [
+        {
+            "id": r.id,
+            "title": r.title,
+            "organization_id": r.organization_id,
+            "organization_name": (
+                org_names.get(r.organization_id) if r.organization_id else None
+            ),
+            "location": r.location,
+            "date_discovered": (
+                r.date_discovered.isoformat() if r.date_discovered else None
+            ),
+            "fit_score": (
+                (r.fit_summary or {}).get("score")
+                if isinstance(r.fit_summary, dict)
+                else None
+            ),
+            "status": r.status,
+        }
+        for r in rows
+    ]
+    return ReviewQueueOut(
+        total=len(rows),
+        ids=[r.id for r in rows],
+        items=items,
+    )
 
 
 # --- ApplicationEvents (activity feed) --------------------------------------
