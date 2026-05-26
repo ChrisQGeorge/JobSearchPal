@@ -141,6 +141,11 @@ export default function JobDetailPage({
             status={job.status}
             onStatusChanged={(s) => patch({ status: s })}
           />
+          <MoveToApplyButton
+            status={job.status}
+            disabled={saving}
+            onApply={() => patch({ status: "interested" })}
+          />
           <ApplyAction
             jobId={job.id}
             status={job.status}
@@ -568,6 +573,44 @@ function ReviewAction({
  * when the user came via `?from=apply` but this row is no longer
  * `interested` (they already acted), so they don't lose their place.
  */
+// Header "Apply" button. Moves a job from pre-application states into
+// `interested` — the schema's name for "I'm working on this application
+// right now." Once a job hits `interested`, the existing ApplyAction
+// takes over with the Applied / Not interested / Skip buttons.
+function MoveToApplyButton({
+  status,
+  disabled,
+  onApply,
+}: {
+  status: JobStatus;
+  disabled: boolean;
+  onApply: () => void;
+}) {
+  // Show on early-pipeline and revivable states. Hide once the job is
+  // already in the apply lane (ApplyAction handles those) or past it
+  // (`responded`, `interviewing`, etc — moving back is a manual choice
+  // via the status select, not a one-click action).
+  const PRE_APPLY: ReadonlySet<JobStatus> = new Set<JobStatus>([
+    "to_review",
+    "reviewed",
+    "watching",
+    "not_interested",
+  ]);
+  if (!PRE_APPLY.has(status)) return null;
+  return (
+    <button
+      type="button"
+      className="jsp-btn-primary text-xs"
+      onClick={onApply}
+      disabled={disabled}
+      title="Move this job into the apply queue (status → interested)."
+    >
+      Apply
+    </button>
+  );
+}
+
+
 function ApplyAction({
   jobId,
   status,
