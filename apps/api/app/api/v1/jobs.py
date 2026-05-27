@@ -22,7 +22,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
@@ -1385,6 +1385,7 @@ async def interview_prep(
             label=f"Interview prep: round {rnd.round_number}",
             allowed_tools=["Bash"],
             timeout_seconds=180,
+            action="interview_prep",
             extra_env={
                 "JSP_API_BASE_URL": "http://localhost:8000",
                 "JSP_API_TOKEN": api_token,
@@ -1449,6 +1450,7 @@ async def interview_retrospective(
             label=f"Retro: round {rnd.round_number}",
             allowed_tools=[],
             timeout_seconds=120,
+            action="interview_retro",
         )
     except ClaudeCodeError as exc:
         log.warning("interview-retro failed for round %s: %s", round_id, exc)
@@ -2309,12 +2311,19 @@ async def _direct_fetch_page(url: str) -> tuple[str, Optional[str]]:
     """Single httpx GET → cleaned markdown. Returns
     `(text, error_reason)`. On success error_reason is None and text is
     the page body trimmed to _PAGE_TEXT_BUDGET. On failure text is "" and
-    error_reason describes why so the fallback prompt can quote it."""
+    error_reason describes why so the fallback prompt can quote it.
+
+    For URLs hosted on known job boards / ATSes (greenhouse, lever, ashby,
+    workday, indeed, etc.) we slice the HTML down to the posting-relevant
+    region BEFORE markdownifying so the parse prompt isn't paying tokens
+    for nav, footer, "similar jobs" widgets, etc. See fetch_templates.py.
+    """
     from app.sources._common import (
         UpstreamGateError,
         html_to_md,
         http_get_text,
     )
+    from app.skills.fetch_templates import extract_relevant_html
     import httpx
 
     try:
@@ -2329,6 +2338,7 @@ async def _direct_fetch_page(url: str) -> tuple[str, Optional[str]]:
     except Exception as exc:  # pragma: no cover  (defensive)
         return "", f"{type(exc).__name__}: {exc}"
 
+    body = extract_relevant_html(url, body)
     md = html_to_md(body)
     if not md or len(md.strip()) < _PAGE_TEXT_MIN:
         return "", (
@@ -2429,6 +2439,7 @@ async def perform_fetch(
             prompt=prompt,
             allowed_tools=allowed_tools,
             timeout_seconds=180,
+            action="fetch",
         ):
             ev_type = raw.get("type")
             if ev_type == "system":
@@ -2488,6 +2499,7 @@ async def perform_fetch(
             output_format="json",
             allowed_tools=allowed_tools,
             timeout_seconds=180,
+            action="fetch",
         )
         final_text = result.result
 
@@ -2934,6 +2946,49 @@ async def put_worker_settings(
     return {"max_parallel": saved, "min": lo, "max": hi}
 
 
+class _ModelSettingsIn(BaseModel):
+    # action_key → model_id (or empty string to clear an override).
+    models: dict[str, str]
+
+
+@router.get("/model-settings")
+async def get_model_settings(_: User = Depends(get_current_user)) -> dict:
+    """List the per-action Claude model picker — current choices, plus
+    the catalogue of supported models and action keys the UI renders.
+
+    All Claude invocations go through the Claude Code CLI (`claude -p
+    --model <id>`). No Anthropic API SDK is involved.
+    """
+    from app.skills import model_settings as _ms
+
+    return {
+        "models": _ms.get_all(),
+        "actions": [{"key": k, "label": label} for k, label in _ms.ACTIONS],
+        "model_choices": [
+            {"id": mid, "label": label} for mid, label in _ms.SUPPORTED_MODELS
+        ],
+    }
+
+
+@router.put("/model-settings")
+async def put_model_settings(
+    payload: _ModelSettingsIn,
+    _: User = Depends(get_current_user),
+) -> dict:
+    """Replace the per-action model map. Unknown action keys and unknown
+    model ids are silently dropped before persisting."""
+    from app.skills import model_settings as _ms
+
+    saved = _ms.set_all(payload.models or {})
+    return {
+        "models": saved,
+        "actions": [{"key": k, "label": label} for k, label in _ms.ACTIONS],
+        "model_choices": [
+            {"id": mid, "label": label} for mid, label in _ms.SUPPORTED_MODELS
+        ],
+    }
+
+
 @router.get("/activity/stream")
 async def stream_activity_tasks(
     _: User = Depends(get_current_user_streaming),
@@ -3267,6 +3322,33 @@ async def retry_queue_item(
     item.state = "queued"
     item.error_message = None
     item.attempts = 0
+    item.resume_after = None
     await db.commit()
     await db.refresh(item)
     return item
+
+
+@router.post("/queue/retry-failed")
+async def retry_all_failed_queue_items(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Bulk re-queue every failed (`state=error`) row for the current user.
+    Resets attempts + clears any error/resume_after so the worker picks
+    them back up on the next claim. Returns how many were touched."""
+    stmt = (
+        update(JobFetchQueue)
+        .where(
+            JobFetchQueue.user_id == user.id,
+            JobFetchQueue.state == "error",
+        )
+        .values(
+            state="queued",
+            error_message=None,
+            attempts=0,
+            resume_after=None,
+        )
+    )
+    result = await db.execute(stmt)
+    await db.commit()
+    return {"retried": int(result.rowcount or 0)}

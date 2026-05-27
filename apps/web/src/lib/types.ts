@@ -121,6 +121,7 @@ export type JobStatus =
   | "reviewed"
   | "watching"
   | "interested"
+  | "contacted_by_recruiter"
   | "in_progress"
   | "not_interested"
   | "applied"
@@ -140,6 +141,7 @@ export const JOB_STATUSES: JobStatus[] = [
   "reviewed",
   "watching",
   "interested",
+  "contacted_by_recruiter",
   "in_progress",
   "not_interested",
   "applied",

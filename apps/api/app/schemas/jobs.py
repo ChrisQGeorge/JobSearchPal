@@ -17,6 +17,11 @@ JOB_STATUSES = {
     "reviewed",
     "watching",
     "interested",
+    # Inbound from a recruiter — the user didn't go looking, the
+    # recruiter found them. Same lane as `interested` (active pipeline,
+    # not yet applied) but tracked separately so response-rate and
+    # source-attribution metrics stay honest.
+    "contacted_by_recruiter",
     # Active applying state — the user clicked "Apply" on the detail page,
     # which opens the posting in a new tab and parks the row here until
     # they confirm Applied or change their mind (Not interested). Distinct

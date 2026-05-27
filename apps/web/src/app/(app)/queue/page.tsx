@@ -196,6 +196,23 @@ export default function QueuePage() {
     await refresh();
   }
 
+  async function retryAllFailed() {
+    try {
+      const res = await api.post<{ retried: number }>(
+        "/api/v1/jobs/queue/retry-failed",
+      );
+      // No toast/banner library here; just refresh so the affected rows
+      // visibly move from error → queued. The button's count label will
+      // drop to zero on the next refresh tick.
+      await refresh();
+      // Surface a quick console line in case the user wants to confirm.
+      // eslint-disable-next-line no-console
+      console.info(`Retry-failed: ${res.retried} row(s) re-queued.`);
+    } catch (e) {
+      setErr(e instanceof ApiError ? `HTTP ${e.status}` : "Retry-all failed.");
+    }
+  }
+
   async function remove(fetchQueueId: number) {
     // Look up the row so we can give the user a state-aware confirm.
     // Cancelling something mid-flight has a different cost (Claude
@@ -496,14 +513,24 @@ export default function QueuePage() {
             </button>
           ) : null}
           {counts.errored > 0 ? (
-            <button
-              type="button"
-              className="jsp-btn-ghost text-xs text-corp-danger border-corp-danger/40"
-              onClick={() => dismissByStatus("error")}
-              title={`Remove all ${counts.errored} errored rows`}
-            >
-              Dismiss errored ({counts.errored})
-            </button>
+            <>
+              <button
+                type="button"
+                className="jsp-btn-ghost text-xs"
+                onClick={retryAllFailed}
+                title={`Re-queue all ${counts.errored} errored rows for another attempt`}
+              >
+                Retry all failed ({counts.errored})
+              </button>
+              <button
+                type="button"
+                className="jsp-btn-ghost text-xs text-corp-danger border-corp-danger/40"
+                onClick={() => dismissByStatus("error")}
+                title={`Remove all ${counts.errored} errored rows`}
+              >
+                Dismiss errored ({counts.errored})
+              </button>
+            </>
           ) : null}
           <button
             type="button"
