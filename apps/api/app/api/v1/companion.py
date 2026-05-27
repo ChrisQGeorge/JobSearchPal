@@ -915,10 +915,25 @@ def _format_attachments_block(attachments: list) -> str:
 
 
 async def _build_primer_for(user: User, db: AsyncSession) -> str:
-    """Compose the same primer the non-streaming endpoint uses."""
+    """Compose the same primer the non-streaming endpoint uses.
+
+    `user` may be detached from this session — callers like
+    send_message_stream resolve auth via `get_current_user_streaming`,
+    which closes its own session before handing the User back. Re-fetch
+    by id inside `db` so subsequent queries (including persona lookups)
+    work and we see whatever `active_persona_id` was committed most
+    recently.
+    """
     from app.api.v1.personas import _ensure_default_persona
     await _ensure_default_persona(db, user.id)
-    await db.refresh(user)
+    fresh_user = (
+        await db.execute(select(User).where(User.id == user.id))
+    ).scalar_one_or_none()
+    if fresh_user is None:
+        # Defensive — auth verified the user existed at request start.
+        # If they vanished mid-request, fall back to the detached snapshot.
+        fresh_user = user
+    user = fresh_user
 
     primer = _API_PRIMER.format(display_name=user.display_name, user_id=user.id)
     if user.active_persona_id:
