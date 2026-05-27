@@ -391,6 +391,8 @@ export default function QueuePage() {
         />
       </section>
 
+      <WorkerParallelismControl />
+
       <form
         onSubmit={enqueue}
         className="jsp-card p-4 mb-4 grid grid-cols-[1fr_180px_180px_180px_auto] gap-2 items-end"
@@ -1094,6 +1096,96 @@ function StreamLine({ ev }: { ev: StreamEvent }) {
   return (
     <div className="text-corp-muted">
       {header}{JSON.stringify(ev)}
+    </div>
+  );
+}
+
+// ---------- Worker parallelism control --------------------------------------
+
+type WorkerSettings = {
+  max_parallel: number;
+  min: number;
+  max: number;
+};
+
+function WorkerParallelismControl() {
+  const [settings, setSettings] = useState<WorkerSettings | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [draft, setDraft] = useState<number>(1);
+  const [err, setErr] = useState<string | null>(null);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+
+  useEffect(() => {
+    api
+      .get<WorkerSettings>("/api/v1/jobs/worker-settings")
+      .then((s) => {
+        setSettings(s);
+        setDraft(s.max_parallel);
+      })
+      .catch(() => {
+        // Non-fatal — just hides the control if it fails.
+        setSettings(null);
+      });
+  }, []);
+
+  if (!settings) return null;
+  const dirty = draft !== settings.max_parallel;
+
+  async function save() {
+    setSaving(true);
+    setErr(null);
+    try {
+      const s = await api.put<WorkerSettings>(
+        "/api/v1/jobs/worker-settings",
+        { max_parallel: draft },
+      );
+      setSettings(s);
+      setDraft(s.max_parallel);
+      setSavedAt(Date.now());
+      setTimeout(() => setSavedAt((t) => (t === Date.now() ? null : t)), 2500);
+    } catch (e) {
+      setErr(e instanceof ApiError ? `HTTP ${e.status}` : "Save failed");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="jsp-card p-3 mb-4 flex items-center gap-3 flex-wrap">
+      <div>
+        <label className="jsp-label">Parallel tasks</label>
+        <input
+          type="number"
+          min={settings.min}
+          max={settings.max}
+          value={draft}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            if (Number.isFinite(n)) setDraft(n);
+          }}
+          disabled={saving}
+          className="jsp-input w-20"
+        />
+      </div>
+      <p className="text-[11px] text-corp-muted max-w-md">
+        How many queue tasks the worker runs at once. Higher = more Claude
+        subprocesses going in parallel; lower = sequential. Takes effect on
+        the next claim slot. Range {settings.min}–{settings.max}.
+      </p>
+      <div className="ml-auto flex items-center gap-2">
+        {savedAt ? (
+          <span className="text-[11px] text-corp-ok">Saved.</span>
+        ) : null}
+        {err ? <span className="text-[11px] text-corp-danger">{err}</span> : null}
+        <button
+          type="button"
+          className="jsp-btn-primary text-xs"
+          onClick={save}
+          disabled={saving || !dirty}
+        >
+          {saving ? "Saving…" : "Save"}
+        </button>
+      </div>
     </div>
   );
 }

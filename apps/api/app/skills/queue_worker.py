@@ -1457,13 +1457,42 @@ async def _process(item: JobFetchQueue) -> None:
 
 
 async def run_forever() -> None:
-    """Main loop. Resets stuck rows once on boot, then polls indefinitely."""
+    """Main loop. Resets stuck rows once on boot, then polls indefinitely.
+
+    Concurrency: claims happen sequentially from this single loop so the
+    SELECT-then-UPDATE in `_claim_next` can't race with itself. Each
+    claimed row dispatches to its own asyncio task; we keep up to
+    `worker_settings.get_max_parallel()` in flight at once. The limit is
+    re-read on every iteration so the user can change it on /queue
+    without restarting the API.
+    """
+    from app.skills import worker_settings as _ws
+
     try:
         await _reset_stuck_rows()
     except Exception:  # pragma: no cover
         log.exception("Queue worker: stuck-row reset failed on boot")
 
+    running: set[asyncio.Task] = set()
+
+    async def _supervised_process(item: JobFetchQueue) -> None:
+        try:
+            await _process(item)
+        except Exception:  # pragma: no cover
+            log.exception("Queue worker: _process raised unexpectedly")
+
     while True:
+        # Wait for an open slot if we're at capacity. Re-read the limit
+        # every cycle so changes from the UI apply immediately.
+        if len(running) >= _ws.get_max_parallel():
+            # Block on whichever task finishes first — no busy poll.
+            done, _pending = await asyncio.wait(
+                running, return_when=asyncio.FIRST_COMPLETED
+            )
+            for t in done:
+                running.discard(t)
+            continue
+
         try:
             async with SessionLocal() as db:
                 item = await _claim_next(db)
@@ -1473,12 +1502,24 @@ async def run_forever() -> None:
             continue
 
         if item is None:
-            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+            # Nothing to claim. Wait either for the poll interval OR for
+            # an in-flight task to finish (it might enqueue follow-ups).
+            if running:
+                done, _pending = await asyncio.wait(
+                    running,
+                    timeout=POLL_INTERVAL_SECONDS,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in done:
+                    running.discard(t)
+            else:
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
             continue
 
-        try:
-            await _process(item)
-        except Exception:  # pragma: no cover
-            log.exception("Queue worker: _process raised unexpectedly")
-        # Immediately try for another item — if there's more queued work
-        # the user is probably waiting, and each fetch takes 60–180s.
+        task = asyncio.create_task(
+            _supervised_process(item), name=f"qworker-{item.id}"
+        )
+        running.add(task)
+        task.add_done_callback(running.discard)
+        # Tight loop: try to claim another immediately. Falls back to
+        # the capacity wait above on the next iteration if we're full.

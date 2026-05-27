@@ -2901,6 +2901,39 @@ async def cancel_activity_task(
     return {"status": task["status"], "key": task["key"]}
 
 
+class _WorkerSettingsIn(BaseModel):
+    max_parallel: int = Field(ge=1, le=8)
+
+
+@router.get("/worker-settings")
+async def get_worker_settings(_: User = Depends(get_current_user)) -> dict:
+    """Read the queue worker's parallelism limit + clamp bounds."""
+    from app.skills import worker_settings as _ws
+
+    lo, hi = _ws.get_bounds()
+    return {
+        "max_parallel": _ws.get_max_parallel(),
+        "min": lo,
+        "max": hi,
+    }
+
+
+@router.put("/worker-settings")
+async def put_worker_settings(
+    payload: _WorkerSettingsIn,
+    _: User = Depends(get_current_user),
+) -> dict:
+    """Update how many queue tasks the worker runs concurrently.
+
+    Takes effect on the worker's next claim slot. Persists to a tiny
+    JSON file in the Claude config volume so it survives restarts."""
+    from app.skills import worker_settings as _ws
+
+    saved = _ws.set_max_parallel(payload.max_parallel)
+    lo, hi = _ws.get_bounds()
+    return {"max_parallel": saved, "min": lo, "max": hi}
+
+
 @router.get("/activity/stream")
 async def stream_activity_tasks(
     _: User = Depends(get_current_user_streaming),
