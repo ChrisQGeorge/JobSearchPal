@@ -59,22 +59,32 @@ async def run_claude_prompt(
     cwd: str | None = None,
     session_id: str | None = None,
     extra_env: dict[str, str] | None = None,
+    action: str | None = None,
 ) -> ClaudeResult:
     """Run the Claude Code CLI non-interactively and return parsed output.
 
     If `session_id` is provided, passes `--resume <id>` so the CLI continues an
     existing multi-turn conversation instead of starting a fresh one.
 
+    `action` is an optional key from `model_settings.ACTIONS` that lets the
+    user route different kinds of work (fetch, jd_analyze, tailor_resume,
+    …) to different Claude models from the Settings page. Falls back to
+    ANTHROPIC_DEFAULT_MODEL when the user hasn't picked an override.
+
     Raises ClaudeCodeError on non-zero exit, timeout, or JSON parse failure.
     """
 
     cmd: list[str] = [settings.CLAUDE_CODE_BIN, "-p", prompt, "--output-format", output_format]
 
-    # Pin the model so changing ANTHROPIC_DEFAULT_MODEL in .env actually
-    # takes effect. Without --model the CLI uses whatever default the
-    # account / config dir resolves to, which made the env var look inert.
-    if settings.ANTHROPIC_DEFAULT_MODEL:
-        cmd += ["--model", settings.ANTHROPIC_DEFAULT_MODEL]
+    # Pin the model. The runner consults the user's per-action override
+    # (from /api/v1/jobs/model-settings, persisted in /root/.claude) and
+    # falls back to ANTHROPIC_DEFAULT_MODEL. We always go through the CLI
+    # `--model` flag — never the Anthropic API SDK.
+    from app.skills.model_settings import get_model_for as _get_model
+
+    chosen_model = _get_model(action) if action else settings.ANTHROPIC_DEFAULT_MODEL
+    if chosen_model:
+        cmd += ["--model", chosen_model]
 
     if session_id:
         cmd += ["--resume", session_id]
@@ -181,6 +191,7 @@ async def stream_claude_prompt(
     skills_dir: str | None = None,
     cwd: str | None = None,
     timeout_seconds: int = 300,
+    action: str | None = None,
 ):
     """Run Claude Code with `--output-format stream-json` and yield each
     event (parsed dict) as it arrives.
@@ -204,8 +215,11 @@ async def stream_claude_prompt(
         "--verbose",  # stream-json requires --verbose
         "--include-partial-messages",
     ]
-    if settings.ANTHROPIC_DEFAULT_MODEL:
-        cmd += ["--model", settings.ANTHROPIC_DEFAULT_MODEL]
+    from app.skills.model_settings import get_model_for as _get_model
+
+    chosen_model = _get_model(action) if action else settings.ANTHROPIC_DEFAULT_MODEL
+    if chosen_model:
+        cmd += ["--model", chosen_model]
     if session_id:
         cmd += ["--resume", session_id]
 

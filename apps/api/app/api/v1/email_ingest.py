@@ -324,6 +324,7 @@ async def parse_email(
                 "JSP_API_TOKEN": api_token,
             },
             timeout_seconds=120,
+            action="email_ingest",
         )
     except ClaudeCodeError as exc:
         from app.skills.queue_worker import _is_rate_limited as _rl
@@ -407,6 +408,7 @@ async def reparse_email(
                 "JSP_API_TOKEN": api_token,
             },
             timeout_seconds=120,
+            action="email_ingest",
         )
     except ClaudeCodeError as exc:
         row.state = "errored"

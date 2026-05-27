@@ -811,6 +811,7 @@ async def _handle_score(item: JobFetchQueue) -> None:
                     "JSP_API_TOKEN": api_token,
                 },
                 timeout_seconds=180,
+                action="jd_analyze",
             )
         except ClaudeCodeError as exc:
             err = str(exc)
@@ -948,6 +949,14 @@ async def _handle_tailor(item: JobFetchQueue) -> None:
         )
         label = row.label or f"{doc_type.replace('_', ' ').title()}: {job_title}"
 
+        # Map doc_type to a model-settings action key. resume / cover
+        # letter get dedicated knobs; everything else (outreach, follow-up,
+        # custom) shares one bucket.
+        _tailor_action = (
+            "tailor_resume" if doc_type == "resume"
+            else "tailor_cover_letter" if doc_type == "cover_letter"
+            else "tailor_other"
+        )
         try:
             final_text = await queue_bus.run_claude_to_bus(
                 prompt=prompt,
@@ -956,6 +965,7 @@ async def _handle_tailor(item: JobFetchQueue) -> None:
                 label=label,
                 allowed_tools=["Bash"],
                 timeout_seconds=600,
+                action=_tailor_action,
                 extra_env={
                     "JSP_API_BASE_URL": "http://localhost:8000",
                     "JSP_API_TOKEN": api_token,
@@ -1081,6 +1091,7 @@ async def _handle_humanize(item: JobFetchQueue) -> None:
                 label=label,
                 allowed_tools=[],
                 timeout_seconds=600,
+                action="humanize",
             )
         except ClaudeCodeError as exc:
             err = str(exc)
@@ -1152,6 +1163,7 @@ async def _handle_humanize(item: JobFetchQueue) -> None:
                     label=f"Humanize fix-pass {pass_idx + 1}: {source_title}",
                     allowed_tools=[],
                     timeout_seconds=600,
+                    action="humanize",
                 )
             except ClaudeCodeError as exc:
                 err = str(exc)
@@ -1379,6 +1391,7 @@ async def _handle_prep(item: JobFetchQueue) -> None:
                     "JSP_API_TOKEN": api_token,
                 },
                 timeout_seconds=240,
+                action="interview_prep",
             )
         except ClaudeCodeError as exc:
             err = str(exc)

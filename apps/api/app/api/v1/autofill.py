@@ -354,6 +354,7 @@ async def autofill(
             label=f"Autofill ({len(payload.questions)} q)",
             allowed_tools=[],
             timeout_seconds=120,
+            action="autofill",
         )
     except ClaudeCodeError as exc:
         log.warning("autofill failed: %s", exc)

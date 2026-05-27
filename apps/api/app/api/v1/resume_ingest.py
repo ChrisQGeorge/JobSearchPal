@@ -231,6 +231,7 @@ async def resume_ingest(
             label=f"Resume ingest: {doc.title}",
             allowed_tools=[],
             timeout_seconds=180,
+            action="resume_ingest",
         )
     except ClaudeCodeError as exc:
         log.warning("resume-ingest failed: %s", exc)

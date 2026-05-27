@@ -724,3 +724,140 @@ export function DataIoPanel() {
     </section>
   );
 }
+
+
+// ---------- Per-action Claude model picker ---------------------------------
+
+type ActionMeta = { key: string; label: string };
+type ModelChoice = { id: string; label: string };
+type ModelSettings = {
+  // action key → model id; missing keys mean "use the default"
+  models: Record<string, string>;
+  actions: ActionMeta[];
+  model_choices: ModelChoice[];
+};
+
+export function ModelPickerPanel() {
+  const [state, setState] = useState<ModelSettings | null>(null);
+  const [draft, setDraft] = useState<Record<string, string>>({});
+  const [saving, setSaving] = useState(false);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function refresh() {
+    try {
+      const s = await api.get<ModelSettings>("/api/v1/jobs/model-settings");
+      setState(s);
+      setDraft({ ...s.models });
+      setErr(null);
+    } catch (e) {
+      setErr(e instanceof ApiError ? `HTTP ${e.status}` : "Load failed.");
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+  }, []);
+
+  if (!state) {
+    return (
+      <section className="jsp-card p-5">
+        <h2 className="text-sm uppercase tracking-wider text-corp-muted">
+          Claude model per action
+        </h2>
+        <p className="text-xs text-corp-muted mt-2">
+          {err ?? "Loading…"}
+        </p>
+      </section>
+    );
+  }
+
+  // dirty if any action's draft differs from saved (including the "" → unset case)
+  const dirty = state.actions.some((a) => {
+    const current = state.models[a.key] ?? "";
+    const next = draft[a.key] ?? "";
+    return current !== next;
+  });
+
+  async function save() {
+    setSaving(true);
+    setErr(null);
+    try {
+      // Strip empty strings so the server stores only real overrides.
+      const cleaned: Record<string, string> = {};
+      for (const [k, v] of Object.entries(draft)) {
+        if (v && v.trim()) cleaned[k] = v;
+      }
+      const s = await api.put<ModelSettings>(
+        "/api/v1/jobs/model-settings",
+        { models: cleaned },
+      );
+      setState(s);
+      setDraft({ ...s.models });
+      setSavedAt(Date.now());
+      setTimeout(() => setSavedAt((t) => (t === Date.now() ? null : t)), 2500);
+    } catch (e) {
+      setErr(e instanceof ApiError ? `Save failed (HTTP ${e.status}).` : "Save failed.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section className="jsp-card p-5">
+      <header className="mb-3">
+        <h2 className="text-sm uppercase tracking-wider text-corp-muted">
+          Claude model per action
+        </h2>
+        <p className="text-[11px] text-corp-muted mt-1 max-w-2xl">
+          Route different work to different Claude models. Cheap fetches via
+          Haiku 4.5, resume writing via Opus 4.7, JD analysis via Sonnet 4.6,
+          etc. All requests still go through the Claude Code CLI
+          (<code>claude -p --model …</code>); no Anthropic API SDK is involved.
+          Leave a row on <strong>Default</strong> to fall back to
+          <code> ANTHROPIC_DEFAULT_MODEL</code>.
+        </p>
+      </header>
+
+      <ul className="divide-y divide-corp-border">
+        {state.actions.map((a) => (
+          <li
+            key={a.key}
+            className="py-2 flex items-center gap-3 flex-wrap"
+          >
+            <span className="text-sm w-72 shrink-0">{a.label}</span>
+            <select
+              className="jsp-input flex-1 min-w-[16rem]"
+              value={draft[a.key] ?? ""}
+              onChange={(e) =>
+                setDraft((prev) => ({ ...prev, [a.key]: e.target.value }))
+              }
+              disabled={saving}
+            >
+              {state.model_choices.map((c) => (
+                <option key={c.id || "default"} value={c.id}>
+                  {c.label}
+                </option>
+              ))}
+            </select>
+          </li>
+        ))}
+      </ul>
+
+      <div className="flex items-center gap-2 mt-3">
+        <button
+          type="button"
+          className="jsp-btn-primary text-xs"
+          onClick={save}
+          disabled={saving || !dirty}
+        >
+          {saving ? "Saving…" : "Save"}
+        </button>
+        {savedAt ? (
+          <span className="text-[11px] text-corp-ok">Saved.</span>
+        ) : null}
+        {err ? <span className="text-[11px] text-corp-danger">{err}</span> : null}
+      </div>
+    </section>
+  );
+}

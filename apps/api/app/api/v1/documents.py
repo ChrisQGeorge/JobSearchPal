@@ -2334,6 +2334,7 @@ async def selection_edit(
             label=f"{payload.mode.replace('_', ' ').title()}: {doc.title}",
             allowed_tools=[],
             timeout_seconds=120,
+            action="selection_edit",
         )
     except ClaudeCodeError as exc:
         log.warning(

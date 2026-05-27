@@ -287,6 +287,7 @@ async def run_claude_to_bus(
     allowed_tools: list[str] | None = None,
     extra_env: dict[str, str] | None = None,
     timeout_seconds: int = 240,
+    action: str | None = None,
 ) -> str:
     """Run Claude Code via the streaming variant and fan events onto the bus.
 
@@ -319,6 +320,7 @@ async def run_claude_to_bus(
             allowed_tools=allowed_tools,
             extra_env=extra_env,
             timeout_seconds=timeout_seconds,
+            action=action,
         ):
             t = raw.get("type")
             if t == "system":

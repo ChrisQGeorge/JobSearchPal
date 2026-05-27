@@ -499,6 +499,7 @@ async def _run_analyze_in_background(
                 "JSP_API_BASE_URL": "http://localhost:8000",
                 "JSP_API_TOKEN": api_token,
             },
+            action="analyze_entity",
         )
     except ClaudeCodeError as exc:
         log.warning("analyze-entity background Claude failure: %s", exc)
@@ -791,6 +792,7 @@ async def send_message(
                 "JSP_API_BASE_URL": "http://localhost:8000",
                 "JSP_API_TOKEN": api_token,
             },
+            action="companion_chat",
         )
     except ClaudeCodeError as exc:
         log.warning("Claude Code failure for conversation %s: %s", conv.id, exc)
@@ -1038,6 +1040,7 @@ async def _run_chat_in_background(
                 "JSP_API_TOKEN": api_token,
             },
             timeout_seconds=_STREAM_TIMEOUT_SECONDS,
+            action="companion_chat",
         ):
             ev_type = ev.get("type")
 

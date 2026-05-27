@@ -352,6 +352,7 @@ async def job_strategy(
             label="Strategy briefing",
             allowed_tools=[],
             timeout_seconds=120,
+            action="strategy",
         )
     except ClaudeCodeError as exc:
         log.warning("strategy failed: %s", exc)

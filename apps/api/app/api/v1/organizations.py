@@ -498,6 +498,7 @@ async def run_org_research_pipeline(
         label=f"Research: {obj.name}",
         allowed_tools=allowed_tools,
         timeout_seconds=180,
+        action="org_research",
     )
 
     data = _extract_json(final_text) or {}
