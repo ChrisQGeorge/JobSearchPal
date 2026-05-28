@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useRef, useState, use as usePromise } from "react";
+import { useCallback, useEffect, useRef, useState, use as usePromise } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { OrganizationCombobox } from "@/components/OrganizationCombobox";
 import { PageShell } from "@/components/PageShell";
@@ -400,22 +400,32 @@ function ReviewAction({
   const searchParams = useSearchParams();
   const inReviewFlow = searchParams.get("from") === "review";
   const [ids, setIds] = useState<number[]>([]);
+  // Distinct from "ids is empty": we only trust an EMPTY queue once a fetch
+  // has SUCCEEDED. A failed / in-flight fetch also leaves ids=[], but with
+  // idsReady=false — so advancing won't mistake a server hiccup for "queue
+  // done" and bounce the user back to the pipeline (the reported bug).
+  const [idsReady, setIdsReady] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
+  const [navErr, setNavErr] = useState<string | null>(null);
+
+  const fetchQueue = useCallback(async (): Promise<number[]> => {
+    const out = await api.get<{ ids: number[] }>("/api/v1/jobs/review-queue");
+    const next = out.ids ?? [];
+    setIds(next);
+    setIdsReady(true);
+    return next;
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
-    api
-      .get<{ ids: number[] }>("/api/v1/jobs/review-queue")
-      .then((out) => {
-        if (!cancelled) setIds(out.ids ?? []);
-      })
-      .catch(() => {
-        /* best-effort */
-      });
+    fetchQueue().catch(() => {
+      // Best-effort on mount; advancing re-fetches on demand.
+      if (!cancelled) setIdsReady(false);
+    });
     return () => {
       cancelled = true;
     };
-  }, [jobId]);
+  }, [jobId, fetchQueue]);
 
   // Remaining = jobs that will still need review AFTER this action. When
   // status is to_review, any triage button clears this row, so subtract 1.
@@ -424,34 +434,68 @@ function ReviewAction({
       ? Math.max(0, ids.filter((i) => i !== jobId).length)
       : ids.length;
 
-  function nextTarget(): string {
-    const queue = ids.filter((i) => i !== jobId);
-    if (queue.length === 0) return "/jobs/pipeline";
-    const idx = ids.indexOf(jobId);
-    const next = idx >= 0 && idx + 1 < ids.length ? ids[idx + 1] : queue[0];
+  // Pure: next job URL for a KNOWN queue, or null when it's genuinely empty.
+  function targetFor(list: number[]): string | null {
+    const queue = list.filter((i) => i !== jobId);
+    if (queue.length === 0) return null;
+    const idx = list.indexOf(jobId);
+    const next = idx >= 0 && idx + 1 < list.length ? list[idx + 1] : queue[0];
     return `/jobs/${next}?from=review`;
+  }
+
+  // Resolve the freshest queue we can before navigating. If the mount fetch
+  // never succeeded, fetch now instead of trusting a maybe-empty-from-failure
+  // list. Returns null only on fetch failure (caller should stay put).
+  async function resolveQueue(): Promise<number[] | null> {
+    if (idsReady) return ids;
+    try {
+      return await fetchQueue();
+    } catch {
+      return null;
+    }
+  }
+
+  async function goNext() {
+    setNavErr(null);
+    const list = await resolveQueue();
+    if (list === null) {
+      setNavErr("Couldn't load the next job — server's busy. Try again.");
+      return;
+    }
+    // null target = queue genuinely empty → back to the pipeline overview.
+    router.push(targetFor(list) ?? "/jobs/pipeline");
+  }
+
+  async function goPrev() {
+    setNavErr(null);
+    const list = await resolveQueue();
+    if (list === null) {
+      setNavErr("Couldn't load the previous job — server's busy. Try again.");
+      return;
+    }
+    if (list.length === 0) {
+      router.push("/jobs/pipeline");
+      return;
+    }
+    const idx = list.indexOf(jobId);
+    const prev = idx > 0 ? list[idx - 1] : list[list.length - 1];
+    router.push(`/jobs/${prev}?from=review`);
   }
 
   async function triage(newStatus: JobStatus, key: string) {
     setBusy(key);
+    setNavErr(null);
     try {
       await api.put<TrackedJob>(`/api/v1/jobs/${jobId}`, {
         status: newStatus,
       });
       onStatusChanged(newStatus);
-      router.push(nextTarget());
+      await goNext();
     } catch {
-      /* non-fatal; stay put */
+      setNavErr("Couldn't save — server's busy. Try again.");
     } finally {
       setBusy(null);
     }
-  }
-
-  function prevTarget(): string {
-    if (ids.length === 0) return "/jobs/pipeline";
-    const idx = ids.indexOf(jobId);
-    if (idx > 0) return `/jobs/${ids[idx - 1]}?from=review`;
-    return `/jobs/${ids[ids.length - 1]}?from=review`;
   }
 
   // Keyboard shortcuts on the review-flow detail page:
@@ -483,19 +527,17 @@ function ReviewAction({
         e.preventDefault();
         void triage("reviewed", "skip");
       } else if (e.key === "j") {
-        if (ids.length === 0) return;
         e.preventDefault();
-        router.push(nextTarget());
+        void goNext();
       } else if (e.key === "k") {
-        if (ids.length === 0) return;
         e.preventDefault();
-        router.push(prevTarget());
+        void goPrev();
       }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [inReviewFlow, status, busy, ids, jobId]);
+  }, [inReviewFlow, status, busy, ids, idsReady, jobId]);
 
   const counter =
     remaining > 0 ? (
@@ -546,6 +588,9 @@ function ReviewAction({
             <kbd>j</kbd>/<kbd>k</kbd> next/prev
           </span>
         ) : null}
+        {navErr ? (
+          <span className="text-[10px] text-corp-danger ml-2">{navErr}</span>
+        ) : null}
       </div>
     );
   }
@@ -554,14 +599,19 @@ function ReviewAction({
   // when the user arrived via /jobs/review and there's still a queue.
   if (!inReviewFlow || remaining === 0) return null;
   return (
-    <button
-      type="button"
-      className="jsp-btn-ghost text-xs"
-      onClick={() => router.push(nextTarget())}
-      title="Move to the next to-review job"
-    >
-      Next to review →{counter}
-    </button>
+    <div className="flex items-center gap-2">
+      <button
+        type="button"
+        className="jsp-btn-ghost text-xs"
+        onClick={() => void goNext()}
+        title="Move to the next to-review job"
+      >
+        Next to review →{counter}
+      </button>
+      {navErr ? (
+        <span className="text-[10px] text-corp-danger">{navErr}</span>
+      ) : null}
+    </div>
   );
 }
 
@@ -634,7 +684,12 @@ function ApplyAction({
   const searchParams = useSearchParams();
   const inApplyFlow = searchParams.get("from") === "apply";
   const [ids, setIds] = useState<number[]>([]);
+  // See ReviewAction: idsReady distinguishes "queue loaded + empty" from
+  // "queue fetch failed / pending", so a server hiccup can't bounce the
+  // user back to the pipeline mid-apply-flow.
+  const [idsReady, setIdsReady] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
+  const [navErr, setNavErr] = useState<string | null>(null);
 
   // Only run when relevant — avoids hammering the endpoint on every job
   // detail page even though the component is always mounted. Active for
@@ -643,37 +698,76 @@ function ApplyAction({
   // navigate through `interested` rows from the apply queue).
   const active = inApplyFlow || status === "in_progress";
 
+  const fetchQueue = useCallback(async (): Promise<number[]> => {
+    const out = await api.get<{ ids: number[] }>("/api/v1/jobs/apply-queue");
+    const next = out.ids ?? [];
+    setIds(next);
+    setIdsReady(true);
+    return next;
+  }, []);
+
   useEffect(() => {
     if (!active) return;
     let cancelled = false;
-    api
-      .get<{ ids: number[] }>("/api/v1/jobs/apply-queue")
-      .then((out) => {
-        if (!cancelled) setIds(out.ids ?? []);
-      })
-      .catch(() => {
-        /* best-effort */
-      });
+    fetchQueue().catch(() => {
+      if (!cancelled) setIdsReady(false);
+    });
     return () => {
       cancelled = true;
     };
-  }, [jobId, active]);
+  }, [jobId, active, fetchQueue]);
 
   const remaining =
     status === "interested" || status === "in_progress"
       ? Math.max(0, ids.filter((i) => i !== jobId).length)
       : ids.length;
 
-  function nextTarget(): string {
-    const queue = ids.filter((i) => i !== jobId);
-    if (queue.length === 0) return "/jobs/pipeline";
-    const idx = ids.indexOf(jobId);
-    const next = idx >= 0 && idx + 1 < ids.length ? ids[idx + 1] : queue[0];
+  function targetFor(list: number[]): string | null {
+    const queue = list.filter((i) => i !== jobId);
+    if (queue.length === 0) return null;
+    const idx = list.indexOf(jobId);
+    const next = idx >= 0 && idx + 1 < list.length ? list[idx + 1] : queue[0];
     return `/jobs/${next}?from=apply`;
+  }
+
+  async function resolveQueue(): Promise<number[] | null> {
+    if (idsReady) return ids;
+    try {
+      return await fetchQueue();
+    } catch {
+      return null;
+    }
+  }
+
+  async function goNext() {
+    setNavErr(null);
+    const list = await resolveQueue();
+    if (list === null) {
+      setNavErr("Couldn't load the next job — server's busy. Try again.");
+      return;
+    }
+    router.push(targetFor(list) ?? "/jobs/pipeline");
+  }
+
+  async function goPrev() {
+    setNavErr(null);
+    const list = await resolveQueue();
+    if (list === null) {
+      setNavErr("Couldn't load the previous job — server's busy. Try again.");
+      return;
+    }
+    if (list.length === 0) {
+      router.push("/jobs/pipeline");
+      return;
+    }
+    const idx = list.indexOf(jobId);
+    const prev = idx > 0 ? list[idx - 1] : list[list.length - 1];
+    router.push(`/jobs/${prev}?from=apply`);
   }
 
   async function triage(newStatus: JobStatus, key: string, keepStatus: boolean) {
     setBusy(key);
+    setNavErr(null);
     try {
       if (!keepStatus) {
         await api.put<TrackedJob>(`/api/v1/jobs/${jobId}`, {
@@ -681,19 +775,12 @@ function ApplyAction({
         });
         onStatusChanged(newStatus);
       }
-      router.push(nextTarget());
+      await goNext();
     } catch {
-      /* non-fatal */
+      setNavErr("Couldn't save — server's busy. Try again.");
     } finally {
       setBusy(null);
     }
-  }
-
-  function prevTarget(): string {
-    if (ids.length === 0) return "/jobs/pipeline";
-    const idx = ids.indexOf(jobId);
-    if (idx > 0) return `/jobs/${ids[idx - 1]}?from=apply`;
-    return `/jobs/${ids[ids.length - 1]}?from=apply`;
   }
 
   // Apply-flow keyboard shortcuts mirror the review-flow ones:
@@ -725,19 +812,17 @@ function ApplyAction({
         e.preventDefault();
         void triage(status, "skip", true);
       } else if (e.key === "j") {
-        if (ids.length === 0) return;
         e.preventDefault();
-        router.push(nextTarget());
+        void goNext();
       } else if (e.key === "k") {
-        if (ids.length === 0) return;
         e.preventDefault();
-        router.push(prevTarget());
+        void goPrev();
       }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [inApplyFlow, status, busy, ids, jobId]);
+  }, [inApplyFlow, status, busy, ids, idsReady, jobId]);
 
   if (!active) return null;
 
@@ -787,6 +872,9 @@ function ApplyAction({
             <kbd>j</kbd>/<kbd>k</kbd> next/prev
           </span>
         ) : null}
+        {navErr ? (
+          <span className="text-[10px] text-corp-danger ml-2">{navErr}</span>
+        ) : null}
       </div>
     );
   }
@@ -795,14 +883,19 @@ function ApplyAction({
   // but this row has moved on. Offer a nav button only.
   if (!inApplyFlow || remaining === 0) return null;
   return (
-    <button
-      type="button"
-      className="jsp-btn-ghost text-xs"
-      onClick={() => router.push(nextTarget())}
-      title="Move to the next interested job"
-    >
-      Next to apply →{counter}
-    </button>
+    <div className="flex items-center gap-2">
+      <button
+        type="button"
+        className="jsp-btn-ghost text-xs"
+        onClick={() => void goNext()}
+        title="Move to the next interested job"
+      >
+        Next to apply →{counter}
+      </button>
+      {navErr ? (
+        <span className="text-[10px] text-corp-danger">{navErr}</span>
+      ) : null}
+    </div>
   );
 }
 

@@ -1015,6 +1015,19 @@ async def review_queue(
 
     stmt = (
         select(TrackedJob)
+        .options(
+            # Only the columns the queue item renders — never the full row
+            # (job_description Text etc.). This endpoint is hit on every job
+            # page in the review flow, so the heavy payload was a real drag.
+            load_only(
+                TrackedJob.title,
+                TrackedJob.organization_id,
+                TrackedJob.location,
+                TrackedJob.date_discovered,
+                TrackedJob.fit_summary,
+                TrackedJob.status,
+            )
+        )
         .where(
             TrackedJob.user_id == user.id,
             TrackedJob.deleted_at.is_(None),
@@ -1087,6 +1100,18 @@ async def apply_queue(
 
     stmt = (
         select(TrackedJob)
+        .options(
+            # Narrow columns only — see review_queue. Hit on every job page
+            # in the apply flow, so the full-row payload mattered.
+            load_only(
+                TrackedJob.title,
+                TrackedJob.organization_id,
+                TrackedJob.location,
+                TrackedJob.date_discovered,
+                TrackedJob.fit_summary,
+                TrackedJob.status,
+            )
+        )
         .where(
             TrackedJob.user_id == user.id,
             TrackedJob.deleted_at.is_(None),
