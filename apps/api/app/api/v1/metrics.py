@@ -39,31 +39,51 @@ class SnapshotOut(BaseModel):
 
 async def _compute_snapshot(db: AsyncSession, user_id: int) -> dict[str, Any]:
     today = date.today()
-    jobs = list(
-        (
-            await db.execute(
-                select(TrackedJob).where(
-                    TrackedJob.user_id == user_id,
-                    TrackedJob.deleted_at.is_(None),
-                )
+    # Select only the columns the aggregates need — NOT full ORM rows.
+    # The full row drags job_description (Text) + jd_analysis +
+    # fit_summary (JSON) along, which at a few thousand jobs is megabytes
+    # of payload to count statuses. These four columns are all we touch.
+    rows = (
+        await db.execute(
+            select(
+                TrackedJob.status,
+                TrackedJob.date_applied,
+                TrackedJob.updated_at,
+            ).where(
+                TrackedJob.user_id == user_id,
+                TrackedJob.deleted_at.is_(None),
             )
-        ).scalars().all()
-    )
+        )
+    ).all()
     status_counts: dict[str, int] = {}
-    for j in jobs:
-        status_counts[j.status] = status_counts.get(j.status, 0) + 1
-    applied = [j for j in jobs if j.date_applied]
-    responded = [j for j in applied if j.status in POST_APPLY]
-    offers = [j for j in jobs if j.status in ("offer", "won")]
-    wins = [j for j in jobs if j.status == "won"]
-
-    # Days-to-first-response: updated_at of jobs that moved to POST_APPLY minus date_applied.
+    applied_count = 0
+    responded_count = 0
+    offers_count = 0
+    wins_count = 0
     ttr_days: list[float] = []
-    for j in applied:
-        if j.status in POST_APPLY and j.updated_at and j.date_applied:
-            d = (j.updated_at.date() - j.date_applied).days
-            if d >= 0:
-                ttr_days.append(d)
+    applied_this_week = 0
+    applied_30d = 0
+    week_ago_pre = today - timedelta(days=7)
+    thirty_ago_pre = today - timedelta(days=30)
+    for status_v, date_applied_v, updated_at_v in rows:
+        status_counts[status_v] = status_counts.get(status_v, 0) + 1
+        if status_v in ("offer", "won"):
+            offers_count += 1
+        if status_v == "won":
+            wins_count += 1
+        if date_applied_v:
+            applied_count += 1
+            if status_v in POST_APPLY:
+                responded_count += 1
+                if updated_at_v:
+                    d = (updated_at_v.date() - date_applied_v).days
+                    if d >= 0:
+                        ttr_days.append(d)
+            if date_applied_v >= week_ago_pre:
+                applied_this_week += 1
+            if date_applied_v >= thirty_ago_pre:
+                applied_30d += 1
+    total_jobs = len(rows)
     rounds = list(
         (
             await db.execute(
@@ -79,21 +99,16 @@ async def _compute_snapshot(db: AsyncSession, user_id: int) -> dict[str, Any]:
     rounds_passed = sum(1 for r in rounds if r.outcome == "passed")
     rounds_failed = sum(1 for r in rounds if r.outcome == "failed")
 
-    week_ago = today - timedelta(days=7)
-    thirty_ago = today - timedelta(days=30)
-    applied_this_week = sum(1 for j in applied if j.date_applied >= week_ago)
-    applied_30d = sum(1 for j in applied if j.date_applied >= thirty_ago)
-
     return {
-        "total_jobs": len(jobs),
+        "total_jobs": total_jobs,
         "status_counts": status_counts,
-        "applied_count": len(applied),
-        "responded_count": len(responded),
-        "response_rate": round(len(responded) / len(applied) * 100, 1)
-        if applied
+        "applied_count": applied_count,
+        "responded_count": responded_count,
+        "response_rate": round(responded_count / applied_count * 100, 1)
+        if applied_count
         else None,
-        "offers_count": len(offers),
-        "wins_count": len(wins),
+        "offers_count": offers_count,
+        "wins_count": wins_count,
         "applied_this_week": applied_this_week,
         "applied_last_30_days": applied_30d,
         "avg_days_to_response": round(sum(ttr_days) / len(ttr_days), 1)
@@ -171,30 +186,33 @@ async def funnel_by_source(
     at status=onsite has reached applied + phone_screen + onsite. The
     funnel doesn't count jobs that bypassed `applied` (e.g. recruiter
     inbound that skipped straight to interest)."""
+    # Only need status + source_platform — not the full rows (which drag
+    # job_description / jd_analysis / fit_summary along). Bucket statuses
+    # per source as a list of plain status strings.
     rows = (
         await db.execute(
-            select(TrackedJob).where(
+            select(TrackedJob.status, TrackedJob.source_platform).where(
                 TrackedJob.user_id == user.id,
                 TrackedJob.deleted_at.is_(None),
             )
         )
-    ).scalars().all()
+    ).all()
 
     # Bucket by source_platform. Empty / None collapses to "(unknown)" so
     # the user can see how much of their pipeline is unattributed.
-    by_source: dict[str, list[TrackedJob]] = {}
-    for j in rows:
-        key = (j.source_platform or "").strip() or "(unknown)"
-        by_source.setdefault(key, []).append(j)
+    by_source: dict[str, list[str]] = {}
+    for status_v, source_platform_v in rows:
+        key = (source_platform_v or "").strip() or "(unknown)"
+        by_source.setdefault(key, []).append(status_v)
 
     out: list[FunnelBySourceRowOut] = []
-    for source, items in by_source.items():
+    for source, statuses in by_source.items():
         applied_count = sum(
-            1 for j in items if j.status in _FUNNEL_STAGES[0][1]
+            1 for s in statuses if s in _FUNNEL_STAGES[0][1]
         )
         stages: list[FunnelStageOut] = []
         for stage, accepted in _FUNNEL_STAGES:
-            n = sum(1 for j in items if j.status in accepted)
+            n = sum(1 for s in statuses if s in accepted)
             rate = (
                 round(100 * n / applied_count, 1) if applied_count else None
             )
@@ -204,7 +222,7 @@ async def funnel_by_source(
         out.append(
             FunnelBySourceRowOut(
                 source=source,
-                total=len(items),
+                total=len(statuses),
                 stages=stages,
             )
         )
