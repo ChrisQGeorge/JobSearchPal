@@ -4,6 +4,7 @@ Status transitions are free-form (any → any) per SRS REQ-FUNC-JOBS-001 but
 always emit an ApplicationEvent so the audit/history is preserved.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -101,6 +102,21 @@ async def _get_owned_job(
     return job
 
 
+def _is_deadlock(exc: Exception) -> bool:
+    """True for MySQL deadlock (1213) / lock-wait-timeout (1205). Both are
+    transient by nature — MySQL rolls the loser back and the retry usually
+    wins. Triggered here when rapid review-flow PUTs + the parallel queue
+    worker contend on the same tracked_jobs rows."""
+    from sqlalchemy.exc import OperationalError
+
+    if not isinstance(exc, OperationalError):
+        return False
+    orig = getattr(exc, "orig", None)
+    args = getattr(orig, "args", None) if orig is not None else None
+    code = args[0] if args else None
+    return code in (1213, 1205)
+
+
 def _normalize_source_url(url: str | None) -> str | None:
     """Cheap canonicalization for dedup matching. Trims whitespace and
     a single trailing slash; lower-cases the host. Query string is left
@@ -129,32 +145,59 @@ def _normalize_source_url(url: str | None) -> str | None:
     return u or None
 
 
+def _url_match_candidates(url: str | None) -> list[str]:
+    """Generate the handful of stored-URL forms that should count as the
+    same listing as `url`: normalized, raw, ± trailing slash, http⇄https.
+
+    Used to dedup with a bounded `WHERE source_url IN (...)` lookup
+    instead of loading every job and normalizing in Python — the latter
+    was O(all jobs) per import and got brutal past a few hundred rows.
+    """
+    norm = _normalize_source_url(url)
+    if not norm:
+        return []
+    raw = (url or "").strip()
+    cands: set[str] = {norm, raw}
+    for base in (norm, raw.rstrip("/")):
+        if not base:
+            continue
+        cands.add(base)
+        cands.add(base + "/")
+        if base.startswith("https://"):
+            cands.add("http://" + base[len("https://"):])
+            cands.add("http://" + base[len("https://"):] + "/")
+        elif base.startswith("http://"):
+            cands.add("https://" + base[len("http://"):])
+            cands.add("https://" + base[len("http://"):] + "/")
+    return [c for c in cands if c]
+
+
 async def _find_existing_job_by_url(
     db: AsyncSession, user_id: int, url: str | None
 ) -> Optional[TrackedJob]:
     """Return the user's existing non-deleted TrackedJob with this
-    `source_url`, or None. Matches against the normalized form so
-    trailing-slash / scheme-case variants collapse to the same row.
+    `source_url`, or None.
 
-    The dedup is intentionally URL-only — same URL = same listing, and
-    if the URL differs we assume the jobs differ (per product call).
+    Matches a small candidate set of equivalent URL forms via an indexed
+    `IN` query (see the (user_id, source_url) index). Trailing-slash and
+    http/https variants collapse to the same row. Host-case-only
+    differences (rare for job-board URLs) won't match — an acceptable
+    trade since the product rule is "different URL = different job."
     """
-    norm = _normalize_source_url(url)
-    if not norm:
+    candidates = _url_match_candidates(url)
+    if not candidates:
         return None
-    rows = (
+    return (
         await db.execute(
-            select(TrackedJob).where(
+            select(TrackedJob)
+            .where(
                 TrackedJob.user_id == user_id,
                 TrackedJob.deleted_at.is_(None),
-                TrackedJob.source_url.is_not(None),
+                TrackedJob.source_url.in_(candidates),
             )
+            .limit(1)
         )
-    ).scalars().all()
-    for row in rows:
-        if _normalize_source_url(row.source_url) == norm:
-            return row
-    return None
+    ).scalar_one_or_none()
 
 
 async def _org_names_for(
@@ -225,12 +268,31 @@ async def _compute_job_summaries(
         db, {j.organization_id for j in jobs if j.organization_id}
     )
 
-    # Build a single normalized set of skill names + aliases the user knows.
-    # Used below to compute skill_match_pct for each job's required_skills
-    # without N+1 querying. We normalize lower-case and strip simple
-    # punctuation so "Node.js" matches "node js".
+    def _norm(s: object) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip()
+
+    # Skill-match heatmap is now denormalized onto fit_summary at score
+    # time (see apply_fit_score_to_job). The tracker reads those stored
+    # values directly. We only fall back to the live (memoized) compute
+    # for jobs scored before that change — i.e. ones whose fit_summary
+    # has no skill_match_total yet. The user's skill catalogue is loaded
+    # lazily and only if at least one such legacy job exists, so a fully
+    # migrated dataset does zero skill-match work + one fewer query.
+    def _job_has_stored_skill_match(j: TrackedJob) -> bool:
+        fs = j.fit_summary
+        return isinstance(fs, dict) and isinstance(
+            fs.get("skill_match_total"), int
+        )
+
+    needs_live_skill_match = any(
+        not _job_has_stored_skill_match(j)
+        and isinstance(j.required_skills, list)
+        and j.required_skills
+        for j in jobs
+    )
+
     user_skill_terms: set[str] = set()
-    if jobs:
+    if jobs and needs_live_skill_match:
         skill_rows = (
             await db.execute(
                 select(Skill.name, Skill.aliases).where(
@@ -238,10 +300,6 @@ async def _compute_job_summaries(
                 )
             )
         ).all()
-
-        def _norm(s: object) -> str:
-            return re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip()
-
         for name, aliases in skill_rows:
             t = _norm(name)
             if t:
@@ -251,9 +309,6 @@ async def _compute_job_summaries(
                     ta = _norm(a)
                     if ta:
                         user_skill_terms.add(ta)
-    else:
-        def _norm(s: object) -> str:  # noqa: E306
-            return re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip()
 
     # Rounds aggregate: count + latest outcome per job.
     if jobs:
@@ -325,6 +380,25 @@ async def _compute_job_summaries(
         has_resume_by_job = {}
         has_cover_letter_by_job = {}
 
+    # Memoize the per-skill match result across all jobs. The same skill
+    # strings ("python", "aws", …) recur on hundreds of postings, so without
+    # this we re-ran the O(user_skill_terms) substring scan for each
+    # occurrence — millions of comparisons on a few thousand jobs. With the
+    # cache, each DISTINCT normalized skill is scanned once.
+    _user_terms_list = tuple(user_skill_terms)
+    _skill_match_cache: dict[str, bool] = {}
+
+    def _skill_is_matched(n: str) -> bool:
+        cached = _skill_match_cache.get(n)
+        if cached is not None:
+            return cached
+        if n in user_skill_terms:
+            _skill_match_cache[n] = True
+            return True
+        matched = any(n in t or t in n for t in _user_terms_list)
+        _skill_match_cache[n] = matched
+        return matched
+
     out: list[TrackedJobSummary] = []
     for j in jobs:
         fit_score: Optional[int] = None
@@ -340,32 +414,30 @@ async def _compute_job_summaries(
             if isinstance(rfs, list):
                 red_flag_count = len(rfs)
 
-        # Skill-match heatmap: % of this JD's required_skills that the user
-        # has on file. We do a normalized substring check in either
-        # direction so "AWS" matches "AWS (ECS, Lambda)" and "Node.js"
-        # matches "node js". Null when there's nothing to match against.
+        # Skill-match heatmap. Prefer the value denormalized onto
+        # fit_summary at score time; only compute live for legacy jobs
+        # that predate the denormalization (no stored skill_match_total).
         skill_match_pct: Optional[int] = None
         skill_match_have: Optional[int] = None
         skill_match_total: Optional[int] = None
-        req = j.required_skills if isinstance(j.required_skills, list) else None
-        if req:
-            normalized = [_norm(s) for s in req if str(s).strip()]
-            normalized = [n for n in normalized if n]
-            if normalized:
-                have = 0
-                for n in normalized:
-                    if n in user_skill_terms:
-                        have += 1
-                        continue
-                    if any(n in t or t in n for t in user_skill_terms):
-                        have += 1
-                skill_match_total = len(normalized)
-                skill_match_have = have
-                skill_match_pct = (
-                    int(round(100 * have / skill_match_total))
-                    if skill_match_total
-                    else None
-                )
+        if isinstance(fs, dict) and isinstance(fs.get("skill_match_total"), int):
+            skill_match_total = fs.get("skill_match_total")
+            skill_match_have = fs.get("skill_match_have")
+            skill_match_pct = fs.get("skill_match_pct")
+        else:
+            req = j.required_skills if isinstance(j.required_skills, list) else None
+            if req:
+                normalized = [_norm(s) for s in req if str(s).strip()]
+                normalized = [n for n in normalized if n]
+                if normalized:
+                    have = sum(1 for n in normalized if _skill_is_matched(n))
+                    skill_match_total = len(normalized)
+                    skill_match_have = have
+                    skill_match_pct = (
+                        int(round(100 * have / skill_match_total))
+                        if skill_match_total
+                        else None
+                    )
         out.append(
             TrackedJobSummary(
                 id=j.id,
@@ -695,6 +767,29 @@ async def update_job(
     payload: TrackedJobUpdate,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
+) -> TrackedJob:
+    # Retry on transient MySQL deadlocks. The review flow fires status
+    # PUTs back-to-back and the parallel queue worker can be writing the
+    # same tracked_jobs rows (fit-score, enrichment); occasionally two
+    # transactions deadlock. MySQL rolls one back — re-running it in a
+    # fresh transaction succeeds. Re-fetch the job each attempt so we
+    # work from clean post-rollback state.
+    for attempt in range(3):
+        try:
+            return await _update_job_once(db, job_id, payload, user)
+        except Exception as exc:
+            if _is_deadlock(exc) and attempt < 2:
+                await db.rollback()
+                await asyncio.sleep(0.05 * (attempt + 1))
+                continue
+            raise
+
+
+async def _update_job_once(
+    db: AsyncSession,
+    job_id: int,
+    payload: TrackedJobUpdate,
+    user: User,
 ) -> TrackedJob:
     job = await _get_owned_job(db, job_id, user.id)
     data = payload.model_dump(exclude_unset=True)

@@ -95,6 +95,11 @@ class Component:
     matched_pct: float  # 0..1
     detail: str
     tier: Optional[str] = None  # for criterion components
+    # Free-form extras a component wants to surface up to the caller —
+    # e.g. the skills component stashes raw required-skill counts here so
+    # they can be persisted onto the job and read by the tracker without
+    # recomputing the match on every list load.
+    extra: Optional[dict] = None
 
     def to_dict(self) -> dict:
         return {
@@ -633,6 +638,10 @@ def _score_skills(
         verdict=verdict,
         matched_pct=pct,
         detail=" · ".join(detail_parts) if detail_parts else "—",
+        # Required-only counts for the tracker heatmap. The tracker shows
+        # "have / required" (not the weighted required+nice the score uses),
+        # so persist those raw numbers for it to read directly.
+        extra={"req_matched": req_matched, "req_total": req_total},
     )
 
 
@@ -937,7 +946,15 @@ async def compute_fit_score(
 def apply_fit_score_to_job(job: TrackedJob, result: FitResult) -> None:
     """Persist `result` onto `job.fit_summary`. Preserves any existing
     qualitative summary the JD-analyzer wrote so re-scoring doesn't
-    erase analyst output."""
+    erase analyst output.
+
+    Also denormalizes the tracker's skill-match heatmap numbers
+    (have / total / pct over required skills) into fit_summary so the
+    job list can read them directly instead of recomputing the match
+    against the user's whole skill catalogue on every load. Recomputed
+    here whenever the job is scored — create, JD-analyze, or any update
+    that touches scoring inputs.
+    """
     prior = job.fit_summary if isinstance(job.fit_summary, dict) else {}
     out = dict(prior)
     out["score"] = result.score
@@ -945,4 +962,24 @@ def apply_fit_score_to_job(job: TrackedJob, result: FitResult) -> None:
     out["veto_reason"] = result.veto_reason
     out["breakdown"] = [c.to_dict() for c in result.components]
     out["scored_by"] = "deterministic"
+
+    # Pull the required-skill counts out of the skills component (if it
+    # ran). Store have/total/pct so _compute_job_summaries can read them.
+    skills_comp = next(
+        (c for c in result.components if c.key == "skills"), None
+    )
+    if skills_comp is not None and skills_comp.extra:
+        have = skills_comp.extra.get("req_matched")
+        total = skills_comp.extra.get("req_total")
+        if isinstance(have, int) and isinstance(total, int) and total > 0:
+            out["skill_match_have"] = have
+            out["skill_match_total"] = total
+            out["skill_match_pct"] = int(round(100 * have / total))
+        else:
+            # No required skills surfaced (e.g. JD not analyzed yet).
+            # Clear stale values so the tracker shows "—" rather than an
+            # outdated number.
+            out.pop("skill_match_have", None)
+            out.pop("skill_match_total", None)
+            out.pop("skill_match_pct", None)
     job.fit_summary = out

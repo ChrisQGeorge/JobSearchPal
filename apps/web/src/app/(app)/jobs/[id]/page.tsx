@@ -139,7 +139,9 @@ export default function JobDetailPage({
           <ReviewAction
             jobId={job.id}
             status={job.status}
-            onStatusChanged={(s) => patch({ status: s })}
+            onStatusChanged={(s) =>
+              setJob((prev) => (prev ? { ...prev, status: s } : prev))
+            }
           />
           <MoveToApplyButton
             status={job.status}
@@ -150,7 +152,9 @@ export default function JobDetailPage({
           <ApplyAction
             jobId={job.id}
             status={job.status}
-            onStatusChanged={(s) => patch({ status: s })}
+            onStatusChanged={(s) =>
+              setJob((prev) => (prev ? { ...prev, status: s } : prev))
+            }
           />
           <WriteDocButton jobId={job.id} docType="resume" label="Write resume" />
           <WriteDocButton
