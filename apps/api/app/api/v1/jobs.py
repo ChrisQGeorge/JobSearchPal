@@ -25,6 +25,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 log = logging.getLogger(__name__)
 
@@ -252,8 +253,42 @@ async def _compute_job_summaries(
     inside a single session (jobs + counts + prefs in one round-trip)
     without us forking and drifting two implementations.
     """
-    stmt = select(TrackedJob).where(
-        TrackedJob.user_id == user.id, TrackedJob.deleted_at.is_(None)
+    # Load ONLY the columns the summary row renders. `select(TrackedJob)`
+    # pulls every column — including job_description (full JD Text, often
+    # several KB each) plus notes / equity_notes / description and the
+    # other unused Text/JSON blobs. At a few thousand jobs that's tens of
+    # MB shipped just to draw a list. load_only keeps these as ORM objects
+    # (so the JSON-reading logic below is unchanged) while deferring the
+    # heavy columns we never touch here. fit_summary / jd_analysis /
+    # required_skills ARE listed because the derived fields need them.
+    stmt = (
+        select(TrackedJob)
+        .options(
+            load_only(
+                TrackedJob.title,
+                TrackedJob.status,
+                TrackedJob.priority,
+                TrackedJob.remote_policy,
+                TrackedJob.location,
+                TrackedJob.organization_id,
+                TrackedJob.date_applied,
+                TrackedJob.date_discovered,
+                TrackedJob.updated_at,
+                TrackedJob.salary_min,
+                TrackedJob.salary_max,
+                TrackedJob.salary_currency,
+                TrackedJob.experience_level,
+                TrackedJob.experience_years_min,
+                TrackedJob.experience_years_max,
+                TrackedJob.employment_type,
+                TrackedJob.fit_summary,
+                TrackedJob.jd_analysis,
+                TrackedJob.required_skills,
+            )
+        )
+        .where(
+            TrackedJob.user_id == user.id, TrackedJob.deleted_at.is_(None)
+        )
     )
     if status:
         _validate_status(status)
