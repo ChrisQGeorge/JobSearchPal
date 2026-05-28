@@ -29,7 +29,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import SessionLocal, get_db
@@ -102,6 +102,30 @@ class GeneratedDocumentOut(BaseModel):
     version: int
     parent_version_id: Optional[int] = None
     humanized: bool
+    model_used: Optional[str] = None
+    persona_id: Optional[int] = None
+    source_skill: Optional[str] = None
+    tags: Optional[list[str]] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class GeneratedDocumentSummary(BaseModel):
+    """List-view shape — everything the documents list renders, MINUS the
+    heavy `content_md` body. At hundreds of docs, shipping every full
+    document just to render a list of titles was wasteful. `has_text`
+    (computed server-side) tells the UI whether the doc is humanizable
+    without transferring the text itself. Fetch the full doc via
+    GET /documents/{id} when actually opening it."""
+    id: int
+    tracked_job_id: Optional[int] = None
+    doc_type: str
+    title: str
+    content_structured: Optional[Any] = None
+    version: int
+    parent_version_id: Optional[int] = None
+    humanized: bool
+    has_text: bool
     model_used: Optional[str] = None
     persona_id: Optional[int] = None
     source_skill: Optional[str] = None
@@ -231,15 +255,38 @@ async def create_document_manual(
     return doc
 
 
-@router.get("", response_model=list[GeneratedDocumentOut])
+@router.get("", response_model=list[GeneratedDocumentSummary])
 async def list_documents(
     tracked_job_id: Optional[int] = None,
     doc_type: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
-) -> list[GeneratedDocument]:
+) -> list[GeneratedDocumentSummary]:
+    # Select narrow columns only — never the `content_md` TEXT body. At
+    # hundreds of docs, shipping every full body just to render a list was
+    # the dominant cost. `has_text` is computed in SQL so the UI can decide
+    # humanize-eligibility without the text crossing the wire.
+    has_text = (
+        func.coalesce(func.length(func.trim(GeneratedDocument.content_md)), 0) > 0
+    ).label("has_text")
     stmt = (
-        select(GeneratedDocument)
+        select(
+            GeneratedDocument.id,
+            GeneratedDocument.tracked_job_id,
+            GeneratedDocument.doc_type,
+            GeneratedDocument.title,
+            GeneratedDocument.content_structured,
+            GeneratedDocument.version,
+            GeneratedDocument.parent_version_id,
+            GeneratedDocument.humanized,
+            has_text,
+            GeneratedDocument.model_used,
+            GeneratedDocument.persona_id,
+            GeneratedDocument.source_skill,
+            GeneratedDocument.tags,
+            GeneratedDocument.created_at,
+            GeneratedDocument.updated_at,
+        )
         .where(
             GeneratedDocument.user_id == user.id,
             GeneratedDocument.deleted_at.is_(None),
@@ -250,7 +297,8 @@ async def list_documents(
         stmt = stmt.where(GeneratedDocument.tracked_job_id == tracked_job_id)
     if doc_type is not None:
         stmt = stmt.where(GeneratedDocument.doc_type == doc_type)
-    return list((await db.execute(stmt)).scalars().all())
+    rows = (await db.execute(stmt)).mappings().all()
+    return [GeneratedDocumentSummary(**row) for row in rows]
 
 
 @router.get("/{doc_id:int}", response_model=GeneratedDocumentOut)

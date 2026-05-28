@@ -409,6 +409,9 @@ export type GeneratedDocument = {
   doc_type: DocType;
   title: string;
   content_md?: string | null;
+  // Present only on the detail fetch (GET /documents/{id}). The list
+  // endpoint omits the body and ships `has_text` instead.
+  has_text?: boolean;
   content_structured?: unknown;
   version: number;
   parent_version_id?: number | null;

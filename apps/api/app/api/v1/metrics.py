@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select
+from sqlalchemy import and_, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -39,82 +39,135 @@ class SnapshotOut(BaseModel):
 
 async def _compute_snapshot(db: AsyncSession, user_id: int) -> dict[str, Any]:
     today = date.today()
-    # Select only the columns the aggregates need — NOT full ORM rows.
-    # The full row drags job_description (Text) + jd_analysis +
-    # fit_summary (JSON) along, which at a few thousand jobs is megabytes
-    # of payload to count statuses. These four columns are all we touch.
-    rows = (
+    week_ago = today - timedelta(days=7)
+    thirty_ago = today - timedelta(days=30)
+
+    # Do the counting in MySQL, not in Python. Previously we pulled every
+    # job's (status, date_applied, updated_at) back and looped — at a few
+    # thousand jobs that's thousands of rows over the wire just to produce
+    # ~12 numbers. Conditional aggregates push the whole rollup into the
+    # engine; only the scalar result row comes back. (This is what a SQL
+    # view would buy us too — a view is just this query saved server-side.
+    # It wouldn't *cache* anything; MetricSnapshot is our cache layer.)
+    applied = TrackedJob.date_applied.isnot(None)
+    responded = and_(applied, TrackedJob.status.in_(POST_APPLY))
+    ttr = func.datediff(TrackedJob.updated_at, TrackedJob.date_applied)
+    agg = (
         await db.execute(
             select(
-                TrackedJob.status,
-                TrackedJob.date_applied,
-                TrackedJob.updated_at,
+                func.count().label("total_jobs"),
+                func.coalesce(func.sum(case((applied, 1), else_=0)), 0).label(
+                    "applied_count"
+                ),
+                func.coalesce(func.sum(case((responded, 1), else_=0)), 0).label(
+                    "responded_count"
+                ),
+                func.coalesce(
+                    func.sum(
+                        case((TrackedJob.status.in_(("offer", "won")), 1), else_=0)
+                    ),
+                    0,
+                ).label("offers_count"),
+                func.coalesce(
+                    func.sum(case((TrackedJob.status == "won", 1), else_=0)), 0
+                ).label("wins_count"),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (and_(applied, TrackedJob.date_applied >= week_ago), 1),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ).label("applied_this_week"),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (and_(applied, TrackedJob.date_applied >= thirty_ago), 1),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ).label("applied_30d"),
+                func.avg(
+                    case(
+                        (
+                            and_(
+                                responded,
+                                TrackedJob.updated_at.isnot(None),
+                                ttr >= 0,
+                            ),
+                            ttr,
+                        ),
+                        else_=None,
+                    )
+                ).label("avg_ttr"),
             ).where(
                 TrackedJob.user_id == user_id,
                 TrackedJob.deleted_at.is_(None),
             )
         )
-    ).all()
-    status_counts: dict[str, int] = {}
-    applied_count = 0
-    responded_count = 0
-    offers_count = 0
-    wins_count = 0
-    ttr_days: list[float] = []
-    applied_this_week = 0
-    applied_30d = 0
-    week_ago_pre = today - timedelta(days=7)
-    thirty_ago_pre = today - timedelta(days=30)
-    for status_v, date_applied_v, updated_at_v in rows:
-        status_counts[status_v] = status_counts.get(status_v, 0) + 1
-        if status_v in ("offer", "won"):
-            offers_count += 1
-        if status_v == "won":
-            wins_count += 1
-        if date_applied_v:
-            applied_count += 1
-            if status_v in POST_APPLY:
-                responded_count += 1
-                if updated_at_v:
-                    d = (updated_at_v.date() - date_applied_v).days
-                    if d >= 0:
-                        ttr_days.append(d)
-            if date_applied_v >= week_ago_pre:
-                applied_this_week += 1
-            if date_applied_v >= thirty_ago_pre:
-                applied_30d += 1
-    total_jobs = len(rows)
-    rounds = list(
-        (
+    ).one()
+
+    # Per-status breakdown: one GROUP BY, a row per distinct status.
+    status_counts = {
+        s: c
+        for s, c in (
             await db.execute(
-                select(InterviewRound)
-                .join(TrackedJob, TrackedJob.id == InterviewRound.tracked_job_id)
+                select(TrackedJob.status, func.count())
                 .where(
                     TrackedJob.user_id == user_id,
-                    InterviewRound.deleted_at.is_(None),
+                    TrackedJob.deleted_at.is_(None),
                 )
+                .group_by(TrackedJob.status)
             )
-        ).scalars().all()
-    )
-    rounds_passed = sum(1 for r in rounds if r.outcome == "passed")
-    rounds_failed = sum(1 for r in rounds if r.outcome == "failed")
+        ).all()
+    }
+
+    # Interview rounds: same conditional-aggregate treatment.
+    round_agg = (
+        await db.execute(
+            select(
+                func.count().label("rounds_total"),
+                func.coalesce(
+                    func.sum(case((InterviewRound.outcome == "passed", 1), else_=0)),
+                    0,
+                ).label("rounds_passed"),
+                func.coalesce(
+                    func.sum(case((InterviewRound.outcome == "failed", 1), else_=0)),
+                    0,
+                ).label("rounds_failed"),
+            )
+            .select_from(InterviewRound)
+            .join(TrackedJob, TrackedJob.id == InterviewRound.tracked_job_id)
+            .where(
+                TrackedJob.user_id == user_id,
+                InterviewRound.deleted_at.is_(None),
+            )
+        )
+    ).one()
+
+    applied_count = int(agg.applied_count)
+    responded_count = int(agg.responded_count)
+    rounds_passed = int(round_agg.rounds_passed)
+    rounds_failed = int(round_agg.rounds_failed)
 
     return {
-        "total_jobs": total_jobs,
+        "total_jobs": int(agg.total_jobs),
         "status_counts": status_counts,
         "applied_count": applied_count,
         "responded_count": responded_count,
         "response_rate": round(responded_count / applied_count * 100, 1)
         if applied_count
         else None,
-        "offers_count": offers_count,
-        "wins_count": wins_count,
-        "applied_this_week": applied_this_week,
-        "applied_last_30_days": applied_30d,
-        "avg_days_to_response": round(sum(ttr_days) / len(ttr_days), 1)
-        if ttr_days
+        "offers_count": int(agg.offers_count),
+        "wins_count": int(agg.wins_count),
+        "applied_this_week": int(agg.applied_this_week),
+        "applied_last_30_days": int(agg.applied_30d),
+        "avg_days_to_response": round(float(agg.avg_ttr), 1)
+        if agg.avg_ttr is not None
         else None,
-        "rounds_total": len(rounds),
+        "rounds_total": int(round_agg.rounds_total),
         "rounds_passed": rounds_passed,
         "rounds_failed": rounds_failed,
         "round_pass_rate": round(rounds_passed / (rounds_passed + rounds_failed) * 100, 1)
@@ -186,33 +239,40 @@ async def funnel_by_source(
     at status=onsite has reached applied + phone_screen + onsite. The
     funnel doesn't count jobs that bypassed `applied` (e.g. recruiter
     inbound that skipped straight to interest)."""
-    # Only need status + source_platform — not the full rows (which drag
-    # job_description / jd_analysis / fit_summary along). Bucket statuses
-    # per source as a list of plain status strings.
-    rows = (
+    # GROUP BY in the engine: one row per (source_platform, status) with a
+    # count — at most a few dozen rows regardless of pipeline size, versus
+    # one row per job. Bucketing then operates on those small counts.
+    grouped = (
         await db.execute(
-            select(TrackedJob.status, TrackedJob.source_platform).where(
+            select(
+                TrackedJob.source_platform,
+                TrackedJob.status,
+                func.count().label("n"),
+            )
+            .where(
                 TrackedJob.user_id == user.id,
                 TrackedJob.deleted_at.is_(None),
             )
+            .group_by(TrackedJob.source_platform, TrackedJob.status)
         )
     ).all()
 
     # Bucket by source_platform. Empty / None collapses to "(unknown)" so
     # the user can see how much of their pipeline is unattributed.
-    by_source: dict[str, list[str]] = {}
-    for status_v, source_platform_v in rows:
+    by_source: dict[str, dict[str, int]] = {}
+    for source_platform_v, status_v, n in grouped:
         key = (source_platform_v or "").strip() or "(unknown)"
-        by_source.setdefault(key, []).append(status_v)
+        bucket = by_source.setdefault(key, {})
+        bucket[status_v] = bucket.get(status_v, 0) + int(n)
 
     out: list[FunnelBySourceRowOut] = []
-    for source, statuses in by_source.items():
+    for source, status_counts in by_source.items():
         applied_count = sum(
-            1 for s in statuses if s in _FUNNEL_STAGES[0][1]
+            c for s, c in status_counts.items() if s in _FUNNEL_STAGES[0][1]
         )
         stages: list[FunnelStageOut] = []
         for stage, accepted in _FUNNEL_STAGES:
-            n = sum(1 for s in statuses if s in accepted)
+            n = sum(c for s, c in status_counts.items() if s in accepted)
             rate = (
                 round(100 * n / applied_count, 1) if applied_count else None
             )
@@ -222,7 +282,7 @@ async def funnel_by_source(
         out.append(
             FunnelBySourceRowOut(
                 source=source,
-                total=len(statuses),
+                total=sum(status_counts.values()),
                 stages=stages,
             )
         )

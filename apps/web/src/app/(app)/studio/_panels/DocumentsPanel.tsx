@@ -119,25 +119,21 @@ export function DocumentsPanel() {
     });
   }
 
-  // Skip rows that aren't humanizable: uploads with no extracted text, or
-  // already-humanized versions (humanize is idempotent-ish, but the user
-  // probably means "the ones that aren't done yet"). Show a warning if the
-  // selection has skip-eligible rows so the user can adjust if they meant
-  // those too.
+  // The only rows we can't humanize are ones with no text at all (e.g.
+  // uploads where extraction failed). Already-humanized docs ARE eligible:
+  // re-running just produces another pass, and if the text is already as
+  // human as it gets, the same text comes back out — no harm. `has_text`
+  // comes from the list endpoint, which omits the heavy body.
   async function batchHumanize() {
     const targets = filtered.filter(
-      (d) =>
-        selectedIds.has(d.id) &&
-        !!d.content_md &&
-        d.content_md.trim().length > 0 &&
-        !d.humanized,
+      (d) => selectedIds.has(d.id) && d.has_text !== false,
     );
     const skipped =
       [...selectedIds].length - targets.length;
     if (targets.length === 0) {
       setBatchMsg(
         skipped > 0
-          ? "Nothing to humanize — all selected rows are uploads with no text or already humanized."
+          ? "Nothing to humanize — all selected rows are uploads with no extracted text."
           : "Nothing selected.",
       );
       return;
@@ -293,7 +289,7 @@ export function DocumentsPanel() {
             className="jsp-btn-primary text-xs"
             onClick={batchHumanize}
             disabled={batchRunning}
-            title="Run humanize against every selected doc that has text and isn't already humanized"
+            title="Run humanize against every selected doc that has text"
           >
             {batchRunning ? "Queuing…" : "Humanize all"}
           </button>
