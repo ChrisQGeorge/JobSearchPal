@@ -21,16 +21,24 @@ Liveness: pool_pre_ping is ON. If MySQL restarts (e.g. the host OOM-kills
 it under load — the parallel Claude CLIs + a big query can spike memory),
 every connection already in the pool is now dead. Without pre-ping the
 pool keeps handing those dead sockets out and every request fails with
-"Lost connection to MySQL server during query" until pool_recycle finally
-ages them out — a cascade that doesn't self-heal for up to an hour. With
-pre-ping, SQLAlchemy issues a cheap liveness check on checkout, silently
-discards a dead connection, and opens a fresh one. A prior comment here
-claimed pre-ping was "broken on aiomysql"; that wasn't borne out by the
-documented history (which is about NullPool vs QueuePool) and it works
-correctly on SQLAlchemy 2.0's async engine.
+"Lost connection to MySQL server during query". With pre-ping, SQLAlchemy
+issues a cheap liveness check on checkout, silently discards a dead
+connection, and opens a fresh one.
+
+The aiomysql ping bug (and why we override do_ping): a prior comment here
+said pre-ping was "broken on aiomysql" — that part was RIGHT. SQLAlchemy's
+stock MySQL `do_ping` calls `dbapi_connection.ping()` with no arguments,
+but the aiomysql async adapter exposes `ping(reconnect)` with no default,
+so pre-ping raised `TypeError: ping() missing 1 required positional
+argument: 'reconnect'` and 500'd every DB request. We override do_ping to
+pass `reconnect=False` explicitly — which is also the semantically correct
+value: we want a dead connection to RAISE so SQLAlchemy recycles it, not
+have aiomysql silently reconnect under the pool's feet. The try/except
+covers adapter signature differences across SQLAlchemy versions.
 """
 from __future__ import annotations
 
+import types
 from typing import AsyncIterator
 
 from sqlalchemy.ext.asyncio import (
@@ -59,6 +67,29 @@ engine = create_async_engine(
     # indefinitely; fail fast so pre-ping can retry with a fresh socket.
     connect_args={"connect_timeout": 10},
     echo=False,
+)
+
+
+def _aiomysql_do_ping(_dialect, dbapi_connection) -> bool:
+    """Pre-ping liveness check that works with the aiomysql adapter.
+
+    See module docstring: the stock do_ping calls ping() with no args,
+    which the aiomysql adapter rejects. Pass reconnect=False explicitly;
+    fall back to the no-arg form for adapter versions that take no param.
+    A dead connection raises here, which is exactly what tells the pool to
+    discard and replace it.
+    """
+    try:
+        dbapi_connection.ping(False)
+    except TypeError:
+        dbapi_connection.ping()
+    return True
+
+
+# Bind the override onto the engine's dialect — this is the same dialect
+# instance the pool consults for pre-ping (pool._dialect.do_ping).
+engine.sync_engine.dialect.do_ping = types.MethodType(
+    _aiomysql_do_ping, engine.sync_engine.dialect
 )
 
 SessionLocal = async_sessionmaker(
