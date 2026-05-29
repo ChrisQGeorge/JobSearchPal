@@ -48,29 +48,49 @@ ACTIONS: tuple[tuple[str, str], ...] = (
 )
 _VALID_KEYS = frozenset(k for k, _ in ACTIONS)
 
-# Models we surface in the Settings dropdown. Order = most → least capable.
-# An empty string means "use the global default" (env or CLI default).
-SUPPORTED_MODELS: tuple[tuple[str, str], ...] = (
-    ("", "Default (ANTHROPIC_DEFAULT_MODEL env var)"),
-    ("claude-opus-4-7", "Claude Opus 4.7 (most capable, slowest, priciest)"),
-    ("claude-sonnet-4-6", "Claude Sonnet 4.6 (balanced)"),
-    ("claude-haiku-4-5-20251001", "Claude Haiku 4.5 (fastest, cheapest)"),
+# Models we surface in the Settings dropdown.
+#
+# Why aliases, not pinned version IDs: the Claude Code CLI has no way to
+# *enumerate* available models (no `claude models`, no JSON catalogue, no
+# on-disk list — that only exists on the Anthropic API, which this app
+# deliberately never calls). But the CLI's `--model` flag accepts tier
+# aliases that auto-resolve to the newest release of each tier. So
+# `--model opus` is Opus 4.8 today and whatever ships next with zero code
+# changes — which is exactly the "new models show up automatically" goal,
+# achieved purely through the CLI. Labels avoid version numbers for the
+# same reason (they'd go stale). Power users can still pin an exact version
+# ID via the API/settings file; see the relaxed validation below.
+#
+# Order = most → least capable. "" means "use the global default".
+MODEL_CHOICES: tuple[tuple[str, str], ...] = (
+    ("", "Default (ANTHROPIC_DEFAULT_MODEL, else the CLI's own default)"),
+    ("best", "Best available — most capable model (tracks the newest release)"),
+    ("opus", "Opus — latest (most capable, slowest, priciest)"),
+    ("sonnet", "Sonnet — latest (balanced)"),
+    ("haiku", "Haiku — latest (fastest, cheapest)"),
+    ("opus[1m]", "Opus — latest, 1M-token context (long JDs / resumes)"),
+    ("sonnet[1m]", "Sonnet — latest, 1M-token context"),
 )
-_VALID_MODELS = frozenset(m for m, _ in SUPPORTED_MODELS)
 
 
 def _load_raw() -> dict[str, str]:
-    """Read the per-action map from disk. Returns {} on any error."""
+    """Read the per-action map from disk. Returns {} on any error.
+
+    Values are NOT checked against a fixed allow-list: the model space is
+    open-ended (new aliases/versions appear over time) and the CLI is the
+    real validator at run time. We only sanity-check the action key and
+    that the value is a non-empty string, so a legacy pinned ID (e.g.
+    "claude-opus-4-7") set before we moved to aliases is preserved rather
+    than silently dropped.
+    """
     try:
         data = json.loads(_PATH.read_text())
         models = data.get("models") or {}
         if isinstance(models, dict):
-            # Drop unknown keys / unknown values defensively so a stale
-            # settings file from a previous schema can't poison resolution.
             return {
-                k: v
+                k: v.strip()
                 for k, v in models.items()
-                if k in _VALID_KEYS and isinstance(v, str) and v in _VALID_MODELS
+                if k in _VALID_KEYS and isinstance(v, str) and v.strip()
             }
         return {}
     except (FileNotFoundError, json.JSONDecodeError, OSError):
@@ -97,20 +117,17 @@ def get_all() -> dict[str, str]:
 
 
 def set_all(mapping: dict[str, str]) -> dict[str, str]:
-    """Replace the per-action map. Silently drops unknown keys / unknown
-    model ids so a malformed PUT can't break resolution. Returns the
-    sanitized map that was actually persisted."""
+    """Replace the per-action map. Drops unknown action keys and empty
+    values (empty = "fall back to the global default", so storing it would
+    just waste space). Model values are accepted as-is (any non-empty
+    string) — the CLI validates them at run time and the model space is
+    open-ended. Returns the sanitized map that was actually persisted."""
     sanitized: dict[str, str] = {}
     for k, v in (mapping or {}).items():
         if k not in _VALID_KEYS:
             continue
-        if not isinstance(v, str):
-            continue
-        if v == "" or v in _VALID_MODELS:
-            # Only keep non-empty overrides — empty means "fall back to
-            # global default" so writing it would just waste space.
-            if v:
-                sanitized[k] = v
+        if isinstance(v, str) and v.strip():
+            sanitized[k] = v.strip()
     try:
         _PATH.parent.mkdir(parents=True, exist_ok=True)
         _PATH.write_text(json.dumps({"models": sanitized}, indent=2))

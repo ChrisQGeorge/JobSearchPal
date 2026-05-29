@@ -3120,7 +3120,7 @@ async def get_model_settings(_: User = Depends(get_current_user)) -> dict:
         "models": _ms.get_all(),
         "actions": [{"key": k, "label": label} for k, label in _ms.ACTIONS],
         "model_choices": [
-            {"id": mid, "label": label} for mid, label in _ms.SUPPORTED_MODELS
+            {"id": mid, "label": label} for mid, label in _ms.MODEL_CHOICES
         ],
     }
 
@@ -3139,7 +3139,7 @@ async def put_model_settings(
         "models": saved,
         "actions": [{"key": k, "label": label} for k, label in _ms.ACTIONS],
         "model_choices": [
-            {"id": mid, "label": label} for mid, label in _ms.SUPPORTED_MODELS
+            {"id": mid, "label": label} for mid, label in _ms.MODEL_CHOICES
         ],
     }
 

@@ -810,12 +810,16 @@ export function ModelPickerPanel() {
           Claude model per action
         </h2>
         <p className="text-[11px] text-corp-muted mt-1 max-w-2xl">
-          Route different work to different Claude models. Cheap fetches via
-          Haiku 4.5, resume writing via Opus 4.7, JD analysis via Sonnet 4.6,
-          etc. All requests still go through the Claude Code CLI
-          (<code>claude -p --model …</code>); no Anthropic API SDK is involved.
-          Leave a row on <strong>Default</strong> to fall back to
-          <code> ANTHROPIC_DEFAULT_MODEL</code>.
+          Route different work to different Claude models — cheap fetches via
+          Haiku, resume writing via Opus, JD analysis via Sonnet, etc. The
+          options are tier <em>aliases</em> that always resolve to the newest
+          release of that tier: pick <strong>Opus</strong> and you get Opus 4.8
+          today and whatever ships next automatically — no update needed.
+          (The CLI can&apos;t list exact versions, so there&apos;s nothing to
+          enumerate; aliases are how you stay current.) All requests still go
+          through the Claude Code CLI (<code>claude -p --model …</code>); no
+          Anthropic API SDK is involved. Leave a row on <strong>Default</strong>
+          {" "}to fall back to <code>ANTHROPIC_DEFAULT_MODEL</code>.
         </p>
       </header>
 
@@ -839,6 +843,14 @@ export function ModelPickerPanel() {
                   {c.label}
                 </option>
               ))}
+              {/* A previously-saved exact version (pinned before we moved to
+                  aliases) won't be in model_choices — surface it so the row
+                  shows the real current value and the user can keep or change
+                  it instead of it silently appearing as Default. */}
+              {draft[a.key] &&
+              !state.model_choices.some((c) => c.id === draft[a.key]) ? (
+                <option value={draft[a.key]}>{draft[a.key]} (pinned)</option>
+              ) : null}
             </select>
           </li>
         ))}
