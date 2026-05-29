@@ -66,3 +66,39 @@ export const api = {
     request<T>(path, { method: "PUT", body: body ? JSON.stringify(body) : undefined }),
   delete: <T>(path: string) => request<T>(path, { method: "DELETE" }),
 };
+
+/**
+ * Run `fn` over `items` with at most `limit` in flight at once, mirroring
+ * Promise.allSettled's result shape (settled in input order).
+ *
+ * Why this exists: bulk actions (tailor / status-change across a multi-select)
+ * used to fire every request at once via Promise.allSettled. Selecting ~25
+ * jobs × 2 doc types = 50 simultaneous POSTs, each holding a DB pool
+ * connection — well past the API's 30-connection pool, so the pool times out
+ * and unrelated requests (even /auth/me) 500 in the crossfire. Capping
+ * concurrency keeps the burst under the pool ceiling while still parallelizing.
+ */
+export async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results: PromiseSettledResult<R>[] = new Array(items.length);
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    while (cursor < items.length) {
+      const i = cursor++;
+      try {
+        results[i] = { status: "fulfilled", value: await fn(items[i], i) };
+      } catch (reason) {
+        results[i] = { status: "rejected", reason };
+      }
+    }
+  };
+  const workers = Array.from(
+    { length: Math.max(1, Math.min(limit, items.length)) },
+    () => worker(),
+  );
+  await Promise.all(workers);
+  return results;
+}

@@ -827,6 +827,15 @@ async def _handle_score(item: JobFetchQueue) -> None:
 
         data = _extract_json_object(final_text) or {}
         if not data:
+            # A usage/rate-limit cap is delivered by the CLI as a normal
+            # exit-0 result ("You've hit your session limit · resets 5:50pm"),
+            # NOT a non-zero exit — so it slips past the except-ClaudeCodeError
+            # branch above and lands here. Detect it on the success path too
+            # and PARK the task (cooldown + auto-resume) instead of burning it
+            # as a permanent failure.
+            if _is_rate_limited(final_text):
+                await _handle_rate_limit(db, row, final_text)
+                return
             # Include a snippet of what Claude actually returned so the
             # user can see whether it's hitting a rate-limit message, a
             # tool error, or just emitting prose instead of JSON.
@@ -1006,6 +1015,14 @@ async def _handle_tailor(item: JobFetchQueue) -> None:
         data = _extract_json_object(final_text) or {}
         content_md = (data.get("content_md") or "").strip()
         if not content_md:
+            # Usage-cap message comes back as a successful (exit-0) result,
+            # not a ClaudeCodeError — so catch it here and park for cooldown
+            # rather than burning the doc as errored + retrying 3× into the
+            # same cap. The placeholder stays in its "generating" state and
+            # the task auto-resumes when the window reopens.
+            if _is_rate_limited(final_text):
+                await _handle_rate_limit(db, row, final_text)
+                return
             msg = "Tailoring returned no content."
             await _fail(db, row, msg)
             await _mark_doc(
@@ -1124,6 +1141,11 @@ async def _handle_humanize(item: JobFetchQueue) -> None:
         data = _extract_json_object(final_text) or {}
         content_md = (data.get("content_md") or "").strip()
         if not content_md:
+            # Exit-0 usage-cap message path — park for cooldown instead of
+            # erroring the doc (see _handle_tailor).
+            if _is_rate_limited(final_text):
+                await _handle_rate_limit(db, row, final_text)
+                return
             await _fail(db, row, "Humanizer returned no content.")
             await _mark_doc(
                 doc_id,
@@ -1407,6 +1429,11 @@ async def _handle_prep(item: JobFetchQueue) -> None:
 
         data = _extract_json_object(final_text) or {}
         if not data:
+            # Exit-0 usage-cap message path — park for cooldown instead of a
+            # permanent failure (see _handle_score).
+            if _is_rate_limited(final_text):
+                await _handle_rate_limit(db, row, final_text)
+                return
             snippet = (final_text or "").strip()
             if len(snippet) > 600:
                 snippet = snippet[:300] + " […] " + snippet[-300:]

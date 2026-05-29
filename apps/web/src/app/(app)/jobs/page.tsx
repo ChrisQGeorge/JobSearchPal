@@ -15,7 +15,12 @@ import { PageShell } from "@/components/PageShell";
 import { Paginator, usePagination } from "@/components/Paginator";
 import { SkillsAnalysis } from "@/components/SkillsAnalysis";
 import { StatusBadge, STATUS_STYLES } from "@/components/StatusBadge";
-import { api, ApiError } from "@/lib/api";
+import { api, ApiError, mapWithConcurrency } from "@/lib/api";
+
+// Cap on simultaneous bulk requests. Kept well under the API's DB pool
+// (15 + 15 overflow) so a big multi-select can't exhaust it and 500
+// unrelated requests. 6 parallelizes meaningfully while leaving headroom.
+const BULK_CONCURRENCY = 6;
 import {
   EDUCATION_REQUIRED,
   EMPLOYMENT_TYPES,
@@ -293,10 +298,8 @@ export default function JobTrackerPage() {
     if (ids.length === 0 || !target) return;
     setBulkRunning(true);
     setBulkMsg(null);
-    const results = await Promise.allSettled(
-      ids.map((id) =>
-        api.put(`/api/v1/jobs/${id}`, { status: target }),
-      ),
+    const results = await mapWithConcurrency(ids, BULK_CONCURRENCY, (id) =>
+      api.put(`/api/v1/jobs/${id}`, { status: target }),
     );
     const ok = results.filter((r) => r.status === "fulfilled").length;
     const fail = results.length - ok;
@@ -324,14 +327,13 @@ export default function JobTrackerPage() {
     if (ids.length === 0 || docTypes.length === 0) return;
     setBulkRunning(true);
     setBulkMsg(null);
-    const results = await Promise.allSettled(
-      ids.flatMap((id) =>
-        docTypes.map((doc_type) =>
-          api.post<{ id: number }>(`/api/v1/documents/tailor/${id}`, {
-            doc_type,
-          }),
-        ),
-      ),
+    // Flatten (job × doc_type) into one work-list, then run bounded — firing
+    // all of them at once exhausted the DB pool (see mapWithConcurrency).
+    const jobs = ids.flatMap((id) =>
+      docTypes.map((doc_type) => ({ id, doc_type })),
+    );
+    const results = await mapWithConcurrency(jobs, BULK_CONCURRENCY, ({ id, doc_type }) =>
+      api.post<{ id: number }>(`/api/v1/documents/tailor/${id}`, { doc_type }),
     );
     const ok = results.filter((r) => r.status === "fulfilled").length;
     const fail = results.length - ok;
