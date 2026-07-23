@@ -61,15 +61,21 @@ _VALID_KEYS = frozenset(k for k, _ in ACTIONS)
 # same reason (they'd go stale). Power users can still pin an exact version
 # ID via the API/settings file; see the relaxed validation below.
 #
+# Exception: Sonnet is deliberately PINNED to 4.6 (not the latest-tracking
+# `sonnet` alias) — a product choice to hold the Sonnet tier at the 4.x
+# generation rather than auto-upgrading to Sonnet 5.
+#
 # Order = most → least capable. "" means "use the global default".
 MODEL_CHOICES: tuple[tuple[str, str], ...] = (
     ("", "Default (ANTHROPIC_DEFAULT_MODEL, else the CLI's own default)"),
     ("best", "Best available — most capable model (tracks the newest release)"),
-    ("opus", "Opus — latest (most capable, slowest, priciest)"),
-    ("sonnet", "Sonnet — latest (balanced)"),
+    ("fable", "Fable — deepest reasoning (long-horizon work, priciest)"),
+    ("opus", "Opus — latest (most capable, slower)"),
+    ("claude-sonnet-4-6", "Sonnet 4.6 (balanced; pinned)"),
     ("haiku", "Haiku — latest (fastest, cheapest)"),
+    ("fable[1m]", "Fable — 1M-token context"),
     ("opus[1m]", "Opus — latest, 1M-token context (long JDs / resumes)"),
-    ("sonnet[1m]", "Sonnet — latest, 1M-token context"),
+    ("claude-sonnet-4-6[1m]", "Sonnet 4.6 — 1M-token context"),
 )
 
 
