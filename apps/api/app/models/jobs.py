@@ -10,6 +10,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     JSON,
     Numeric,
@@ -145,6 +146,9 @@ class JobFetchQueue(Base, IdMixin, TimestampMixin):
     """
 
     __tablename__ = "job_fetch_queue"
+    # Composite for the activity feed's per-state counts (GROUP BY state
+    # filtered by user) and the bulk clear's delete-by-state (migration 0028).
+    __table_args__ = (Index("ix_job_fetch_queue_user_state", "user_id", "state"),)
 
     user_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True

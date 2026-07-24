@@ -66,17 +66,22 @@ export function FetchQueuePanel({ onJobCreated }: Props) {
     }
   }, [onJobCreated]);
 
+  // Adaptive poll: 3s only while something is actually processing; a
+  // merely-queued backlog drains one task at a time so 15s is plenty;
+  // idle-but-expanded ticks at 30s; collapsed + idle doesn't poll at all.
+  // Keying on the two booleans (not a join of every row's state) avoids
+  // rebuilding a giant dep string per render with a big queue.
+  const hasProcessing = items.some((i) => i.state === "processing");
+  const hasQueued = items.some((i) => i.state === "queued");
   useEffect(() => {
     refresh();
-    // Poll every 3s while any item is queued/processing, every 15s otherwise.
+    const ms = hasProcessing ? 3000 : hasQueued ? 15000 : 30000;
     const interval = setInterval(() => {
-      const active = items.some((i) => i.state === "queued" || i.state === "processing");
-      if (active) refresh();
-      else if (expanded) refresh();
-    }, 3000);
+      if (hasProcessing || hasQueued || expanded) refresh();
+    }, ms);
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refresh, items.map((i) => i.state).join(","), expanded]);
+  }, [refresh, hasProcessing, hasQueued, expanded]);
 
   async function enqueue(e: React.FormEvent) {
     e.preventDefault();
@@ -119,16 +124,15 @@ export function FetchQueuePanel({ onJobCreated }: Props) {
     if (targets.length === 0) return;
     if (
       !confirm(
-        `Remove ${targets.length} ${state} ${
-          targets.length === 1 ? "row" : "rows"
-        } from the fetch queue?`,
+        `Clear all ${state} rows from the queue? ` +
+          `(${targets.length} visible${targets.length >= 190 ? ", possibly more beyond the list cap" : ""})`,
       )
     ) {
       return;
     }
-    await Promise.allSettled(
-      targets.map((t) => api.delete(`/api/v1/jobs/queue/${t.id}`)),
-    );
+    // One server-side bulk delete instead of a burst of per-row DELETEs —
+    // also reaches rows past the endpoint's 200-row cap.
+    await api.post("/api/v1/jobs/queue/clear", { states: [state] });
     await refresh();
   }
 
@@ -389,7 +393,9 @@ export async function importExcel(file: File): Promise<{
   skipped_duplicates?: {
     row: number;
     url: string;
-    existing_job_id: number;
+    // null when the duplicate is a row already sitting in the fetch
+    // queue (not yet a TrackedJob); existing_title carries the note.
+    existing_job_id: number | null;
     existing_title: string;
   }[];
 }> {
@@ -434,7 +440,9 @@ export async function importQueueExcel(file: File): Promise<{
   skipped_duplicates?: {
     row: number;
     url: string;
-    existing_job_id: number;
+    // null when the duplicate is a row already sitting in the fetch
+    // queue (not yet a TrackedJob); existing_title carries the note.
+    existing_job_id: number | null;
     existing_title: string;
   }[];
 }> {

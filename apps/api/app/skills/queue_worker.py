@@ -31,7 +31,7 @@ import re
 from typing import Optional
 from datetime import datetime, time as _dt_time, timedelta, timezone
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, delete as sa_delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import SessionLocal
@@ -42,6 +42,13 @@ log = logging.getLogger(__name__)
 POLL_INTERVAL_SECONDS = 5
 STUCK_RESET_MINUTES = 20
 MAX_ATTEMPTS = 3
+# Finished rows are kept for a while as history on the /queue page, then
+# pruned so the table doesn't grow forever — the activity endpoints pay
+# per-row on every poll, and a bulk import can add thousands of rows.
+# Errors are kept longer so the user has time to notice and retry them.
+PRUNE_DONE_AFTER_DAYS = 7
+PRUNE_ERROR_AFTER_DAYS = 30
+PRUNE_INTERVAL_SECONDS = 24 * 3600
 
 # Substrings that indicate the CLI hit an Anthropic rate-limit / usage-cap
 # rather than a regular failure. We treat these as "try again later" and
@@ -211,6 +218,33 @@ async def _reset_stuck_rows() -> None:
                 result.rowcount,
                 STUCK_RESET_MINUTES,
             )
+
+
+async def _prune_old_rows() -> None:
+    """Delete long-finished queue rows (done > 7 days, error > 30 days,
+    by last activity). Runs at boot and then daily from the main loop."""
+    now = datetime.now(tz=timezone.utc)
+    async with SessionLocal() as db:
+        for state, days in (
+            ("done", PRUNE_DONE_AFTER_DAYS),
+            ("error", PRUNE_ERROR_AFTER_DAYS),
+        ):
+            cutoff = now - timedelta(days=days)
+            result = await db.execute(
+                sa_delete(JobFetchQueue).where(
+                    JobFetchQueue.state == state,
+                    func.coalesce(
+                        JobFetchQueue.last_attempt_at, JobFetchQueue.created_at
+                    )
+                    < cutoff,
+                )
+            )
+            if result.rowcount:
+                log.info(
+                    "Queue worker pruned %d '%s' row(s) older than %d day(s)",
+                    result.rowcount, state, days,
+                )
+        await db.commit()
 
 
 async def _claim_next(db: AsyncSession) -> JobFetchQueue | None:
@@ -1513,6 +1547,14 @@ async def run_forever() -> None:
     except Exception:  # pragma: no cover
         log.exception("Queue worker: stuck-row reset failed on boot")
 
+    import time as _time
+
+    try:
+        await _prune_old_rows()
+    except Exception:  # pragma: no cover
+        log.exception("Queue worker: prune failed on boot")
+    last_prune = _time.monotonic()
+
     running: set[asyncio.Task] = set()
 
     async def _supervised_process(item: JobFetchQueue) -> None:
@@ -1522,6 +1564,14 @@ async def run_forever() -> None:
             log.exception("Queue worker: _process raised unexpectedly")
 
     while True:
+        # Daily prune of long-finished rows. Cheap check per iteration.
+        if _time.monotonic() - last_prune >= PRUNE_INTERVAL_SECONDS:
+            last_prune = _time.monotonic()
+            try:
+                await _prune_old_rows()
+            except Exception:  # pragma: no cover
+                log.exception("Queue worker: periodic prune failed")
+
         # Wait for an open slot if we're at capacity. Re-read the limit
         # every cycle so changes from the UI apply immediately.
         if len(running) >= _ws.get_max_parallel():

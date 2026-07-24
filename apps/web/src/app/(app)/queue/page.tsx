@@ -39,6 +39,16 @@ type ActivityRow = {
   num_turns: number | null;
 };
 
+// Envelope from GET /jobs/activity. `rows` is capped server-side (~200);
+// `counts` covers the user's entire fetch-queue table so the KPI tiles
+// stay accurate past the cap. Companion bus rows are all in `rows`.
+type ActivityFeed = {
+  rows: ActivityRow[];
+  counts: Record<string, number>;
+  total: number;
+  next_resume_at: string | null;
+};
+
 const STATUS_STYLES: Record<string, string> = {
   queued: "bg-corp-surface2 text-corp-muted border-corp-border",
   running: "bg-sky-500/25 text-sky-300 border-sky-500/40 animate-pulse",
@@ -71,6 +81,8 @@ function isActive(it: ActivityRow): boolean {
 
 export default function QueuePage() {
   const [items, setItems] = useState<ActivityRow[]>([]);
+  const [dbCounts, setDbCounts] = useState<Record<string, number>>({});
+  const [serverNextResume, setServerNextResume] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [filter, setFilter] = useState<Filter>("active");
@@ -84,9 +96,11 @@ export default function QueuePage() {
 
   async function refresh() {
     try {
-      const data = await api.get<ActivityRow[]>("/api/v1/jobs/activity");
+      const data = await api.get<ActivityFeed>("/api/v1/jobs/activity");
       // Backend already sorts most-recent-first.
-      setItems(data);
+      setItems(data.rows);
+      setDbCounts(data.counts);
+      setServerNextResume(data.next_resume_at);
       setErr(null);
     } catch (e) {
       setErr(e instanceof ApiError ? `HTTP ${e.status}` : "Load failed.");
@@ -152,20 +166,25 @@ export default function QueuePage() {
     };
   }, []);
 
-  // Poll on a schedule: 3s when anything is actively moving, else 15s.
-  // The SSE covers companion tasks; polling is still needed for fetch rows,
-  // since JobFetchQueue's state transitions aren't funneled through the bus
-  // in every path.
+  // Adaptive poll schedule. Fast (3s) ONLY while something is actually
+  // executing — a deep queued backlog drains one task at a time, so its
+  // rows change on the minutes scale, and every poll costs the server a
+  // full queue sweep. Merely-queued/waiting → 15s; idle → 30s. The SSE
+  // stream covers live progress of the running task in between.
+  const hasProcessing = items.some(
+    (i) => i.status === "processing" || i.status === "running",
+  );
+  const hasPending =
+    (dbCounts["queued"] ?? 0) > 0 || items.some((i) => i.status === "queued");
   useEffect(() => {
     if (pollRef.current) clearInterval(pollRef.current);
-    const active = items.some(isActive);
-    const ms = active ? 3000 : 15000;
+    const ms = hasProcessing ? 3000 : hasPending ? 15000 : 30000;
     pollRef.current = setInterval(refresh, ms);
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [items.map((i) => i.status + (i.resume_after ?? "")).join(",")]);
+  }, [hasProcessing, hasPending]);
 
   async function enqueue(e: React.FormEvent) {
     e.preventDefault();
@@ -260,17 +279,16 @@ export default function QueuePage() {
   }
 
   async function dismissByStatus(status: "done" | "error") {
-    // Only fetch-queue rows have a delete endpoint; companion tasks
-    // are in-memory SSE state and disappear on next refresh anyway.
-    // We still drop matching companion rows from local state so the
-    // button feels responsive regardless of which kind is hidden.
-    const fetchTargets = items.filter(
-      (i) => i.status === status && i.kind === "fetch" && i.fetch_queue_id,
-    );
+    // DB-backed rows are cleared with ONE server-side bulk delete — the
+    // visible list is capped, so per-row deletes couldn't reach older
+    // rows (and a 2000-row backlog would mean 2000 round-trips).
+    // Companion tasks are in-memory SSE state; drop them locally so the
+    // button feels responsive.
+    const dbTotal = dbCounts[status] ?? 0;
     const companionTargets = items.filter(
-      (i) => i.status === status && i.kind === "companion",
+      (i) => i.status === status && i.id.startsWith("task:"),
     );
-    const total = fetchTargets.length + companionTargets.length;
+    const total = dbTotal + companionTargets.length;
     if (total === 0) return;
     if (
       !confirm(
@@ -279,12 +297,12 @@ export default function QueuePage() {
     ) {
       return;
     }
-    if (fetchTargets.length > 0) {
-      await Promise.allSettled(
-        fetchTargets.map((t) =>
-          api.delete(`/api/v1/jobs/queue/${t.fetch_queue_id}`),
-        ),
-      );
+    if (dbTotal > 0) {
+      try {
+        await api.post("/api/v1/jobs/queue/clear", { states: [status] });
+      } catch (e) {
+        setErr(e instanceof ApiError ? `HTTP ${e.status}` : "Clear failed.");
+      }
     }
     if (companionTargets.length > 0) {
       const dropIds = new Set(companionTargets.map((t) => t.id));
@@ -294,12 +312,21 @@ export default function QueuePage() {
   }
 
   const counts = useMemo(() => {
-    let active = 0;
-    let waiting = 0;
-    let done = 0;
-    let errored = 0;
-    let processing = 0;
+    // Fetch-queue states come from the server's whole-table counts (the
+    // rows list is capped at ~200). Companion bus rows are all present in
+    // items (bus registry is capped at 200 server-side) — count those
+    // client-side and add them in. DB rows have id "fetch:<n>", bus rows
+    // "task:<key>".
+    let waiting = dbCounts["waiting"] ?? 0;
+    let processing = dbCounts["processing"] ?? 0;
+    let done = dbCounts["done"] ?? 0;
+    let errored = dbCounts["error"] ?? 0;
+    let active = Math.max(0, (dbCounts["queued"] ?? 0) - waiting) + processing;
+    let total =
+      (dbCounts["queued"] ?? 0) + processing + done + errored;
     for (const it of items) {
+      if (!it.id.startsWith("task:")) continue;
+      total++;
       if (isWaiting(it)) waiting++;
       else if (it.status === "processing" || it.status === "running") {
         processing++;
@@ -308,8 +335,8 @@ export default function QueuePage() {
       else if (it.status === "done") done++;
       else if (it.status === "error" || it.status === "stale") errored++;
     }
-    return { active, waiting, done, errored, processing, total: items.length };
-  }, [items]);
+    return { active, waiting, done, errored, processing, total };
+  }, [items, dbCounts]);
 
   const visible = useMemo<ActivityRow[]>(() => {
     // Pick the rows for the active filter, then trim done-fetch rows
@@ -348,9 +375,15 @@ export default function QueuePage() {
 
   const hiddenDoneCount = Math.max(0, counts.done - 20);
 
-  // Soonest upcoming resume, for the "next resume in N min" hint.
+  // Soonest upcoming resume, for the "next resume in N min" hint. The
+  // server computes it over the whole table (visible rows are capped);
+  // fall back to scanning the visible rows if the field is absent.
   const nextResume = useMemo(() => {
     const now = Date.now();
+    if (serverNextResume) {
+      const t = new Date(serverNextResume).getTime();
+      if (t > now) return t;
+    }
     let best: number | null = null;
     for (const it of items) {
       if (!it.resume_after) continue;
@@ -358,7 +391,7 @@ export default function QueuePage() {
       if (t > now && (best === null || t < best)) best = t;
     }
     return best;
-  }, [items]);
+  }, [items, serverNextResume]);
 
   return (
     <PageShell

@@ -23,7 +23,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import delete as sa_delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
@@ -2853,7 +2853,11 @@ async def list_queue(
     """Legacy fetch-only view of the queue. Kind=score/tailor/… tasks have
     `url=""` which doesn't satisfy `JobFetchQueueOut.url` (min_length=8),
     so filter to the original fetch rows here. The unified activity feed
-    is at `GET /jobs/activity`."""
+    is at `GET /jobs/activity`.
+
+    Capped at the newest 200 rows — this endpoint is polled every few
+    seconds by the tracker page's FetchQueuePanel and the table can hold
+    thousands of rows after a bulk import."""
     stmt = (
         select(JobFetchQueue)
         .where(
@@ -2862,6 +2866,7 @@ async def list_queue(
             or_(JobFetchQueue.kind.is_(None), JobFetchQueue.kind == "fetch"),
         )
         .order_by(JobFetchQueue.id.desc())
+        .limit(200)
     )
     return list((await db.execute(stmt)).scalars().all())
 
@@ -2985,27 +2990,77 @@ def _fetch_queue_to_row(item: JobFetchQueue) -> ActivityRowOut:
     )
 
 
-@router.get("/activity", response_model=list[ActivityRowOut])
+class ActivityFeedOut(BaseModel):
+    """Envelope for the Companion Activity feed. `rows` is CAPPED (the
+    queue table can hold thousands of rows after a bulk import and this
+    endpoint is polled every few seconds — returning everything was
+    O(total-rows-ever) per poll and could drag the whole host down).
+    `counts` covers the user's entire job_fetch_queue table so the KPI
+    tiles stay accurate; in-memory companion-bus rows are all present in
+    `rows` (the bus registry is capped at 200) and are counted client-side.
+    """
+
+    rows: list[ActivityRowOut]
+    # Whole-table per-state counts: queued / processing / done / error,
+    # plus `waiting` (queued rows parked on a future resume_after).
+    counts: dict[str, int]
+    total: int
+    next_resume_at: Optional[datetime] = None
+
+
+@router.get("/activity", response_model=ActivityFeedOut)
 async def list_activity(
+    limit: int = Query(200, ge=1, le=1000),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
-) -> list[ActivityRowOut]:
+) -> ActivityFeedOut:
     """Unified Companion Activity feed: fetch-queue items + every in-flight
     / recent task from the Claude bus (tailor, humanize, score, research,
     chat, etc.). Sorted by updated_at descending so the most recently
-    active rows float to the top.
+    active rows float to the top. Queue rows are capped at `limit`;
+    per-state counts over the full table ride along in `counts`.
     """
     from app.skills import queue_bus as _bus
+
+    now = datetime.now(tz=timezone.utc)
 
     fetch_stmt = (
         select(JobFetchQueue)
         .where(JobFetchQueue.user_id == user.id)
         .order_by(JobFetchQueue.id.desc())
+        .limit(limit)
     )
     fetch_rows = [
         _fetch_queue_to_row(i)
         for i in (await db.execute(fetch_stmt)).scalars().all()
     ]
+
+    count_rows = (
+        await db.execute(
+            select(JobFetchQueue.state, func.count(JobFetchQueue.id))
+            .where(JobFetchQueue.user_id == user.id)
+            .group_by(JobFetchQueue.state)
+        )
+    ).all()
+    counts: dict[str, int] = {state: n for state, n in count_rows}
+    counts["waiting"] = (
+        await db.execute(
+            select(func.count(JobFetchQueue.id)).where(
+                JobFetchQueue.user_id == user.id,
+                JobFetchQueue.state == "queued",
+                JobFetchQueue.resume_after > now,
+            )
+        )
+    ).scalar_one()
+    next_resume_at = (
+        await db.execute(
+            select(func.min(JobFetchQueue.resume_after)).where(
+                JobFetchQueue.user_id == user.id,
+                JobFetchQueue.state == "queued",
+                JobFetchQueue.resume_after > now,
+            )
+        )
+    ).scalar_one_or_none()
 
     # Non-fetch DB rows are also in the bus task registry (the worker
     # publishes while running). Skip any bus entry whose item_id points at
@@ -3030,7 +3085,12 @@ async def list_activity(
         return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
 
     merged.sort(key=_sort_key, reverse=True)
-    return merged
+    return ActivityFeedOut(
+        rows=merged,
+        counts=counts,
+        total=sum(n for k, n in counts.items() if k != "waiting"),
+        next_resume_at=next_resume_at,
+    )
 
 
 class _CancelActivityIn(BaseModel):
@@ -3240,6 +3300,40 @@ async def delete_queue_item(
     await db.commit()
 
 
+class _QueueClearIn(BaseModel):
+    states: list[str] = Field(min_length=1, max_length=4)
+
+
+@router.post("/queue/clear")
+async def clear_queue_rows(
+    payload: _QueueClearIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Bulk-delete the user's queue rows in the given states with ONE
+    statement. The activity feed is capped at ~200 rows, so client-side
+    per-row deletion can't reach older rows — and a 2000-deep backlog
+    would take 2000 DELETE round-trips anyway. `processing` is excluded:
+    an in-flight row disappearing mid-handler would resurrect via the
+    handler's own commit. Deleting `queued` rows is the supported way to
+    abort a bulk import."""
+    allowed = {"queued", "done", "error"}
+    states = [s for s in payload.states if s in allowed]
+    if not states:
+        raise HTTPException(
+            status_code=422,
+            detail=f"states must be a subset of {sorted(allowed)}",
+        )
+    result = await db.execute(
+        sa_delete(JobFetchQueue).where(
+            JobFetchQueue.user_id == user.id,
+            JobFetchQueue.state.in_(states),
+        )
+    )
+    await db.commit()
+    return {"deleted": result.rowcount or 0, "states": states}
+
+
 # --- Excel bulk import ------------------------------------------------------
 
 
@@ -3408,6 +3502,14 @@ async def import_queue_from_xlsx(
     errors: list[dict] = []
     skipped_duplicates: list[dict] = []
 
+    # Pass 1 — validate + dedup within the file itself. The old
+    # implementation ran one dedup SELECT + flush PER ROW, which meant a
+    # 2000-row upload was 4000 sequential DB round-trips inside one
+    # request. Everything is batched now: validate in memory, then one
+    # IN-query sweep against tracked jobs, one against already-queued
+    # rows, then a single bulk INSERT.
+    valid: list[tuple[int, str, dict]] = []  # (row_num, url, parsed row)
+    seen_in_file: dict[str, int] = {}  # normalized url → first row_num
     for row_num, row in enumerate(rows, start=2):
         url = row.get("url")
         if not url or not isinstance(url, str):
@@ -3419,36 +3521,111 @@ async def import_queue_from_xlsx(
                 {"row": row_num, "error": f"Unrecognized URL: {url[:120]}"}
             )
             continue
+        norm = _normalize_source_url(url) or url
+        first_row = seen_in_file.get(norm)
+        if first_row is not None:
+            errors.append(
+                {
+                    "row": row_num,
+                    "error": f"Duplicate of row {first_row} in this file",
+                }
+            )
+            continue
+        seen_in_file[norm] = row_num
+        valid.append((row_num, url, row))
 
-        # Skip duplicates at enqueue time so we don't burn a Claude fetch
-        # call only to find out downstream that this URL is already tracked.
-        existing = await _find_existing_job_by_url(db, user.id, url)
-        if existing is not None:
+    # Pass 2 — batched dedup against existing TrackedJobs (all URL-form
+    # candidates for every row, chunked IN queries on the indexed
+    # (user_id, source_url) lookup).
+    cand_by_row: dict[int, list[str]] = {
+        row_num: _url_match_candidates(url) for row_num, url, _ in valid
+    }
+    all_cands = sorted({c for cands in cand_by_row.values() for c in cands})
+    _CHUNK = 500
+    existing_by_url: dict[str, tuple[int, str]] = {}
+    for i in range(0, len(all_cands), _CHUNK):
+        chunk = all_cands[i : i + _CHUNK]
+        found = (
+            await db.execute(
+                select(TrackedJob.source_url, TrackedJob.id, TrackedJob.title)
+                .where(
+                    TrackedJob.user_id == user.id,
+                    TrackedJob.deleted_at.is_(None),
+                    TrackedJob.source_url.in_(chunk),
+                )
+            )
+        ).all()
+        for src_url, job_id, title in found:
+            existing_by_url.setdefault(src_url, (job_id, title))
+
+    # Pass 3 — batched dedup against rows already sitting in the queue,
+    # so re-uploading a half-imported file doesn't double-enqueue (each
+    # dup would otherwise burn a full Claude fetch before being caught).
+    already_queued: set[str] = set()
+    for i in range(0, len(all_cands), _CHUNK):
+        chunk = all_cands[i : i + _CHUNK]
+        found_urls = (
+            await db.execute(
+                select(JobFetchQueue.url).where(
+                    JobFetchQueue.user_id == user.id,
+                    JobFetchQueue.state.in_(("queued", "processing")),
+                    JobFetchQueue.url.in_(chunk),
+                )
+            )
+        ).scalars().all()
+        already_queued.update(found_urls)
+
+    # Pass 4 — build the survivors and insert them in one flush.
+    items: list[tuple[int, JobFetchQueue]] = []
+    for row_num, url, row in valid:
+        cands = cand_by_row[row_num]
+        dup = next(
+            (existing_by_url[c] for c in cands if c in existing_by_url), None
+        )
+        if dup is not None:
             skipped_duplicates.append(
                 {
                     "row": row_num,
                     "url": url,
-                    "existing_job_id": existing.id,
-                    "existing_title": existing.title,
+                    "existing_job_id": dup[0],
+                    "existing_title": dup[1],
                 }
             )
             continue
-
-        item = JobFetchQueue(
-            user_id=user.id,
-            url=url,
-            desired_date_applied=row.get("desired_date_applied"),
-            desired_date_posted=row.get("desired_date_posted"),
-            state="queued",
-            attempts=0,
+        if any(c in already_queued for c in cands):
+            skipped_duplicates.append(
+                {
+                    "row": row_num,
+                    "url": url,
+                    "existing_job_id": None,
+                    "existing_title": "(already in the fetch queue)",
+                }
+            )
+            continue
+        items.append(
+            (
+                row_num,
+                JobFetchQueue(
+                    user_id=user.id,
+                    url=url,
+                    desired_date_applied=row.get("desired_date_applied"),
+                    desired_date_posted=row.get("desired_date_posted"),
+                    state="queued",
+                    attempts=0,
+                ),
+            )
         )
-        db.add(item)
-        try:
-            await db.flush()
-            enqueued.append(item.id)
-        except Exception as exc:
-            errors.append({"row": row_num, "error": str(exc)})
 
+    db.add_all(item for _, item in items)
+    try:
+        await db.flush()
+        enqueued = [item.id for _, item in items]
+    except Exception as exc:
+        await db.rollback()
+        errors.extend(
+            {"row": row_num, "error": str(exc)} for row_num, _ in items
+        )
+        items = []
     await db.commit()
     return {
         "enqueued": enqueued,
