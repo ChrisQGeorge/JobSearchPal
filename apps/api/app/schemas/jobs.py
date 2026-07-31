@@ -110,6 +110,9 @@ class TrackedJobSummary(BaseModel):
     location: Optional[str] = None
     organization_id: Optional[int] = None
     organization_name: Optional[str] = None
+    # Org's industry, denormalized for the tracker's Industry column
+    # (sort + filter) without an extra client round-trip.
+    organization_industry: Optional[str] = None
     date_applied: Optional[date] = None
     date_discovered: Optional[date] = None
     updated_at: datetime

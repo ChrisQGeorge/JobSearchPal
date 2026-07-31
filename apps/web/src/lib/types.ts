@@ -224,6 +224,7 @@ export type TrackedJobSummary = {
   location?: string | null;
   organization_id?: number | null;
   organization_name?: string | null;
+  organization_industry?: string | null;
   date_applied?: string | null;
   date_discovered?: string | null;
   updated_at: string;

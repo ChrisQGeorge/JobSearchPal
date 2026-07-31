@@ -298,10 +298,19 @@ async def _compute_job_summaries(
     stmt = stmt.order_by(TrackedJob.updated_at.desc())
     jobs = list((await db.execute(stmt)).scalars().all())
 
-    # Hydrate organization names and interview-round counts in bulk.
-    org_names = await _org_names_for(
-        db, {j.organization_id for j in jobs if j.organization_id}
-    )
+    # Hydrate organization names + industries and interview-round counts
+    # in bulk. Industry rides along for the tracker's Industry column.
+    org_ids = {j.organization_id for j in jobs if j.organization_id}
+    org_meta: dict[int, tuple[str, Optional[str]]] = {}
+    if org_ids:
+        org_rows = (
+            await db.execute(
+                select(
+                    Organization.id, Organization.name, Organization.industry
+                ).where(Organization.id.in_(org_ids))
+            )
+        ).all()
+        org_meta = {row[0]: (row[1], row[2]) for row in org_rows}
 
     def _norm(s: object) -> str:
         return re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip()
@@ -482,8 +491,11 @@ async def _compute_job_summaries(
                 remote_policy=j.remote_policy,
                 location=j.location,
                 organization_id=j.organization_id,
-                organization_name=org_names.get(j.organization_id)
-                if j.organization_id
+                organization_name=org_meta[j.organization_id][0]
+                if j.organization_id and j.organization_id in org_meta
+                else None,
+                organization_industry=org_meta[j.organization_id][1]
+                if j.organization_id and j.organization_id in org_meta
                 else None,
                 date_applied=j.date_applied,
                 date_discovered=j.date_discovered,
@@ -842,6 +854,7 @@ async def _update_job_once(
     # Auto-emit an ApplicationEvent on status transitions so the activity feed
     # has an audit trail without the user having to log anything by hand.
     flipped_to_interested = False
+    flipped_to_not_interested = False
     if "status" in data and data["status"] != prior_status:
         db.add(
             ApplicationEvent(
@@ -861,6 +874,7 @@ async def _update_job_once(
         ):
             job.date_closed = date.today()
         flipped_to_interested = data["status"] == "interested"
+        flipped_to_not_interested = data["status"] == "not_interested"
 
     # Recompute deterministic fit_score on every update — the cost is a
     # few small selects, and stale scores were a regular foot-gun before.
@@ -883,6 +897,13 @@ async def _update_job_once(
     if flipped_to_interested:
         from app.skills.queue_worker import enqueue_interested_followups
         await enqueue_interested_followups(db, job)
+
+    # Flipping to `not_interested` drops any still-queued score/prep
+    # Companion tasks for this job — no point burning Claude budget
+    # analyzing a job the user has ruled out.
+    if flipped_to_not_interested:
+        from app.skills.queue_worker import cancel_pending_tasks_for_job
+        await cancel_pending_tasks_for_job(db, job)
 
     await db.commit()
     await db.refresh(job)

@@ -48,6 +48,110 @@ const NEGATIVE_STATUSES: ReadonlySet<JobStatus> = new Set<JobStatus>([
   "archived",
 ]);
 
+// Sortable tracker columns. "none" = the backend's updated_at-desc order.
+type SortKey =
+  | "none"
+  | "title"
+  | "org"
+  | "industry"
+  | "fit"
+  | "skill_match_pct"
+  | "salary"
+  | "applied"
+  | "updated";
+
+// Numeric-flavored columns start descending on first click ("show me the
+// best/highest first"); text and date columns start ascending.
+const NUMERIC_SORT_KEYS: ReadonlySet<SortKey> = new Set<SortKey>([
+  "fit",
+  "skill_match_pct",
+  "salary",
+]);
+
+function sortValue(
+  j: TrackedJobSummary,
+  key: SortKey,
+): number | string | null {
+  switch (key) {
+    case "title":
+      return j.title?.toLowerCase() || null;
+    case "org":
+      return j.organization_name?.toLowerCase() || null;
+    case "industry":
+      return j.organization_industry?.toLowerCase() || null;
+    case "fit":
+      return j.fit_score ?? null;
+    case "skill_match_pct":
+      return j.skill_match_pct ?? null;
+    case "salary":
+      // Ceiling of the posted range — matches what the salary filter uses.
+      return j.salary_max ?? j.salary_min ?? null;
+    case "applied":
+      return j.date_applied ?? null; // ISO strings compare lexically fine
+    case "updated":
+      return j.updated_at ?? null;
+    default:
+      return null;
+  }
+}
+
+/** Compact posted-range label for the Salary column: "80k–120k", "150k",
+ * with a currency suffix when it isn't USD. Em-dash when unposted. */
+function formatSalary(j: TrackedJobSummary): string {
+  const min = j.salary_min ?? null;
+  const max = j.salary_max ?? null;
+  if (min == null && max == null) return "—";
+  const k = (n: number) =>
+    Math.abs(n) >= 1000 ? `${Math.round(n / 1000)}k` : `${n}`;
+  const range =
+    min != null && max != null && min !== max
+      ? `${k(min)}–${k(max)}`
+      : k((max ?? min)!);
+  const cur =
+    j.salary_currency && j.salary_currency.toUpperCase() !== "USD"
+      ? ` ${j.salary_currency.toUpperCase()}`
+      : "";
+  return range + cur;
+}
+
+/** Click-to-cycle sortable column header: first click sorts, second
+ * flips direction, third clears back to the default recency order. */
+function SortableTh({
+  label,
+  colKey,
+  sortKey,
+  sortDir,
+  onSort,
+  className,
+  title,
+}: {
+  label: string;
+  colKey: Exclude<SortKey, "none">;
+  sortKey: SortKey;
+  sortDir: "asc" | "desc";
+  onSort: (key: Exclude<SortKey, "none">) => void;
+  className?: string;
+  title?: string;
+}) {
+  return (
+    <th
+      className={`py-2 px-4 cursor-pointer select-none hover:text-corp-text ${className ?? ""}`}
+      onClick={() => onSort(colKey)}
+      title={
+        title ??
+        `Sort by ${label.toLowerCase()}. Click again to flip, again to clear.`
+      }
+    >
+      {label}
+      {sortKey === colKey ? (
+        <span className="ml-1 text-corp-accent">
+          {sortDir === "desc" ? "↓" : "↑"}
+        </span>
+      ) : null}
+    </th>
+  );
+}
+
 export default function JobTrackerPage() {
   const [items, setItems] = useState<TrackedJobSummary[]>([]);
   const [loading, setLoading] = useState(true);
@@ -159,12 +263,48 @@ export default function JobTrackerPage() {
   }, [statusFilter, showNegative]);
 
   // Sort key for the tracker table. "none" keeps the backend's
-  // updated_at-desc ordering; "skill_match_pct" is the heatmap sort the
-  // user can toggle from the Skills column header. The persisted-state
-  // here is intentionally session-only — refreshing the page resets to
-  // the natural recency order.
-  const [sortKey, setSortKey] = useState<"none" | "skill_match_pct">("none");
+  // updated_at-desc ordering; every other key is a click-to-cycle
+  // column header (first click, click again to flip, again to clear).
+  // Intentionally session-only — refreshing the page resets to the
+  // natural recency order.
+  const [sortKey, setSortKey] = useState<SortKey>("none");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+
+  function toggleSort(key: Exclude<SortKey, "none">) {
+    const first: "asc" | "desc" = NUMERIC_SORT_KEYS.has(key) ? "desc" : "asc";
+    if (sortKey !== key) {
+      setSortKey(key);
+      setSortDir(first);
+    } else if (sortDir === first) {
+      setSortDir(first === "desc" ? "asc" : "desc");
+    } else {
+      setSortKey("none");
+    }
+  }
+
+  // Per-column filters, applied client-side on top of the status pills
+  // and the free-text search. Empty string = column not filtered.
+  const [colFilters, setColFilters] = useState({
+    title: "",
+    org: "",
+    industry: "",
+    salaryMin: "",
+    fitMin: "",
+  });
+  const anyColFilter = Object.values(colFilters).some((v) => v.trim() !== "");
+  function setColFilter(key: keyof typeof colFilters, value: string) {
+    setColFilters((prev) => ({ ...prev, [key]: value }));
+  }
+
+  // Distinct industries present in the loaded rows — feeds the Industry
+  // column's filter dropdown.
+  const industries = useMemo(() => {
+    const s = new Set<string>();
+    for (const j of items) {
+      if (j.organization_industry) s.add(j.organization_industry);
+    }
+    return [...s].sort((a, b) => a.localeCompare(b));
+  }, [items]);
 
   // Apply the search filter on top of whatever the backend returned.
   // Matches case-insensitively across title / org / location.
@@ -187,20 +327,60 @@ export default function JobTrackerPage() {
       const want = coverFilter === "with";
       arr = arr.filter((j) => Boolean(j.has_cover_letter) === want);
     }
-    if (sortKey === "skill_match_pct") {
+
+    // Column filters.
+    const titleQ = colFilters.title.trim().toLowerCase();
+    if (titleQ) {
+      arr = arr.filter(
+        (j) =>
+          j.title?.toLowerCase().includes(titleQ) ||
+          j.location?.toLowerCase().includes(titleQ),
+      );
+    }
+    const orgQ = colFilters.org.trim().toLowerCase();
+    if (orgQ) {
+      arr = arr.filter((j) =>
+        j.organization_name?.toLowerCase().includes(orgQ),
+      );
+    }
+    if (colFilters.industry) {
+      arr = arr.filter(
+        (j) => j.organization_industry === colFilters.industry,
+      );
+    }
+    const salaryMin = parseFloat(colFilters.salaryMin);
+    if (!Number.isNaN(salaryMin)) {
+      // Compare against the posting's ceiling so "≥ 120k" keeps a
+      // 100–140k range. Jobs with no posted salary are excluded while
+      // the filter is active — that's the point of filtering on it.
+      arr = arr.filter((j) => {
+        const ceiling = j.salary_max ?? j.salary_min;
+        return ceiling != null && ceiling >= salaryMin;
+      });
+    }
+    const fitMin = parseInt(colFilters.fitMin, 10);
+    if (!Number.isNaN(fitMin)) {
+      arr = arr.filter((j) => j.fit_score != null && j.fit_score >= fitMin);
+    }
+
+    if (sortKey !== "none") {
       arr = [...arr].sort((a, b) => {
-        const av = a.skill_match_pct;
-        const bv = b.skill_match_pct;
-        // Push nulls to the bottom regardless of direction so they don't
-        // dominate the top of the list with "no analysis yet".
+        const av = sortValue(a, sortKey);
+        const bv = sortValue(b, sortKey);
+        // Push nulls to the bottom regardless of direction so rows with
+        // no data don't dominate the top of the list.
         if (av == null && bv == null) return 0;
         if (av == null) return 1;
         if (bv == null) return -1;
-        return sortDir === "desc" ? bv - av : av - bv;
+        const cmp =
+          typeof av === "number" && typeof bv === "number"
+            ? av - bv
+            : String(av).localeCompare(String(bv));
+        return sortDir === "desc" ? -cmp : cmp;
       });
     }
     return arr;
-  }, [items, search, sortKey, sortDir, resumeFilter, coverFilter]);
+  }, [items, search, sortKey, sortDir, resumeFilter, coverFilter, colFilters]);
 
   // Pagination layered on top of filter+search+sort. Page-size choice
   // persists per-page via localStorage (jsp:paginate:jobs). The
@@ -628,7 +808,7 @@ export default function JobTrackerPage() {
 
       {loading ? (
         <p className="text-corp-muted mt-4">Loading...</p>
-      ) : visibleItems.length === 0 ? (
+      ) : visibleItems.length === 0 && !anyColFilter ? (
         <div className="jsp-card p-6 text-corp-muted text-sm mt-4">
           {search.trim()
             ? `No jobs match "${search.trim()}".`
@@ -668,37 +848,138 @@ export default function JobTrackerPage() {
                     onClick={(e) => e.stopPropagation()}
                   />
                 </th>
-                <th className="py-2 px-4">Title</th>
-                <th className="py-2 px-4">Organization</th>
+                <SortableTh label="Title" colKey="title" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <SortableTh label="Organization" colKey="org" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <th className="py-2 px-4">Status</th>
-                <th className="py-2 px-4">Fit</th>
-                <th
-                  className="py-2 px-4 cursor-pointer select-none hover:text-corp-text"
-                  onClick={() => {
-                    if (sortKey !== "skill_match_pct") {
-                      setSortKey("skill_match_pct");
-                      setSortDir("desc");
-                    } else if (sortDir === "desc") {
-                      setSortDir("asc");
-                    } else {
-                      setSortKey("none");
-                    }
-                  }}
+                <SortableTh
+                  label="Fit"
+                  colKey="fit"
+                  sortKey={sortKey}
+                  sortDir={sortDir}
+                  onSort={toggleSort}
+                  title="Sort by fit score. Click again to flip, again to clear."
+                />
+                <SortableTh
+                  label="Skills"
+                  colKey="skill_match_pct"
+                  sortKey={sortKey}
+                  sortDir={sortDir}
+                  onSort={toggleSort}
                   title="Sort by % of required skills matched. Click again to flip, again to clear."
-                >
-                  Skills
-                  {sortKey === "skill_match_pct" ? (
-                    <span className="ml-1 text-corp-accent">
-                      {sortDir === "desc" ? "↓" : "↑"}
-                    </span>
-                  ) : null}
-                </th>
+                />
+                <SortableTh
+                  label="Salary"
+                  colKey="salary"
+                  sortKey={sortKey}
+                  sortDir={sortDir}
+                  onSort={toggleSort}
+                  title="Sort by the posted range's ceiling. Click again to flip, again to clear."
+                />
+                <SortableTh label="Industry" colKey="industry" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <th className="py-2 px-4">Rounds</th>
-                <th className="py-2 px-4">Applied</th>
-                <th className="py-2 px-4 text-right">Updated</th>
+                <SortableTh label="Applied" colKey="applied" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <SortableTh
+                  label="Updated"
+                  colKey="updated"
+                  sortKey={sortKey}
+                  sortDir={sortDir}
+                  onSort={toggleSort}
+                  className="text-right"
+                />
+              </tr>
+              {/* Per-column filter row. Empty inputs = column unfiltered. */}
+              <tr className="bg-corp-surface2/60 border-t border-corp-border">
+                <td className="py-1 px-2 w-8 text-center">
+                  {anyColFilter ? (
+                    <button
+                      type="button"
+                      className="text-corp-muted hover:text-corp-danger text-xs"
+                      title="Clear all column filters"
+                      onClick={() =>
+                        setColFilters({
+                          title: "",
+                          org: "",
+                          industry: "",
+                          salaryMin: "",
+                          fitMin: "",
+                        })
+                      }
+                    >
+                      ×
+                    </button>
+                  ) : null}
+                </td>
+                <td className="py-1 px-4">
+                  <input
+                    type="text"
+                    className="jsp-input text-xs py-0.5 px-1.5 w-full"
+                    placeholder="Filter title…"
+                    value={colFilters.title}
+                    onChange={(e) => setColFilter("title", e.target.value)}
+                  />
+                </td>
+                <td className="py-1 px-4">
+                  <input
+                    type="text"
+                    className="jsp-input text-xs py-0.5 px-1.5 w-full"
+                    placeholder="Filter org…"
+                    value={colFilters.org}
+                    onChange={(e) => setColFilter("org", e.target.value)}
+                  />
+                </td>
+                <td className="py-1 px-4" />
+                <td className="py-1 px-4">
+                  <input
+                    type="number"
+                    className="jsp-input text-xs py-0.5 px-1.5 w-16"
+                    placeholder="≥"
+                    title="Only show jobs with a fit score at or above this"
+                    value={colFilters.fitMin}
+                    onChange={(e) => setColFilter("fitMin", e.target.value)}
+                  />
+                </td>
+                <td className="py-1 px-4" />
+                <td className="py-1 px-4">
+                  <input
+                    type="number"
+                    step={1000}
+                    className="jsp-input text-xs py-0.5 px-1.5 w-24"
+                    placeholder="≥ min"
+                    title="Only show jobs whose posted range reaches at least this (jobs with no posted salary are hidden while set)"
+                    value={colFilters.salaryMin}
+                    onChange={(e) => setColFilter("salaryMin", e.target.value)}
+                  />
+                </td>
+                <td className="py-1 px-4">
+                  <select
+                    className="jsp-input text-xs py-0.5 px-1.5 w-full"
+                    value={colFilters.industry}
+                    onChange={(e) => setColFilter("industry", e.target.value)}
+                    title="Only show jobs at organizations in this industry"
+                  >
+                    <option value="">All</option>
+                    {industries.map((ind) => (
+                      <option key={ind} value={ind}>
+                        {ind}
+                      </option>
+                    ))}
+                  </select>
+                </td>
+                <td className="py-1 px-4" colSpan={3} />
               </tr>
             </thead>
             <tbody>
+              {pagedItems.length === 0 ? (
+                <tr className="border-t border-corp-border">
+                  <td
+                    colSpan={11}
+                    className="py-6 px-4 text-center text-sm text-corp-muted"
+                  >
+                    No jobs match the column filters. Clear them with the ×
+                    on the left of the filter row.
+                  </td>
+                </tr>
+              ) : null}
               {pagedItems.map((j) => (
                 <tr
                   key={j.id}
@@ -777,6 +1058,19 @@ export default function JobTrackerPage() {
                       have={j.skill_match_have ?? null}
                       total={j.skill_match_total ?? null}
                     />
+                  </td>
+                  <td
+                    className="py-2 px-4 text-corp-muted whitespace-nowrap"
+                    title={
+                      j.salary_min != null || j.salary_max != null
+                        ? `Posted range: ${j.salary_min ?? "?"}–${j.salary_max ?? "?"} ${j.salary_currency ?? ""}`
+                        : "No posted salary"
+                    }
+                  >
+                    {formatSalary(j)}
+                  </td>
+                  <td className="py-2 px-4 text-corp-muted">
+                    {j.organization_industry ?? "—"}
                   </td>
                   <td className="py-2 px-4 text-corp-muted">
                     {j.rounds_count}

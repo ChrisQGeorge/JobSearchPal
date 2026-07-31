@@ -583,6 +583,41 @@ async def enqueue_interested_followups(
             )
 
 
+async def cancel_pending_tasks_for_job(
+    db: "AsyncSession",
+    tj: "TrackedJob",
+    *,
+    kinds: tuple[str, ...] = ("score", "prep"),
+) -> int:
+    """Drop still-queued Companion tasks that target `tj` — fired when the
+    user flips a job to `not_interested`, where scoring/prep would just
+    burn Claude budget on a job they've already ruled out. Only `queued`
+    rows are touched: a `processing` row already has a live Claude
+    subprocess, and its handler re-reads + commits the row when it lands,
+    so deleting it mid-flight would resurrect or orphan the work anyway.
+    Returns the number of rows dropped. Caller commits."""
+    rows = (
+        await db.execute(
+            select(JobFetchQueue).where(
+                JobFetchQueue.user_id == tj.user_id,
+                JobFetchQueue.state == "queued",
+                JobFetchQueue.kind.in_(kinds),
+            )
+        )
+    ).scalars().all()
+    dropped = 0
+    for r in rows:
+        if isinstance(r.payload, dict) and r.payload.get("tracked_job_id") == tj.id:
+            await db.delete(r)
+            dropped += 1
+    if dropped:
+        log.info(
+            "Cancelled %d pending %s task(s) for TrackedJob %d (not interested)",
+            dropped, "/".join(kinds), tj.id,
+        )
+    return dropped
+
+
 async def _handle_fetch(item: JobFetchQueue) -> None:
     """Claim-a-URL → fetch → create OR enrich a TrackedJob.
 
@@ -616,7 +651,6 @@ async def _handle_fetch(item: JobFetchQueue) -> None:
             tj_id = row.payload.get("tracked_job_id")
             if isinstance(tj_id, int):
                 existing_job_id = tj_id
-        row_user_id = row.user_id
         row_url = row.url
 
     def _on_event(ev: dict) -> None:
