@@ -12,17 +12,22 @@ services:
     # worker, poller, healthcheck pings, and the occasional admin shell
     # without ever hitting the cap. MySQL's default 151 is a hair tight
     # for a long-running interactive session.
+    # performance_schema alone costs MySQL ~150-200 MB RSS and this
+    # single-user app never reads it. With it off (+ the stock 128M
+    # buffer pool) mysqld idles around 250-300 MB instead of ~450.
     command: >-
       --character-set-server=utf8mb4
       --collation-server=utf8mb4_unicode_ci
       --max-connections=200
+      --performance-schema=OFF
+      --innodb-buffer-pool-size=128M
     # Resource fences (also on api/web below): without limits, a busy
     # queue drain lets this stack starve every other VM/container on the
     # host. memswap == mem forbids container swap — swap thrash is what
     # turns "busy" into "whole host unresponsive".
     cpus: ${DB_CPU_LIMIT:-1.0}
-    mem_limit: ${DB_MEM_LIMIT:-1g}
-    memswap_limit: ${DB_MEM_LIMIT:-1g}
+    mem_limit: ${DB_MEM_LIMIT:-512m}
+    memswap_limit: ${DB_MEM_LIMIT:-512m}
     volumes:
       - db_data:/var/lib/mysql
     healthcheck:
@@ -59,13 +64,15 @@ services:
       db:
         condition: service_healthy
     # The api container hosts every Claude Code CLI subprocess (a Node
-    # process per queue task, ~0.5-1 GB peak each). 3g comfortably fits
-    # 1-2 concurrent tasks; raise API_MEM_LIMIT if you raise the worker's
-    # max_parallel. cpus caps the CLI's startup/parse bursts so a
-    # days-long queue drain can't monopolize the host.
+    # process per queue task, ~0.5-1 GB peak each). The 1.5g default
+    # fits uvicorn + ONE task; if a pathological task balloons past it,
+    # that process gets OOM-killed and the row errors — contained, the
+    # host stays alive. Raise API_MEM_LIMIT before raising the worker's
+    # max_parallel above 1. cpus caps the CLI's startup/parse bursts so
+    # a days-long queue drain can't monopolize the host.
     cpus: ${API_CPU_LIMIT:-2.0}
-    mem_limit: ${API_MEM_LIMIT:-3g}
-    memswap_limit: ${API_MEM_LIMIT:-3g}
+    mem_limit: ${API_MEM_LIMIT:-1536m}
+    memswap_limit: ${API_MEM_LIMIT:-1536m}
     ports:
       # Bound to loopback by default — Caddy reaches it through the
       # internal docker network at api:8000, no host exposure needed.
