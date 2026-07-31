@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
+import { getScoredOnly, setScoredOnly } from "@/lib/queuePrefs";
 
 type ReviewItem = {
   id: number;
@@ -27,10 +28,21 @@ export function ReviewPanel() {
   const [data, setData] = useState<ReviewQueueOut | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
+  // Persisted: the detail page's "Next →" nav reads the same key, so
+  // the flow keeps skipping unscored jobs after you start reviewing.
+  const [scoredOnly, setScoredOnlyState] = useState(getScoredOnly);
+
+  function toggleScoredOnly(v: boolean) {
+    setScoredOnlyState(v);
+    setScoredOnly(v);
+  }
 
   useEffect(() => {
+    setLoading(true);
     api
-      .get<ReviewQueueOut>("/api/v1/jobs/review-queue")
+      .get<ReviewQueueOut>(
+        `/api/v1/jobs/review-queue${scoredOnly ? "?scored_only=true" : ""}`,
+      )
       .then((d) => {
         setData(d);
         setErr(null);
@@ -39,7 +51,7 @@ export function ReviewPanel() {
         setErr(e instanceof ApiError ? `HTTP ${e.status}` : "Load failed."),
       )
       .finally(() => setLoading(false));
-  }, []);
+  }, [scoredOnly]);
 
   const items = data?.items ?? [];
   const freshCount = items.filter((it) => it.status === "to_review").length;
@@ -48,7 +60,9 @@ export function ReviewPanel() {
 
   const subtitle = (() => {
     if (items.length === 0) {
-      return "Nothing waiting — new jobs land here and you clear them from the detail page.";
+      return scoredOnly
+        ? "No scored jobs waiting. The queue worker may still be analyzing — or un-check the filter to review unscored ones."
+        : "Nothing waiting — new jobs land here and you clear them from the detail page.";
     }
     const parts: string[] = [];
     if (freshCount > 0) {
@@ -67,18 +81,32 @@ export function ReviewPanel() {
     <>
       <div className="flex items-baseline justify-between gap-3 flex-wrap mb-3">
         <p className="text-sm text-corp-muted">{subtitle}</p>
-        {firstId ? (
-          <Link
-            href={`/jobs/${firstId}?from=review`}
-            className="jsp-btn-primary"
+        <div className="flex items-center gap-3">
+          <label
+            className="flex items-center gap-1.5 text-xs text-corp-muted cursor-pointer select-none"
+            title="Only cycle through jobs that already have a fit score. The Next → navigation on the detail page follows this too."
           >
-            Start reviewing →
-          </Link>
-        ) : (
-          <Link href="/jobs" className="jsp-btn-ghost">
-            Back to Tracker
-          </Link>
-        )}
+            <input
+              type="checkbox"
+              className="accent-corp-accent"
+              checked={scoredOnly}
+              onChange={(e) => toggleScoredOnly(e.target.checked)}
+            />
+            Scored jobs only
+          </label>
+          {firstId ? (
+            <Link
+              href={`/jobs/${firstId}?from=review`}
+              className="jsp-btn-primary"
+            >
+              Start reviewing →
+            </Link>
+          ) : (
+            <Link href="/jobs" className="jsp-btn-ghost">
+              Back to Tracker
+            </Link>
+          )}
+        </div>
       </div>
 
       {err ? (
@@ -91,7 +119,9 @@ export function ReviewPanel() {
         <div className="jsp-card p-8 text-center">
           <div className="text-3xl mb-2">✓</div>
           <p className="text-sm text-corp-muted">
-            Inbox zero on job reviews. Nice.
+            {scoredOnly
+              ? "No scored jobs in the review queue right now."
+              : "Inbox zero on job reviews. Nice."}
           </p>
           <Link href="/jobs" className="jsp-btn-ghost mt-4 inline-block">
             Back to Tracker

@@ -8,6 +8,7 @@ import { PageShell } from "@/components/PageShell";
 import { SkillsAnalysis } from "@/components/SkillsAnalysis";
 import { StatusBadge } from "@/components/StatusBadge";
 import { api, apiUrl, ApiError } from "@/lib/api";
+import { scoredOnlyParam } from "@/lib/queuePrefs";
 import {
   ARTIFACT_KINDS,
   EDUCATION_REQUIRED,
@@ -409,7 +410,11 @@ function ReviewAction({
   const [navErr, setNavErr] = useState<string | null>(null);
 
   const fetchQueue = useCallback(async (): Promise<number[]> => {
-    const out = await api.get<{ ids: number[] }>("/api/v1/jobs/review-queue");
+    // scoredOnlyParam() keeps "Next →" consistent with the pipeline
+    // panels' "Scored jobs only" toggle (shared localStorage key).
+    const out = await api.get<{ ids: number[] }>(
+      `/api/v1/jobs/review-queue${scoredOnlyParam()}`,
+    );
     const next = out.ids ?? [];
     setIds(next);
     setIdsReady(true);
@@ -699,7 +704,10 @@ function ApplyAction({
   const active = inApplyFlow || status === "in_progress";
 
   const fetchQueue = useCallback(async (): Promise<number[]> => {
-    const out = await api.get<{ ids: number[] }>("/api/v1/jobs/apply-queue");
+    // Mirrors the review-queue fetch above — honor "Scored jobs only".
+    const out = await api.get<{ ids: number[] }>(
+      `/api/v1/jobs/apply-queue${scoredOnlyParam()}`,
+    );
     const next = out.ids ?? [];
     setIds(next);
     setIdsReady(true);

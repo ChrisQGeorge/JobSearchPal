@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
+import { getScoredOnly, setScoredOnly } from "@/lib/queuePrefs";
 
 type ApplyItem = {
   id: number;
@@ -28,10 +29,21 @@ export function ApplyPanel() {
   const [data, setData] = useState<ApplyQueueOut | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
+  // Persisted + shared with the review panel and the detail page's
+  // "Next →" nav, so the whole flow agrees on skipping unscored jobs.
+  const [scoredOnly, setScoredOnlyState] = useState(getScoredOnly);
+
+  function toggleScoredOnly(v: boolean) {
+    setScoredOnlyState(v);
+    setScoredOnly(v);
+  }
 
   useEffect(() => {
+    setLoading(true);
     api
-      .get<ApplyQueueOut>("/api/v1/jobs/apply-queue")
+      .get<ApplyQueueOut>(
+        `/api/v1/jobs/apply-queue${scoredOnly ? "?scored_only=true" : ""}`,
+      )
       .then((d) => {
         setData(d);
         setErr(null);
@@ -40,7 +52,7 @@ export function ApplyPanel() {
         setErr(e instanceof ApiError ? `HTTP ${e.status}` : "Load failed."),
       )
       .finally(() => setLoading(false));
-  }, []);
+  }, [scoredOnly]);
 
   const total = data?.total ?? 0;
   const items = data?.items ?? [];
@@ -50,7 +62,9 @@ export function ApplyPanel() {
 
   const subtitle = (() => {
     if (total === 0) {
-      return "Nothing queued — mark jobs as 'interested' in the review queue to stack them here.";
+      return scoredOnly
+        ? "No scored jobs queued to apply. Un-check the filter to see unscored ones."
+        : "Nothing queued — mark jobs as 'interested' in the review queue to stack them here.";
     }
     const parts: string[] = [];
     if (inProgressCount > 0) {
@@ -70,18 +84,32 @@ export function ApplyPanel() {
     <>
       <div className="flex items-baseline justify-between gap-3 flex-wrap mb-3">
         <p className="text-sm text-corp-muted">{subtitle}</p>
-        {firstId ? (
-          <Link
-            href={`/jobs/${firstId}?from=apply`}
-            className="jsp-btn-primary"
+        <div className="flex items-center gap-3">
+          <label
+            className="flex items-center gap-1.5 text-xs text-corp-muted cursor-pointer select-none"
+            title="Only cycle through jobs that already have a fit score. The Next → navigation on the detail page follows this too."
           >
-            Start applying →
-          </Link>
-        ) : (
-          <Link href="/jobs" className="jsp-btn-ghost">
-            Back to Tracker
-          </Link>
-        )}
+            <input
+              type="checkbox"
+              className="accent-corp-accent"
+              checked={scoredOnly}
+              onChange={(e) => toggleScoredOnly(e.target.checked)}
+            />
+            Scored jobs only
+          </label>
+          {firstId ? (
+            <Link
+              href={`/jobs/${firstId}?from=apply`}
+              className="jsp-btn-primary"
+            >
+              Start applying →
+            </Link>
+          ) : (
+            <Link href="/jobs" className="jsp-btn-ghost">
+              Back to Tracker
+            </Link>
+          )}
+        </div>
       </div>
 
       {err ? (
@@ -94,8 +122,9 @@ export function ApplyPanel() {
         <div className="jsp-card p-8 text-center">
           <div className="text-3xl mb-2">✓</div>
           <p className="text-sm text-corp-muted">
-            No jobs waiting to apply to. Triage the Review tab first or
-            mark existing rows "interested" on the tracker.
+            {scoredOnly
+              ? "No scored jobs waiting to apply to."
+              : 'No jobs waiting to apply to. Triage the Review tab first or mark existing rows "interested" on the tracker.'}
           </p>
         </div>
       ) : (

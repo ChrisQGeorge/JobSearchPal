@@ -1004,11 +1004,19 @@ async def _queue_by_status(
 
 @router.get("/review-queue", response_model=ReviewQueueOut)
 async def review_queue(
+    scored_only: bool = Query(
+        default=False,
+        description="Only include jobs that already have a fit score",
+    ),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> ReviewQueueOut:
     """Drives the `/jobs/review` page and the "Next → " navigation on
     the detail page.
+
+    `scored_only=true` drops rows without a fit score (fit_summary.score)
+    so the user can work through analyzed jobs first and let the queue
+    worker catch up on the rest.
 
     Returns two cohorts merged into one list:
       * `status=to_review` — fresh, never triaged. Always sorted first.
@@ -1062,6 +1070,14 @@ async def review_queue(
         )
     )
     rows = list((await db.execute(stmt)).scalars().all())
+    if scored_only:
+        # fit_summary is JSON — filtering in Python keeps this portable
+        # and the queue is already a bounded, narrow-column list.
+        rows = [
+            r for r in rows
+            if isinstance(r.fit_summary, dict)
+            and r.fit_summary.get("score") is not None
+        ]
     org_ids = {r.organization_id for r in rows if r.organization_id}
     org_names = await _org_names_for(db, org_ids)
     items = [
@@ -1094,10 +1110,15 @@ async def review_queue(
 
 @router.get("/apply-queue", response_model=ReviewQueueOut)
 async def apply_queue(
+    scored_only: bool = Query(
+        default=False,
+        description="Only include jobs that already have a fit score",
+    ),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> ReviewQueueOut:
     """Drives the `/jobs/apply` page and the apply-flow "Next →" nav.
+    `scored_only=true` drops rows without a fit score (see review_queue).
 
     Returns two cohorts in one list:
       * `status=in_progress` — applications the user started (clicked
@@ -1146,6 +1167,12 @@ async def apply_queue(
         )
     )
     rows = list((await db.execute(stmt)).scalars().all())
+    if scored_only:
+        rows = [
+            r for r in rows
+            if isinstance(r.fit_summary, dict)
+            and r.fit_summary.get("score") is not None
+        ]
     org_ids = {r.organization_id for r in rows if r.organization_id}
     org_names = await _org_names_for(db, org_ids)
     items = [
