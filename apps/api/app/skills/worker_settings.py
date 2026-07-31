@@ -21,11 +21,14 @@ log = logging.getLogger(__name__)
 
 _PATH = Path("/root/.claude/jsp-worker-settings.json")
 _DEFAULT_MAX_PARALLEL = int(os.environ.get("JSP_WORKER_PARALLEL", "1"))
-# Clamp range. Below 1 nothing runs; above 8 each Claude subprocess
-# fights every other one for CPU + the same MySQL pool. 8 is generous
-# for a single-user app on a single host.
+# Clamp range. Below 1 nothing runs. Each Claude subprocess is a Node
+# process peaking at ~0.5-1 GB RSS with heavy CPU bursts — at the old
+# ceiling of 8, a queue drain could flatten the whole host (the api
+# container's default memory fence is 3g; see docker-compose.yml). 4
+# already saturates a typical single-user box; raise API_MEM_LIMIT
+# before raising this.
 _MIN = 1
-_MAX = 8
+_MAX = 4
 
 
 def get_max_parallel() -> int:

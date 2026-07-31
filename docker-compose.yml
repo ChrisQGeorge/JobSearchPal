@@ -16,6 +16,13 @@ services:
       --character-set-server=utf8mb4
       --collation-server=utf8mb4_unicode_ci
       --max-connections=200
+    # Resource fences (also on api/web below): without limits, a busy
+    # queue drain lets this stack starve every other VM/container on the
+    # host. memswap == mem forbids container swap — swap thrash is what
+    # turns "busy" into "whole host unresponsive".
+    cpus: ${DB_CPU_LIMIT:-1.0}
+    mem_limit: ${DB_MEM_LIMIT:-1g}
+    memswap_limit: ${DB_MEM_LIMIT:-1g}
     volumes:
       - db_data:/var/lib/mysql
     healthcheck:
@@ -51,6 +58,14 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    # The api container hosts every Claude Code CLI subprocess (a Node
+    # process per queue task, ~0.5-1 GB peak each). 3g comfortably fits
+    # 1-2 concurrent tasks; raise API_MEM_LIMIT if you raise the worker's
+    # max_parallel. cpus caps the CLI's startup/parse bursts so a
+    # days-long queue drain can't monopolize the host.
+    cpus: ${API_CPU_LIMIT:-2.0}
+    mem_limit: ${API_MEM_LIMIT:-3g}
+    memswap_limit: ${API_MEM_LIMIT:-3g}
     ports:
       # Bound to loopback by default — Caddy reaches it through the
       # internal docker network at api:8000, no host exposure needed.
@@ -84,6 +99,9 @@ services:
       # always listens on 8000 inside the network regardless of API_PORT (which
       # only controls the host-side port mapping).
       INTERNAL_API_URL: http://api:8000
+    cpus: ${WEB_CPU_LIMIT:-1.0}
+    mem_limit: ${WEB_MEM_LIMIT:-768m}
+    memswap_limit: ${WEB_MEM_LIMIT:-768m}
     depends_on:
       - api
     ports:
@@ -104,6 +122,9 @@ services:
       dockerfile: Dockerfile
     container_name: jsp-caddy
     restart: unless-stopped
+    cpus: 0.5
+    mem_limit: 256m
+    memswap_limit: 256m
     environment:
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@local}
       # Hostname baked into the cert's CN + first SAN.

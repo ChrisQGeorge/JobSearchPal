@@ -45,6 +45,13 @@ _HTTP_RETRIES = 2
 # truncated text.
 MAX_DESC_BYTES = 200_000
 
+# Hard cap on how many bytes we'll download from ANY upstream URL. User
+# and lead-supplied URLs can point at anything — a 2 GB PDF or an endless
+# stream would previously be buffered into RAM in full (`resp.text`)
+# before the text-level caps applied. 5 MB is far above any real careers
+# page / feed while keeping the worst case harmless.
+MAX_DOWNLOAD_BYTES = 5 * 1024 * 1024
+
 # Markers used to detect "this isn't actually a feed/JSON, it's an
 # anti-bot challenge or interstitial HTML page." Cloudflare and friends
 # either redirect to / (HTML homepage) or serve a 200 with HTML.
@@ -81,7 +88,13 @@ async def _request_with_retry(
     timeout: Optional[httpx.Timeout] = None,
 ) -> httpx.Response:
     """Perform a request with the shared headers, follow redirects,
-    and retry transient transport failures up to _HTTP_RETRIES times."""
+    and retry transient transport failures up to _HTTP_RETRIES times.
+
+    The body is read as a stream and cut off at MAX_DOWNLOAD_BYTES, then
+    repackaged into a regular httpx.Response so callers keep using
+    `.headers` / `.text` / `.json()` unchanged. Without the cap, a URL
+    pointing at a huge file would be buffered into RAM in full before
+    any downstream truncation ran."""
     headers = dict(_DEFAULT_HEADERS)
     if accept:
         headers["Accept"] = accept
@@ -94,9 +107,37 @@ async def _request_with_retry(
                 follow_redirects=True,
                 http2=False,  # some adapters / proxies trip on h2 negotiation
             ) as client:
-                resp = await client.request(method, url)
-            resp.raise_for_status()
-            return resp
+                async with client.stream(method, url) as resp:
+                    resp.raise_for_status()
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in resp.aiter_bytes():
+                        chunks.append(chunk)
+                        total += len(chunk)
+                        if total >= MAX_DOWNLOAD_BYTES:
+                            import logging as _logging
+
+                            _logging.getLogger(__name__).warning(
+                                "Download from %s exceeded %d bytes — truncating.",
+                                url, MAX_DOWNLOAD_BYTES,
+                            )
+                            break
+                    body = b"".join(chunks)[:MAX_DOWNLOAD_BYTES]
+            # aiter_bytes() already decompressed the transfer encoding, so
+            # drop content-encoding/-length — keeping them would make the
+            # rebuilt Response try to gunzip plain bytes (DecodingError)
+            # or mis-report its length.
+            clean_headers = [
+                (k, v)
+                for k, v in resp.headers.raw
+                if k.lower() not in (b"content-encoding", b"content-length")
+            ]
+            return httpx.Response(
+                status_code=resp.status_code,
+                headers=clean_headers,
+                content=body,
+                request=resp.request,
+            )
         except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as exc:
             last_exc = exc
             if attempt >= _HTTP_RETRIES:

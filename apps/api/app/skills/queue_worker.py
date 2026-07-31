@@ -49,6 +49,13 @@ MAX_ATTEMPTS = 3
 PRUNE_DONE_AFTER_DAYS = 7
 PRUNE_ERROR_AFTER_DAYS = 30
 PRUNE_INTERVAL_SECONDS = 24 * 3600
+# Every `claude -p` run leaves a session transcript (embedding the full
+# page text / JD from the prompt) plus todo/snapshot files under
+# CLAUDE_CONFIG_DIR. A bulk import means thousands of runs — the config
+# volume grows without bound and the CLI's per-spawn startup cost creeps
+# up with it. Prune byproduct files older than this.
+PRUNE_CLAUDE_FILES_AFTER_DAYS = 7
+_CLAUDE_BYPRODUCT_DIRS = ("projects", "todos", "shell-snapshots", "session-env")
 
 # Substrings that indicate the CLI hit an Anthropic rate-limit / usage-cap
 # rather than a regular failure. We treat these as "try again later" and
@@ -245,6 +252,75 @@ async def _prune_old_rows() -> None:
                     result.rowcount, state, days,
                 )
         await db.commit()
+
+
+def _prune_claude_byproducts_sync() -> tuple[int, int]:
+    """Delete Claude CLI byproduct files older than
+    PRUNE_CLAUDE_FILES_AFTER_DAYS under CLAUDE_CONFIG_DIR. Returns
+    (files_removed, bytes_freed). Sync — run via asyncio.to_thread.
+    Age-based (mtime), so anything a live `claude` process is still
+    touching is never in scope."""
+    import os
+    import time
+    from pathlib import Path
+
+    cfg = Path(os.environ.get("CLAUDE_CONFIG_DIR", "/root/.claude"))
+    cutoff = time.time() - PRUNE_CLAUDE_FILES_AFTER_DAYS * 86400
+    removed = 0
+    freed = 0
+    for sub in _CLAUDE_BYPRODUCT_DIRS:
+        root = cfg / sub
+        if not root.is_dir():
+            continue
+        dirs: list[Path] = []
+        for p in root.rglob("*"):
+            try:
+                if p.is_dir():
+                    dirs.append(p)
+                elif p.is_file() and p.stat().st_mtime < cutoff:
+                    size = p.stat().st_size
+                    p.unlink()
+                    removed += 1
+                    freed += size
+            except OSError:
+                continue
+        # Sweep now-empty per-project subdirs, deepest first. rmdir
+        # refuses non-empty dirs, so this can't eat anything live.
+        for d in sorted(dirs, key=lambda d: len(str(d)), reverse=True):
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+    return removed, freed
+
+
+def _ensure_claude_cleanup_setting() -> None:
+    """Make the Claude CLI prune its own chat transcripts by setting
+    `cleanupPeriodDays` in CLAUDE_CONFIG_DIR/settings.json (only when the
+    user hasn't already set a value). Belt to the braces above — the CLI
+    cleans on its own startup; our sweep catches whatever it misses."""
+    import json
+    import os
+    from pathlib import Path
+
+    cfg = Path(os.environ.get("CLAUDE_CONFIG_DIR", "/root/.claude"))
+    path = cfg / "settings.json"
+    try:
+        data: dict = {}
+        if path.exists():
+            loaded = json.loads(path.read_text() or "{}")
+            if isinstance(loaded, dict):
+                data = loaded
+        if "cleanupPeriodDays" not in data:
+            data["cleanupPeriodDays"] = PRUNE_CLAUDE_FILES_AFTER_DAYS
+            cfg.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, indent=2))
+            log.info(
+                "Set cleanupPeriodDays=%d in %s",
+                PRUNE_CLAUDE_FILES_AFTER_DAYS, path,
+            )
+    except (OSError, json.JSONDecodeError):
+        log.warning("Could not ensure Claude cleanupPeriodDays setting", exc_info=True)
 
 
 async def _claim_next(db: AsyncSession) -> JobFetchQueue | None:
@@ -1549,8 +1625,15 @@ async def run_forever() -> None:
 
     import time as _time
 
+    _ensure_claude_cleanup_setting()
     try:
         await _prune_old_rows()
+        removed, freed = await asyncio.to_thread(_prune_claude_byproducts_sync)
+        if removed:
+            log.info(
+                "Pruned %d Claude byproduct file(s), freed %.1f MB",
+                removed, freed / 1_048_576,
+            )
     except Exception:  # pragma: no cover
         log.exception("Queue worker: prune failed on boot")
     last_prune = _time.monotonic()
@@ -1564,11 +1647,20 @@ async def run_forever() -> None:
             log.exception("Queue worker: _process raised unexpectedly")
 
     while True:
-        # Daily prune of long-finished rows. Cheap check per iteration.
+        # Daily prune of long-finished rows + Claude CLI byproducts.
+        # Cheap check per iteration.
         if _time.monotonic() - last_prune >= PRUNE_INTERVAL_SECONDS:
             last_prune = _time.monotonic()
             try:
                 await _prune_old_rows()
+                removed, freed = await asyncio.to_thread(
+                    _prune_claude_byproducts_sync
+                )
+                if removed:
+                    log.info(
+                        "Pruned %d Claude byproduct file(s), freed %.1f MB",
+                        removed, freed / 1_048_576,
+                    )
             except Exception:  # pragma: no cover
                 log.exception("Queue worker: periodic prune failed")
 
