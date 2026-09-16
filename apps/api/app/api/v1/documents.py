@@ -8,7 +8,6 @@ immediately.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import mimetypes
@@ -32,9 +31,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import SessionLocal, get_db
+from app.core.database import get_db
 from app.core.deps import get_current_user
-from app.core.security import create_access_token
 from app.models.documents import DocumentEdit, GeneratedDocument, WritingSample
 from app.models.history import (
     Achievement,
@@ -51,7 +49,7 @@ from app.models.history import (
 from app.models.jobs import Organization, TrackedJob
 from app.models.preferences import Demographics, ResumeProfile, WorkAuthorization
 from app.models.user import User
-from app.skills.runner import ClaudeCodeError, run_claude_prompt
+from app.skills.runner import ClaudeCodeError
 
 log = logging.getLogger(__name__)
 
@@ -570,12 +568,20 @@ Most postings are filtered by an automated screener (ATS) that scores
 resumes on exact keyword overlap with the job description. Your job is
 to maximize that score **without fabricating anything**:
 
-- **Extract the JD's ATS keywords mentally first.** Look at the verbatim
-  JD above for: specific technology names (Kubernetes, Terraform, React,
-  Postgres), methodologies (Agile, Scrum, SAFe, OKRs), domain terms
-  (HIPAA, PCI-DSS, AML, L4/L7), role-scope verbs ("architected", "led",
-  "owned", "shipped"), seniority markers ("senior", "staff", "principal"),
-  and exact phrases the JD repeats.
+- **Work from the FULL verbatim job description above, not just the
+  extracted required/nice-to-have skill lists.** Those lists are a
+  convenience summary; the JD text itself is the keyword source of
+  truth — responsibilities prose, qualification bullets, and benefit/
+  culture sections all carry screener terms the lists miss.
+- **Extract the JD's ATS keywords first.** Before writing anything,
+  re-read the verbatim JD and list (internally) the 15–25 most
+  load-bearing keywords: specific technology names (Kubernetes,
+  Terraform, React, Postgres), methodologies (Agile, Scrum, SAFe, OKRs),
+  domain terms (HIPAA, PCI-DSS, AML, L4/L7), role-scope verbs
+  ("architected", "led", "owned", "shipped"), seniority markers
+  ("senior", "staff", "principal"), and exact phrases the JD repeats.
+  Then, as you write, work every keyword the candidate can honestly
+  claim into the summary, Core Skills, or a bullet.
 - **Use the JD's exact spelling and casing.** If the JD says
   "PostgreSQL", write PostgreSQL — not "Postgres" or "psql". "TypeScript"
   not "Typescript". "CI/CD" not "CICD". "React.js" not "React" if that's
@@ -629,7 +635,7 @@ Return ONE JSON object, no prose, no markdown fences around the JSON:
 {{
   "title": string,          // e.g. "Resume – Acme Senior Engineer"
   "content_md": string,     // the full resume in Markdown, following the structure above
-  "notes": string,          // 1–2 sentences explicitly naming WHICH aspects of the candidate you surfaced to match THIS JD, and what you trimmed
+  "notes": string,          // 2–3 sentences: WHICH aspects of the candidate you surfaced to match THIS JD, what you trimmed, and the main JD keywords you worked in (plus any JD keywords you deliberately OMITTED because the candidate can't honestly claim them)
   "warning": string | null  // honest caveats (missing phone, no dated roles, etc.)
 }}
 """
@@ -1663,10 +1669,6 @@ async def _run_tailor(
         def __missing__(self, key):
             return "(n/a)"
     prompt = prompt_template.format_map(_SafeDict(**format_kwargs))
-
-    api_token = create_access_token(
-        subject=str(user.id), extra={"purpose": f"doc_tailor_{doc_type}"}
-    )
 
     # Version: one more than the highest existing version for this job + doc_type.
     prev_row = (

@@ -2629,6 +2629,27 @@ async def perform_fetch(
         )
         allowed_tools = ["WebFetch"]
 
+    # The parse stage is text-only and honors the user's "URL fetch" model
+    # choice — including external providers. The WebFetch FALLBACK needs a
+    # tool, which external models don't have, so when the configured fetch
+    # model is external, run the fallback on the default Claude model
+    # (action=None → ANTHROPIC_DEFAULT_MODEL) instead of failing.
+    fetch_action: Optional[str] = "fetch"
+    if allowed_tools:
+        from app.skills.llm_providers import resolve_ext_model as _rex
+        from app.skills.model_settings import get_model_for as _gm
+
+        if _rex(_gm("fetch")):
+            _emit({
+                "kind": "system",
+                "text": (
+                    "Configured fetch model is an external provider (no "
+                    "WebFetch tool) — using the default Claude model for "
+                    "this fallback."
+                ),
+            })
+            fetch_action = None
+
     final_text = ""
     if on_event is not None:
         from app.skills.runner import (
@@ -2642,7 +2663,7 @@ async def perform_fetch(
             prompt=prompt,
             allowed_tools=allowed_tools,
             timeout_seconds=180,
-            action="fetch",
+            action=fetch_action,
         ):
             ev_type = raw.get("type")
             if ev_type == "system":
@@ -2702,7 +2723,7 @@ async def perform_fetch(
             output_format="json",
             allowed_tools=allowed_tools,
             timeout_seconds=180,
-            action="fetch",
+            action=fetch_action,
         )
         final_text = result.result
 
@@ -3214,23 +3235,40 @@ class _ModelSettingsIn(BaseModel):
     models: dict[str, str]
 
 
-@router.get("/model-settings")
-async def get_model_settings(_: User = Depends(get_current_user)) -> dict:
-    """List the per-action Claude model picker — current choices, plus
-    the catalogue of supported models and action keys the UI renders.
-
-    All Claude invocations go through the Claude Code CLI (`claude -p
-    --model <id>`). No Anthropic API SDK is involved.
-    """
+def _model_settings_payload(models: dict[str, str]) -> dict:
+    """Shared response shape for the model-settings endpoints. Includes
+    the external-provider dropdown entries and which actions may use
+    them (tool-dependent actions are Claude-only — see
+    model_settings.EXT_COMPATIBLE_ACTIONS)."""
+    from app.skills import llm_providers as _lp
     from app.skills import model_settings as _ms
 
     return {
-        "models": _ms.get_all(),
+        "models": models,
         "actions": [{"key": k, "label": label} for k, label in _ms.ACTIONS],
         "model_choices": [
             {"id": mid, "label": label} for mid, label in _ms.MODEL_CHOICES
         ],
+        "ext_choices": [
+            {"id": mid, "label": label} for mid, label in _lp.provider_choices()
+        ],
+        "ext_allowed_actions": sorted(_ms.EXT_COMPATIBLE_ACTIONS),
     }
+
+
+@router.get("/model-settings")
+async def get_model_settings(_: User = Depends(get_current_user)) -> dict:
+    """List the per-action model picker — current choices, plus the
+    catalogue of supported models and action keys the UI renders.
+
+    Claude invocations go through the Claude Code CLI (`claude -p
+    --model <id>`); `ext:<provider>/<model>` values route to a
+    user-configured OpenAI-compatible provider instead (see
+    /jobs/llm-providers).
+    """
+    from app.skills import model_settings as _ms
+
+    return _model_settings_payload(_ms.get_all())
 
 
 @router.put("/model-settings")
@@ -3242,14 +3280,35 @@ async def put_model_settings(
     model ids are silently dropped before persisting."""
     from app.skills import model_settings as _ms
 
-    saved = _ms.set_all(payload.models or {})
-    return {
-        "models": saved,
-        "actions": [{"key": k, "label": label} for k, label in _ms.ACTIONS],
-        "model_choices": [
-            {"id": mid, "label": label} for mid, label in _ms.MODEL_CHOICES
-        ],
-    }
+    return _model_settings_payload(_ms.set_all(payload.models or {}))
+
+
+class _LlmProvidersIn(BaseModel):
+    providers: list[dict] = Field(default_factory=list, max_length=10)
+
+
+@router.get("/llm-providers")
+async def get_llm_providers(_: User = Depends(get_current_user)) -> dict:
+    """List configured external LLM providers (OpenAI-compatible). API
+    keys are never returned — only a has_api_key flag."""
+    from app.skills import llm_providers as _lp
+
+    return {"providers": _lp.public_providers()}
+
+
+@router.put("/llm-providers")
+async def put_llm_providers(
+    payload: _LlmProvidersIn,
+    _: User = Depends(get_current_user),
+) -> dict:
+    """Replace the external-provider list. An entry with an empty
+    api_key keeps the previously stored key for that provider id, so
+    the UI never round-trips secrets. Invalid entries (missing label /
+    non-http base_url / no models) are dropped silently."""
+    from app.skills import llm_providers as _lp
+
+    _lp.save_providers(payload.providers)
+    return {"providers": _lp.public_providers()}
 
 
 @router.get("/activity/stream")

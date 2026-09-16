@@ -735,7 +735,15 @@ type ModelSettings = {
   models: Record<string, string>;
   actions: ActionMeta[];
   model_choices: ModelChoice[];
+  // External (OpenAI-compatible) provider models, offered only on the
+  // actions listed in ext_allowed_actions — the rest need Claude's tools.
+  ext_choices: ModelChoice[];
+  ext_allowed_actions: string[];
 };
+
+// Fired by LlmProvidersPanel after a save so ModelPickerPanel refetches
+// its dropdown options without a page reload.
+const PROVIDERS_SAVED_EVENT = "jsp:llm-providers-saved";
 
 export function ModelPickerPanel() {
   const [state, setState] = useState<ModelSettings | null>(null);
@@ -757,6 +765,11 @@ export function ModelPickerPanel() {
 
   useEffect(() => {
     refresh();
+    // Re-pull the choice list when the providers panel below saves.
+    const onSaved = () => refresh();
+    window.addEventListener(PROVIDERS_SAVED_EVENT, onSaved);
+    return () => window.removeEventListener(PROVIDERS_SAVED_EVENT, onSaved);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   if (!state) {
@@ -807,53 +820,62 @@ export function ModelPickerPanel() {
     <section className="jsp-card p-5">
       <header className="mb-3">
         <h2 className="text-sm uppercase tracking-wider text-corp-muted">
-          Claude model per action
+          Model per action
         </h2>
         <p className="text-[11px] text-corp-muted mt-1 max-w-2xl">
-          Route different work to different Claude models — cheap fetches via
+          Route different work to different models — cheap fetches via
           Haiku, resume writing via Opus, JD analysis via Sonnet, etc. The
-          options are tier <em>aliases</em> that always resolve to the newest
-          release of that tier: pick <strong>Opus</strong> and you get Opus 4.8
-          today and whatever ships next automatically — no update needed.
-          (The CLI can&apos;t list exact versions, so there&apos;s nothing to
-          enumerate; aliases are how you stay current.) All requests still go
-          through the Claude Code CLI (<code>claude -p --model …</code>); no
-          Anthropic API SDK is involved. Leave a row on <strong>Default</strong>
-          {" "}to fall back to <code>ANTHROPIC_DEFAULT_MODEL</code>.
+          Claude options are tier <em>aliases</em> that always resolve to the
+          newest release of that tier: pick <strong>Opus</strong> and you get
+          Opus 4.8 today and whatever ships next automatically — no update
+          needed. Claude requests go through the Claude Code CLI
+          (<code>claude -p --model …</code>). Rows marked{" "}
+          <em>(external)</em> route to a provider configured below
+          (OpenAI, DeepSeek, local Ollama, …) — those are text-only, so
+          they&apos;re offered just on actions whose prompts don&apos;t need
+          Claude&apos;s tools. Leave a row on <strong>Default</strong> to fall
+          back to <code>ANTHROPIC_DEFAULT_MODEL</code>.
         </p>
       </header>
 
       <ul className="divide-y divide-corp-border">
-        {state.actions.map((a) => (
-          <li
-            key={a.key}
-            className="py-2 flex items-center gap-3 flex-wrap"
-          >
-            <span className="text-sm w-72 shrink-0">{a.label}</span>
-            <select
-              className="jsp-input flex-1 min-w-[16rem]"
-              value={draft[a.key] ?? ""}
-              onChange={(e) =>
-                setDraft((prev) => ({ ...prev, [a.key]: e.target.value }))
-              }
-              disabled={saving}
+        {state.actions.map((a) => {
+          const extAllowed = (state.ext_allowed_actions ?? []).includes(a.key);
+          const choices = extAllowed
+            ? [...state.model_choices, ...(state.ext_choices ?? [])]
+            : state.model_choices;
+          return (
+            <li
+              key={a.key}
+              className="py-2 flex items-center gap-3 flex-wrap"
             >
-              {state.model_choices.map((c) => (
-                <option key={c.id || "default"} value={c.id}>
-                  {c.label}
-                </option>
-              ))}
-              {/* A previously-saved exact version (pinned before we moved to
-                  aliases) won't be in model_choices — surface it so the row
-                  shows the real current value and the user can keep or change
-                  it instead of it silently appearing as Default. */}
-              {draft[a.key] &&
-              !state.model_choices.some((c) => c.id === draft[a.key]) ? (
-                <option value={draft[a.key]}>{draft[a.key]} (pinned)</option>
-              ) : null}
-            </select>
-          </li>
-        ))}
+              <span className="text-sm w-72 shrink-0">{a.label}</span>
+              <select
+                className="jsp-input flex-1 min-w-[16rem]"
+                value={draft[a.key] ?? ""}
+                onChange={(e) =>
+                  setDraft((prev) => ({ ...prev, [a.key]: e.target.value }))
+                }
+                disabled={saving}
+              >
+                {choices.map((c) => (
+                  <option key={c.id || "default"} value={c.id}>
+                    {c.label}
+                  </option>
+                ))}
+                {/* A previously-saved value not in the list (an exact pinned
+                    version, or an external model whose provider was removed /
+                    isn't allowed on this action) — surface it so the row
+                    shows the real current value instead of silently
+                    appearing as Default. */}
+                {draft[a.key] &&
+                !choices.some((c) => c.id === draft[a.key]) ? (
+                  <option value={draft[a.key]}>{draft[a.key]} (pinned)</option>
+                ) : null}
+              </select>
+            </li>
+          );
+        })}
       </ul>
 
       <div className="flex items-center gap-2 mt-3">
@@ -870,6 +892,224 @@ export function ModelPickerPanel() {
         ) : null}
         {err ? <span className="text-[11px] text-corp-danger">{err}</span> : null}
       </div>
+    </section>
+  );
+}
+
+
+// ---------- External LLM providers (OpenAI-compatible) ---------------------
+
+type ProviderRow = {
+  id: string | null; // null = newly added, server assigns a slug
+  label: string;
+  base_url: string;
+  modelsText: string; // comma-separated in the UI
+  apiKey: string; // "" = keep the stored key (never round-tripped)
+  has_api_key: boolean;
+};
+
+type PublicProvider = {
+  id: string;
+  label: string;
+  base_url: string;
+  models: string[];
+  has_api_key: boolean;
+};
+
+export function LlmProvidersPanel() {
+  const [rows, setRows] = useState<ProviderRow[] | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  function toRows(providers: PublicProvider[]): ProviderRow[] {
+    return providers.map((p) => ({
+      id: p.id,
+      label: p.label,
+      base_url: p.base_url,
+      modelsText: p.models.join(", "),
+      apiKey: "",
+      has_api_key: p.has_api_key,
+    }));
+  }
+
+  useEffect(() => {
+    api
+      .get<{ providers: PublicProvider[] }>("/api/v1/jobs/llm-providers")
+      .then((d) => setRows(toRows(d.providers)))
+      .catch((e) =>
+        setErr(e instanceof ApiError ? `HTTP ${e.status}` : "Load failed."),
+      );
+  }, []);
+
+  function update(i: number, patch: Partial<ProviderRow>) {
+    setRows((prev) =>
+      prev ? prev.map((r, j) => (j === i ? { ...r, ...patch } : r)) : prev,
+    );
+  }
+
+  async function save() {
+    if (!rows) return;
+    setSaving(true);
+    setErr(null);
+    try {
+      const payload = {
+        providers: rows.map((r) => ({
+          id: r.id ?? undefined,
+          label: r.label.trim(),
+          base_url: r.base_url.trim(),
+          api_key: r.apiKey, // "" keeps the stored key server-side
+          models: r.modelsText
+            .split(",")
+            .map((m) => m.trim())
+            .filter(Boolean),
+        })),
+      };
+      const d = await api.put<{ providers: PublicProvider[] }>(
+        "/api/v1/jobs/llm-providers",
+        payload,
+      );
+      setRows(toRows(d.providers));
+      setSavedAt(Date.now());
+      setTimeout(() => setSavedAt(null), 2500);
+      // Tell the model picker above to refetch its dropdown options.
+      window.dispatchEvent(new Event(PROVIDERS_SAVED_EVENT));
+    } catch (e) {
+      setErr(
+        e instanceof ApiError ? `Save failed (HTTP ${e.status}).` : "Save failed.",
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section className="jsp-card p-5">
+      <header className="mb-3">
+        <h2 className="text-sm uppercase tracking-wider text-corp-muted">
+          External LLM providers
+        </h2>
+        <p className="text-[11px] text-corp-muted mt-1 max-w-2xl">
+          Add any OpenAI-compatible endpoint and its models show up in the
+          per-action picker above as <em>(external)</em> options. Works with
+          hosted APIs (OpenAI <code>https://api.openai.com/v1</code>, DeepSeek{" "}
+          <code>https://api.deepseek.com/v1</code>, OpenRouter) and local
+          servers (Ollama <code>http://host:11434/v1</code>, LM Studio, vLLM —
+          leave the API key blank if the server doesn&apos;t need one).
+          External models are <strong>text-only</strong>: no web access or
+          tool use, so they&apos;re offered on tailoring, humanize, URL-parse,
+          and company-research actions — the rest stay on Claude. Keys are
+          stored server-side and never sent back to the browser.
+        </p>
+      </header>
+
+      {rows === null ? (
+        <p className="text-xs text-corp-muted">{err ?? "Loading…"}</p>
+      ) : (
+        <>
+          <ul className="space-y-3">
+            {rows.map((r, i) => (
+              <li
+                key={r.id ?? `new-${i}`}
+                className="border border-corp-border rounded p-3 grid grid-cols-2 gap-2"
+              >
+                <div>
+                  <label className="jsp-label">Name</label>
+                  <input
+                    className="jsp-input"
+                    placeholder="DeepSeek"
+                    value={r.label}
+                    onChange={(e) => update(i, { label: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <label className="jsp-label">Base URL</label>
+                  <input
+                    className="jsp-input"
+                    placeholder="https://api.deepseek.com/v1"
+                    value={r.base_url}
+                    onChange={(e) => update(i, { base_url: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <label className="jsp-label">Models (comma-separated)</label>
+                  <input
+                    className="jsp-input"
+                    placeholder="deepseek-chat, deepseek-reasoner"
+                    value={r.modelsText}
+                    onChange={(e) => update(i, { modelsText: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <label className="jsp-label">API key</label>
+                  <div className="flex gap-2 items-center">
+                    <input
+                      className="jsp-input flex-1"
+                      type="password"
+                      placeholder={
+                        r.has_api_key
+                          ? "•••••• (stored — leave blank to keep)"
+                          : "(none — fine for local servers)"
+                      }
+                      value={r.apiKey}
+                      onChange={(e) => update(i, { apiKey: e.target.value })}
+                      autoComplete="off"
+                    />
+                    <button
+                      type="button"
+                      className="jsp-btn-ghost text-xs text-corp-danger shrink-0"
+                      onClick={() =>
+                        setRows((prev) =>
+                          prev ? prev.filter((_, j) => j !== i) : prev,
+                        )
+                      }
+                      title="Remove this provider (takes effect on Save)"
+                    >
+                      Remove
+                    </button>
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+
+          <div className="flex items-center gap-2 mt-3">
+            <button
+              type="button"
+              className="jsp-btn-ghost text-xs"
+              onClick={() =>
+                setRows((prev) => [
+                  ...(prev ?? []),
+                  {
+                    id: null,
+                    label: "",
+                    base_url: "",
+                    modelsText: "",
+                    apiKey: "",
+                    has_api_key: false,
+                  },
+                ])
+              }
+            >
+              + Add provider
+            </button>
+            <button
+              type="button"
+              className="jsp-btn-primary text-xs"
+              onClick={save}
+              disabled={saving}
+            >
+              {saving ? "Saving…" : "Save providers"}
+            </button>
+            {savedAt ? (
+              <span className="text-[11px] text-corp-ok">Saved.</span>
+            ) : null}
+            {err ? (
+              <span className="text-[11px] text-corp-danger">{err}</span>
+            ) : null}
+          </div>
+        </>
+      )}
     </section>
   );
 }

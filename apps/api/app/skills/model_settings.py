@@ -48,6 +48,23 @@ ACTIONS: tuple[tuple[str, str], ...] = (
 )
 _VALID_KEYS = frozenset(k for k, _ in ACTIONS)
 
+# Actions whose prompts are fully self-contained (all context inlined, no
+# Bash / WebFetch / session use) and can therefore run on an external
+# OpenAI-compatible provider (see skills/llm_providers.py). Everything
+# else needs Claude Code's tools — e.g. jd_analyze and interview_prep
+# curl the app's own API for the user's history, fetch may fall back to
+# WebFetch, companion_chat resumes CLI sessions. The runner enforces
+# this: an `ext:` model configured for a non-listed action falls back to
+# ANTHROPIC_DEFAULT_MODEL with a logged warning.
+EXT_COMPATIBLE_ACTIONS = frozenset({
+    "fetch",             # parse stage is no-tool; WebFetch fallback reroutes to Claude
+    "tailor_resume",
+    "tailor_cover_letter",
+    "tailor_other",
+    "humanize",
+    "org_research",      # pipeline fetches pages itself; Claude only parses
+})
+
 # Models we surface in the Settings dropdown.
 #
 # Why aliases, not pinned version IDs: the Claude Code CLI has no way to

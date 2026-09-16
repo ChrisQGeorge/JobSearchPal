@@ -36,6 +36,35 @@ class ClaudeCodeError(RuntimeError):
     """Raised when the Claude Code CLI fails or its output cannot be parsed."""
 
 
+def _resolve_external(
+    chosen_model: str | None, action: str | None
+) -> tuple[dict | None, str | None, str | None]:
+    """Decide whether this run goes to an external OpenAI-compatible
+    provider instead of the Claude CLI.
+
+    Returns (provider, ext_model, effective_claude_model):
+      * provider set → run externally with ext_model.
+      * provider None → run the CLI with effective_claude_model (which is
+        the incoming model, or the env default when an ext model was
+        configured for an action that needs Claude's tools).
+    """
+    from app.skills.llm_providers import resolve_ext_model
+    from app.skills.model_settings import EXT_COMPATIBLE_ACTIONS
+
+    ext = resolve_ext_model(chosen_model)
+    if ext is None:
+        return None, None, chosen_model
+    if action is not None and action not in EXT_COMPATIBLE_ACTIONS:
+        log.warning(
+            "Action %r requires Claude Code tools; configured external model %r "
+            "ignored — using ANTHROPIC_DEFAULT_MODEL.",
+            action, chosen_model,
+        )
+        return None, None, settings.ANTHROPIC_DEFAULT_MODEL or None
+    provider, ext_model = ext
+    return provider, ext_model, None
+
+
 @dataclass(frozen=True)
 class ClaudeResult:
     """Parsed result of a `claude -p --output-format json` invocation."""
@@ -74,15 +103,45 @@ async def run_claude_prompt(
     Raises ClaudeCodeError on non-zero exit, timeout, or JSON parse failure.
     """
 
-    cmd: list[str] = [settings.CLAUDE_CODE_BIN, "-p", prompt, "--output-format", output_format]
-
     # Pin the model. The runner consults the user's per-action override
     # (from /api/v1/jobs/model-settings, persisted in /root/.claude) and
-    # falls back to ANTHROPIC_DEFAULT_MODEL. We always go through the CLI
-    # `--model` flag — never the Anthropic API SDK.
+    # falls back to ANTHROPIC_DEFAULT_MODEL. Claude models go through the
+    # CLI `--model` flag — never the Anthropic API SDK. `ext:` models
+    # (user-configured OpenAI-compatible providers — DeepSeek, OpenAI,
+    # local Ollama, …) skip the CLI entirely and hit the provider's HTTP
+    # API. External models are text-only: allowed_tools / session_id are
+    # ignored (tool-dependent actions are gated in _resolve_external).
     from app.skills.model_settings import get_model_for as _get_model
 
     chosen_model = _get_model(action) if action else settings.ANTHROPIC_DEFAULT_MODEL
+    provider, ext_model, chosen_model = _resolve_external(chosen_model, action)
+    if provider is not None:
+        from app.skills.llm_providers import ExternalProviderError, chat_text
+
+        log.info(
+            "Invoking external provider %s model %s (action=%s)",
+            provider["id"], ext_model, action,
+        )
+        try:
+            text = await chat_text(
+                provider, ext_model, prompt, timeout_seconds=timeout_seconds
+            )
+        except ExternalProviderError as exc:
+            raise ClaudeCodeError(str(exc)) from exc
+        except Exception as exc:
+            raise ClaudeCodeError(
+                f"External provider {provider['label']} failed: {exc}"
+            ) from exc
+        return ClaudeResult(
+            result=text,
+            session_id=None,
+            cost_usd=None,
+            duration_ms=None,
+            num_turns=None,
+            raw={"result": text, "provider": provider["id"], "model": ext_model},
+        )
+
+    cmd: list[str] = [settings.CLAUDE_CODE_BIN, "-p", prompt, "--output-format", output_format]
     if chosen_model:
         cmd += ["--model", chosen_model]
 
@@ -206,6 +265,56 @@ async def stream_claude_prompt(
     """
     import asyncio as _a
 
+    from app.skills.model_settings import get_model_for as _get_model
+
+    chosen_model = _get_model(action) if action else settings.ANTHROPIC_DEFAULT_MODEL
+    provider, ext_model, chosen_model = _resolve_external(chosen_model, action)
+    if provider is not None:
+        # External OpenAI-compatible provider — no CLI subprocess. Emit
+        # events in the same stream-json shape the consumers expect:
+        # assistant text blocks (flushed in chunks for liveness on the
+        # activity feed) followed by a terminal `result`. Tools and
+        # `--resume` sessions don't exist here; `_resolve_external`
+        # already gated tool-dependent actions back to Claude.
+        from app.skills.llm_providers import stream_chat
+
+        log.info(
+            "Streaming external provider %s model %s (action=%s)",
+            provider["id"], ext_model, action,
+        )
+        yield {"type": "system", "subtype": "init", "provider": provider["id"]}
+        collected: list[str] = []
+        buf: list[str] = []
+        buf_len = 0
+        try:
+            async for delta in stream_chat(
+                provider, ext_model, prompt, timeout_seconds=timeout_seconds
+            ):
+                collected.append(delta)
+                buf.append(delta)
+                buf_len += len(delta)
+                if buf_len >= 600:
+                    yield {
+                        "type": "assistant",
+                        "message": {"content": [{"type": "text", "text": "".join(buf)}]},
+                    }
+                    buf, buf_len = [], 0
+        except Exception as exc:
+            yield {"type": "error", "message": f"{provider['label']}: {exc}"[:2000]}
+            return
+        if buf:
+            yield {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "".join(buf)}]},
+            }
+        yield {
+            "type": "result",
+            "result": "".join(collected),
+            "provider": provider["id"],
+            "model": ext_model,
+        }
+        return
+
     cmd: list[str] = [
         settings.CLAUDE_CODE_BIN,
         "-p",
@@ -215,9 +324,6 @@ async def stream_claude_prompt(
         "--verbose",  # stream-json requires --verbose
         "--include-partial-messages",
     ]
-    from app.skills.model_settings import get_model_for as _get_model
-
-    chosen_model = _get_model(action) if action else settings.ANTHROPIC_DEFAULT_MODEL
     if chosen_model:
         cmd += ["--model", chosen_model]
     if session_id:

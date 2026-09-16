@@ -8,6 +8,7 @@ import {
   ApiKeysPanel,
   ClaudeAuthPanel,
   DataIoPanel,
+  LlmProvidersPanel,
   ModelPickerPanel,
   PersonaManager,
 } from "./_panels/SettingsPanels";
@@ -40,7 +41,7 @@ const TABS: { key: Tab; label: string }[] = [
   { key: "demographics", label: "Demographics" },
   // App-level config follows.
   { key: "claude-auth", label: "Claude Auth" },
-  { key: "models", label: "Claude Models" },
+  { key: "models", label: "Models" },
   { key: "api-keys", label: "API Keys" },
   { key: "personas", label: "Personas" },
   { key: "data-io", label: "Data Export / Import" },
@@ -90,7 +91,12 @@ export default function SettingsPage() {
       {tab === "criteria" && <CriteriaPanel />}
       {tab === "demographics" && <DemographicsPanel />}
       {tab === "claude-auth" && <ClaudeAuthPanel />}
-      {tab === "models" && <ModelPickerPanel />}
+      {tab === "models" && (
+        <div className="space-y-4">
+          <ModelPickerPanel />
+          <LlmProvidersPanel />
+        </div>
+      )}
       {tab === "api-keys" && <ApiKeysPanel />}
       {tab === "personas" && <PersonaManager />}
       {tab === "data-io" && <DataIoPanel />}
