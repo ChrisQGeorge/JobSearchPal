@@ -396,9 +396,9 @@ THIS job. Every section of the output must be informed by THIS job — the
 summary, the skills ordering, which roles get the most bullets, which
 highlights get surfaced, even which projects you include.
 
-If a role in the history isn't relevant to this job, shrink it to one line.
-If a skill isn't relevant, leave it off. If the JD emphasizes something the
-candidate has, foreground it. You are not producing a generic resume that
+If a role in the history isn't relevant to this job, LEAVE IT OFF (see
+the relevance rules below). If a skill isn't relevant, leave it off. If
+the JD emphasizes something the candidate has, foreground it. You are not producing a generic resume that
 merely happens to be for this company — you are producing THE resume for
 THIS posting.
 
@@ -497,10 +497,20 @@ if highlights are strong enough to stand alone.
 - Bullets should be one line each in the source markdown (no line wraps
   mid-bullet); commas/semicolons are fine for readability.
 
-List roles reverse-chronologically. Include every role the user has on
-file, but scale depth to relevance: the most JD-relevant roles get the
-most bullets; older or off-topic roles can compress to a single summary
-bullet.
+List roles reverse-chronologically. Include ONLY experience relevant to
+THIS job. The candidate profile is a comprehensive archive of everything
+they've ever done — it is NOT a checklist. An off-topic role (different
+field, no transferable JD-relevant skills — e.g. a bakery job on a
+database-administrator resume) is OMITTED entirely; unrelated work
+signals a weaker candidate to both the ATS and the human skim, and it
+spends the word budget the relevant roles need. Among the roles you DO
+keep, scale depth to relevance: the most JD-relevant get the most
+bullets, peripheral-but-relevant ones compress to 1–2 bullets.
+
+One exception: if omitting an off-topic role would leave a conspicuous
+multi-year hole in the RECENT timeline (roughly the last 5 years), keep
+it as a single title — org — dates line with no bullets, purely to
+preserve employment continuity. Older gaps need no such padding.
 
 ## Education
 
@@ -595,10 +605,12 @@ draft. Treat them accordingly:
   over, the first cut is paragraphs from the LEAST JD-relevant role
   — not equal trimming across all roles. Less-relevant roles
   collapse to one line.
-- **If a description doesn't yield any JD-relevant fact, the role
-  still appears** (employment continuity matters), but at the
-  minimum: title + org + dates + one neutral summary line. No
-  bullets.
+- **Irrelevant roles are omitted, not padded.** A role whose
+  description yields no JD-relevant or transferable fact does NOT
+  appear on this resume — unless dropping it would open a conspicuous
+  recent-timeline gap (see the Professional Experience rules above),
+  in which case it gets exactly one title — org — dates line and
+  nothing more.
 
 ATS keyword matching (critical — this resume will be scanned by software
 before a human sees it)
