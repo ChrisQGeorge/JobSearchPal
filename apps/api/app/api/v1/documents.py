@@ -357,6 +357,18 @@ async def delete_document(
 
 _TAILOR_RESUME_PROMPT = """You are TAILORING a resume for a SPECIFIC job posting.
 
+THE GOAL IS TO GET THE CANDIDATE THIS JOB. Not to produce a tidy,
+average, inoffensive resume — to win the interview. Every choice you
+make (what to lead with, what to cut, how to phrase a bullet) should be
+judged by one question: "does this make the screener and the hiring
+manager MORE likely to advance this candidate for THIS role?" Write the
+strongest, most persuasive case the candidate's REAL history supports.
+Frame accomplishments at their full honest weight — scope, scale,
+outcomes — rather than underselling them; a hedged, modest resume loses
+to a confident one built from the same facts. Persuasion comes from
+selection, ordering, and framing of TRUE material; the honesty rules
+below are the hard boundary, not a suggestion to be bland.
+
 "Tailoring" means: you read the target job carefully, then you pick, reorder,
 and rephrase from the candidate's real history to maximize the match for
 THIS job. Every section of the output must be informed by THIS job — the
@@ -645,6 +657,16 @@ _TAILOR_COVER_LETTER_PROMPT = """You are writing a cover letter TAILORED to a
 specific job posting. "Tailored" means: every sentence should be grounded in
 THIS job's specifics — the company, the team, the product, the stated
 requirements, the stated values — mapped to the candidate's REAL history.
+
+THE GOAL IS TO GET THE CANDIDATE THIS JOB. This letter is a sales
+document, not a formality: its job is to make the reader want to
+interview this specific person for this specific role. Be as persuasive
+as the candidate's REAL history allows — lead with the strongest
+evidence, frame accomplishments at their full honest weight, and make
+the fit feel obvious and inevitable rather than politely plausible. An
+average, safe letter is a failure even if it's well-written. Persuasion
+comes from choosing and framing true material; the honesty rules below
+are the hard boundary, not a reason to undersell.
 
 A generic "I'm passionate about software and excited to apply" letter is a
 failure. The reader should be unable to swap in a different company name
