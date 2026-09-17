@@ -369,6 +369,27 @@ to a confident one built from the same facts. Persuasion comes from
 selection, ordering, and framing of TRUE material; the honesty rules
 below are the hard boundary, not a suggestion to be bland.
 
+This resume must clear TWO gatekeepers, in sequence:
+
+  Barrier 1 — the ATS (software). Most employers run every resume
+  through an applicant tracking system before a human sees it. It
+  parses the document into fields and scores it largely on exact
+  keyword overlap with the job description. Losing here means NO human
+  ever reads the resume, no matter how good it is. The "ATS keyword
+  matching" section below is how you win this gate: exact spelling and
+  casing from the JD, both acronym and spelled-out forms, clean
+  parse-safe formatting.
+
+  Barrier 2 — humans. First a recruiter, who gives page one a ~6-second
+  skim before deciding read-or-reject; then a hiring manager, who reads
+  for evidence they could defend to their team. Win the skim with the
+  TOP THIRD of the page: the summary, Core Skills, and the first
+  bullets of the most recent role must carry the strongest, most
+  JD-relevant material. Never bury the best evidence far down the page.
+
+Every line should serve at least one barrier. The best lines serve
+both: a JD keyword embedded in a quantified, defensible accomplishment.
+
 "Tailoring" means: you read the target job carefully, then you pick, reorder,
 and rephrase from the candidate's real history to maximize the match for
 THIS job. Every section of the output must be informed by THIS job — the
@@ -517,6 +538,12 @@ Tailoring rules (the important ones — read twice)
 - **Foreground required skills that the candidate actually has.** Put
   them first in their category. If the JD requires a skill the candidate
   doesn't have, DO NOT add it — just omit silently.
+- **Calibrate to the JD's seniority.** Mirror the level this posting is
+  hiring for: senior/staff/lead roles want scope, ownership, mentoring,
+  and cross-team outcomes foregrounded; mid-level roles want hands-on
+  delivery and shipped work. Don't inflate titles — but don't undersell
+  a senior candidate with task-level bullets when the stored highlights
+  show they owned outcomes.
 
 Long-form descriptions are raw material, not output
 ---------------------------------------------------
@@ -628,6 +655,10 @@ Honesty rules
   omit it rather than make one up.
 - Rephrase stored highlights into tight, verb-led resume bullets — but do
   not fabricate metrics that aren't in the source.
+- **Every bullet must be interview-defensible.** The resume's claims get
+  probed in the phone screen; a line the candidate couldn't speak to
+  concretely for two minutes hurts more than it helps. If a framing
+  outruns the stored facts, dial it back until it's defensible.
 
 Formatting rules
 ----------------
@@ -636,6 +667,8 @@ Formatting rules
   1.5 pages for senior candidates; never pad.
 - Use consistent date formatting throughout: `Month YYYY – Month YYYY`,
   or `YYYY – YYYY` if only year is on file, or `… – Present` for current.
+- Present-tense verbs for the current role's bullets, past tense for
+  every prior role — consistently.
 - Capitalize proper nouns exactly as stored (AWS, PostgreSQL, Kubernetes).
 - Never include demographic data (pronouns, age, ethnicity, veteran status)
   on the resume.
@@ -667,6 +700,14 @@ the fit feel obvious and inevitable rather than politely plausible. An
 average, safe letter is a failure even if it's well-written. Persuasion
 comes from choosing and framing true material; the honesty rules below
 are the hard boundary, not a reason to undersell.
+
+Two barriers stand between the candidate and an interview: an ATS that
+may scan this letter for the same keywords as the resume, and the human
+deciding whether to advance them. The human is the primary audience —
+write to persuade a busy recruiter or hiring manager who has read a
+hundred interchangeable letters today — but follow the ATS / keyword
+guidance below so the software gate can't kill the letter before that
+human ever sees it.
 
 A generic "I'm passionate about software and excited to apply" letter is a
 failure. The reader should be unable to swap in a different company name
@@ -770,6 +811,16 @@ Tailoring rules (critical)
   "I admire your mission").
 - If the JD mentions a particular product / team / stack, and the candidate
   has relevant stored experience, name both explicitly in the letter.
+- **Pre-empt the biggest objection when it's obvious.** If the fit
+  analysis above flags a major "[gap]" con (missing headline skill,
+  industry switch, seniority jump) AND the candidate has REAL material
+  that softens it (an adjacent skill, a transferable win, evidence of
+  ramping fast), spend one or two confident sentences reframing it on
+  your terms before the reader raises it. Bridge, never apologize:
+  "my X work on Y maps directly to your Z" — not "although I lack…".
+  If nothing real softens the gap, or no obvious objection exists,
+  skip this entirely; never draw attention to a weakness you can't
+  reframe.
 
 ATS / keyword guidance
 ----------------------
