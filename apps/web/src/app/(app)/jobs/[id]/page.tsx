@@ -145,6 +145,7 @@ export default function JobDetailPage({
             }
           />
           <MoveToApplyButton
+            jobId={job.id}
             status={job.status}
             sourceUrl={job.source_url ?? null}
             disabled={saving}
@@ -633,18 +634,85 @@ function ReviewAction({
  * when the user came via `?from=apply` but this row is no longer
  * `interested` (they already acted), so they don't lose their place.
  */
+/** Client-side .md download — same mechanism as the Studio editor's
+ * "Download .md" button. */
+function downloadMarkdownFile(filenameBase: string, content: string): void {
+  const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${filenameBase}.md`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Give the browser a tick to start the download before revoking.
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function sanitizeFilename(s: string): string {
+  return (
+    s
+      .replace(/[\\/:*?"<>|]+/g, "-")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 120) || "document"
+  );
+}
+
+/** Best-effort: download the newest READY resume + cover letter tailored
+ * to this job. A doc whose latest version is still generating (empty
+ * body) falls back to the previous ready version. Missing doc types are
+ * skipped silently — the user may only have written one of the two. */
+async function downloadLatestJobDocs(jobId: number): Promise<void> {
+  let docs: GeneratedDocument[];
+  try {
+    docs = await api.get<GeneratedDocument[]>(
+      `/api/v1/documents?tracked_job_id=${jobId}`,
+    );
+  } catch {
+    return; // QOL feature — never let it break the apply flow
+  }
+  for (const docType of ["resume", "cover_letter"] as const) {
+    const candidates = docs
+      .filter((d) => d.doc_type === docType && d.has_text !== false)
+      .sort((a, b) => b.version - a.version || b.id - a.id)
+      .slice(0, 3);
+    for (const c of candidates) {
+      try {
+        const full = await api.get<GeneratedDocument>(
+          `/api/v1/documents/${c.id}`,
+        );
+        const body = (full.content_md ?? "").trim();
+        if (body) {
+          downloadMarkdownFile(
+            sanitizeFilename(full.title || `${docType}-${c.id}`),
+            body,
+          );
+          break;
+        }
+      } catch {
+        /* try the next-newest version */
+      }
+    }
+  }
+}
+
 // Header "Apply" button. Renders only for `interested` rows — the
 // queued-to-apply state. Clicking pops open the posting in a new tab so
-// the user can fill out the actual application, and moves the row to
+// the user can fill out the actual application, auto-downloads the
+// latest ready tailored resume + cover letter for the job (so they're
+// on hand for the application form), and moves the row to
 // `in_progress` so the detail page swaps to the Applied / Not interested
 // triage buttons (those live in ApplyAction and key off `in_progress`
 // after this commit).
 function MoveToApplyButton({
+  jobId,
   status,
   sourceUrl,
   disabled,
   onApply,
 }: {
+  jobId: number;
   status: JobStatus;
   sourceUrl: string | null | undefined;
   disabled: boolean;
@@ -655,13 +723,15 @@ function MoveToApplyButton({
     if (sourceUrl) {
       // noopener for safety; rel="noreferrer" isn't reachable from
       // window.open, but window.opener gets nulled on `noopener`.
+      // Must stay synchronous with the click or popup blockers eat it.
       window.open(sourceUrl, "_blank", "noopener");
     }
+    void downloadLatestJobDocs(jobId);
     onApply();
   }
   const title = sourceUrl
-    ? "Open the posting in a new tab and move this row to in-progress."
-    : "Move this row to in-progress (no source URL on file — open the posting manually).";
+    ? "Open the posting in a new tab, download the latest tailored resume + cover letter, and move this row to in-progress."
+    : "Download the latest tailored resume + cover letter and move this row to in-progress (no source URL on file — open the posting manually).";
   return (
     <button
       type="button"
