@@ -8,6 +8,8 @@ immediately.
 """
 from __future__ import annotations
 
+import asyncio
+import html as _html
 import json
 import logging
 import mimetypes
@@ -26,7 +28,7 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -306,6 +308,98 @@ async def get_document(
     user: User = Depends(get_current_user),
 ) -> GeneratedDocument:
     return await _get_owned_document(db, doc_id, user.id)
+
+
+# Print stylesheet for the PDF export. Deliberately close to the Studio
+# print view's feel: US Letter, compact professional single-column layout
+# that keeps a ~650-word resume on one page. Liberation Sans ships in the
+# Docker image (metric-compatible with Arial, the ATS-safe default).
+_PDF_CSS = """
+@page { size: letter; margin: 0.65in 0.75in; }
+body {
+  font-family: 'Liberation Sans', Arial, Helvetica, sans-serif;
+  font-size: 10.5pt; line-height: 1.35; color: #111;
+}
+h1 { font-size: 17pt; margin: 0 0 2pt; }
+h1 + p { margin-top: 0; color: #333; }
+h2 {
+  font-size: 11pt; text-transform: uppercase; letter-spacing: 0.06em;
+  border-bottom: 1px solid #999; padding-bottom: 2pt; margin: 10pt 0 4pt;
+}
+h3 { font-size: 10.5pt; margin: 7pt 0 1pt; }
+p { margin: 3pt 0; }
+ul, ol { margin: 2pt 0 4pt; padding-left: 14pt; }
+li { margin: 1.5pt 0; }
+hr { border: none; border-top: 1px solid #999; margin: 8pt 0; }
+a { color: inherit; text-decoration: none; }
+em { color: #333; }
+"""
+
+
+def _render_doc_pdf_sync(title: str, content_md: str) -> bytes:
+    """Markdown → HTML → PDF. Sync + CPU-bound — call via asyncio.to_thread.
+    Imports are lazy so the API still boots on an image built before the
+    WeasyPrint system libs were added (the endpoint 501s instead)."""
+    import markdown as _md
+    from weasyprint import HTML as _WHTML
+
+    body_html = _md.markdown(content_md, extensions=["extra", "sane_lists"])
+    doc_html = (
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        f"<title>{_html.escape(title)}</title><style>{_PDF_CSS}</style>"
+        f"</head><body>{body_html}</body></html>"
+    )
+    return _WHTML(string=doc_html).write_pdf()
+
+
+def _pdf_filename(title: str, doc_id: int) -> str:
+    base = re.sub(r"[^A-Za-z0-9 _.\-–—]+", "-", title or f"document-{doc_id}")
+    base = re.sub(r"\s+", " ", base).strip(" -.")[:120] or f"document-{doc_id}"
+    # Content-Disposition filenames must be latin-1-safe; dashes above are
+    # normalized rather than dropped so titles stay readable.
+    return base.replace("–", "-").replace("—", "-") + ".pdf"
+
+
+@router.get("/{doc_id:int}/pdf")
+async def download_document_pdf(
+    doc_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Response:
+    """Render a generated document (resume / cover letter / …) as a PDF
+    attachment. Used by the job page's Apply button to hand the user
+    upload-ready files; also usable anywhere a doc id is known."""
+    doc = await _get_owned_document(db, doc_id, user.id)
+    body = (doc.content_md or "").strip()
+    if not body:
+        raise HTTPException(
+            status_code=409,
+            detail="Document has no content yet (still generating, or the run failed).",
+        )
+    try:
+        pdf = await asyncio.to_thread(
+            _render_doc_pdf_sync, doc.title or f"Document {doc.id}", body
+        )
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "PDF export libraries aren't installed in this image — "
+                "rebuild the api container (WeasyPrint + Pango were added "
+                "to the Dockerfile)."
+            ),
+        ) from exc
+    except Exception as exc:  # pragma: no cover — malformed markdown, font issues
+        log.exception("PDF render failed for document %d", doc_id)
+        raise HTTPException(status_code=500, detail=f"PDF render failed: {exc}")
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{_pdf_filename(doc.title, doc.id)}"',
+            "Content-Length": str(len(pdf)),
+        },
+    )
 
 
 class GeneratedDocumentUpdate(BaseModel):

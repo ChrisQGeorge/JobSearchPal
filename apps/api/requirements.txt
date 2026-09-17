@@ -22,3 +22,7 @@ html2text>=2024.2,<2026.0
 httpx>=0.27,<1.0
 # RSS / Atom feed parser used by the rss + yc adapters.
 feedparser>=6.0,<7.0
+# PDF export of generated documents (resume / cover letter): markdown →
+# HTML → WeasyPrint. WeasyPrint needs Pango system libs — see Dockerfile.
+markdown>=3.6,<4.0
+weasyprint>=62,<66

@@ -634,21 +634,6 @@ function ReviewAction({
  * when the user came via `?from=apply` but this row is no longer
  * `interested` (they already acted), so they don't lose their place.
  */
-/** Client-side .md download — same mechanism as the Studio editor's
- * "Download .md" button. */
-function downloadMarkdownFile(filenameBase: string, content: string): void {
-  const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `${filenameBase}.md`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  // Give the browser a tick to start the download before revoking.
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
 function sanitizeFilename(s: string): string {
   return (
     s
@@ -659,10 +644,36 @@ function sanitizeFilename(s: string): string {
   );
 }
 
+/** Fetch a generated document as a server-rendered PDF and hand it to
+ * the browser as a download. Returns false on any failure (doc still
+ * generating → 409, old image without WeasyPrint → 501, …) so the
+ * caller can fall back to an earlier version. */
+async function downloadPdf(docId: number, filenameBase: string): Promise<boolean> {
+  try {
+    const res = await fetch(apiUrl(`/api/v1/documents/${docId}/pdf`), {
+      credentials: "include",
+    });
+    if (!res.ok) return false;
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${filenameBase}.pdf`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // Give the browser a tick to start the download before revoking.
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Best-effort: download the newest READY resume + cover letter tailored
- * to this job. A doc whose latest version is still generating (empty
- * body) falls back to the previous ready version. Missing doc types are
- * skipped silently — the user may only have written one of the two. */
+ * to this job as PDFs. A doc whose latest version is still generating
+ * (empty body) falls back to the previous ready version. Missing doc
+ * types are skipped silently — the user may only have written one. */
 async function downloadLatestJobDocs(jobId: number): Promise<void> {
   let docs: GeneratedDocument[];
   try {
@@ -678,21 +689,11 @@ async function downloadLatestJobDocs(jobId: number): Promise<void> {
       .sort((a, b) => b.version - a.version || b.id - a.id)
       .slice(0, 3);
     for (const c of candidates) {
-      try {
-        const full = await api.get<GeneratedDocument>(
-          `/api/v1/documents/${c.id}`,
-        );
-        const body = (full.content_md ?? "").trim();
-        if (body) {
-          downloadMarkdownFile(
-            sanitizeFilename(full.title || `${docType}-${c.id}`),
-            body,
-          );
-          break;
-        }
-      } catch {
-        /* try the next-newest version */
-      }
+      const ok = await downloadPdf(
+        c.id,
+        sanitizeFilename(c.title || `${docType}-${c.id}`),
+      );
+      if (ok) break;
     }
   }
 }

@@ -28,6 +28,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
       git \
       gnupg \
+      # WeasyPrint runtime (PDF export of generated documents) + fonts.
+      libpango-1.0-0 \
+      libpangoft2-1.0-0 \
+      libharfbuzz-subset0 \
+      shared-mime-info \
+      fonts-liberation \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
