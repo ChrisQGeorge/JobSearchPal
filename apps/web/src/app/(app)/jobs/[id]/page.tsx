@@ -634,31 +634,26 @@ function ReviewAction({
  * when the user came via `?from=apply` but this row is no longer
  * `interested` (they already acted), so they don't lose their place.
  */
-function sanitizeFilename(s: string): string {
-  return (
-    s
-      .replace(/[\\/:*?"<>|]+/g, "-")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 120) || "document"
-  );
-}
-
 /** Fetch a generated document as a server-rendered PDF and hand it to
- * the browser as a download. Returns false on any failure (doc still
- * generating → 409, old image without WeasyPrint → 501, …) so the
- * caller can fall back to an earlier version. */
-async function downloadPdf(docId: number, filenameBase: string): Promise<boolean> {
+ * the browser as a download. The filename comes from the server's
+ * Content-Disposition, which uses the same `Name_Type_Org` scheme as
+ * the Studio's manual downloads. Returns false on any failure (doc
+ * still generating → 409, old image without WeasyPrint → 501, …) so
+ * the caller can fall back to an earlier version. */
+async function downloadPdf(docId: number): Promise<boolean> {
   try {
     const res = await fetch(apiUrl(`/api/v1/documents/${docId}/pdf`), {
       credentials: "include",
     });
     if (!res.ok) return false;
+    const cd = res.headers.get("content-disposition") ?? "";
+    const filename =
+      /filename="([^"]+)"/.exec(cd)?.[1] ?? `document-${docId}.pdf`;
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${filenameBase}.pdf`;
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -689,11 +684,7 @@ async function downloadLatestJobDocs(jobId: number): Promise<void> {
       .sort((a, b) => b.version - a.version || b.id - a.id)
       .slice(0, 3);
     for (const c of candidates) {
-      const ok = await downloadPdf(
-        c.id,
-        sanitizeFilename(c.title || `${docType}-${c.id}`),
-      );
-      if (ok) break;
+      if (await downloadPdf(c.id)) break;
     }
   }
 }

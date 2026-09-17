@@ -352,12 +352,74 @@ def _render_doc_pdf_sync(title: str, content_md: str) -> bytes:
     return _WHTML(string=doc_html).write_pdf()
 
 
-def _pdf_filename(title: str, doc_id: int) -> str:
-    base = re.sub(r"[^A-Za-z0-9 _.\-–—]+", "-", title or f"document-{doc_id}")
-    base = re.sub(r"\s+", " ", base).strip(" -.")[:120] or f"document-{doc_id}"
-    # Content-Disposition filenames must be latin-1-safe; dashes above are
-    # normalized rather than dropped so titles stay readable.
-    return base.replace("–", "-").replace("—", "-") + ".pdf"
+# Doc-type → filename token. MUST stay in sync with DOC_TYPE_FILENAME in
+# web/src/app/(app)/studio/[id]/page.tsx — the Studio's manual downloads
+# and this endpoint's Content-Disposition should produce identical names
+# (`Firstname-Lastname_Resume_Acme.pdf`).
+_DOC_TYPE_FILENAME = {
+    "resume": "Resume",
+    "cover_letter": "Cover-Letter",
+    "outreach_email": "Outreach",
+    "thank_you": "Thank-You",
+    "followup": "Followup",
+    "portfolio": "Portfolio",
+    "reference": "Reference",
+    "offer_letter": "Offer-Letter",
+    "transcript": "Transcript",
+    "certificate": "Certificate",
+    "other": "Doc",
+}
+
+
+def _fn_token(raw: Optional[str]) -> str:
+    """Port of the Studio's `_fnToken`: trim, drop filesystem-hostile
+    characters, whitespace → single hyphen, collapse hyphen runs."""
+    if not raw:
+        return ""
+    s = re.sub(r'[\\/:*?"<>|]+', "", str(raw).strip())
+    s = re.sub(r"\s+", "-", s)
+    return re.sub(r"-+", "-", s).strip("-")
+
+
+async def _pdf_filename_base(
+    db: AsyncSession, user: User, doc: GeneratedDocument
+) -> str:
+    """Port of the Studio's `buildFilenameBase`: `Name_Type_Org`, with the
+    doc title only as a fallback when name/org are missing. Name comes
+    from the Resume Profile, else the account display name — the same
+    order the Studio resolves it."""
+    rp_name = (
+        await db.execute(
+            select(ResumeProfile.full_name).where(
+                ResumeProfile.user_id == user.id,
+                ResumeProfile.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    name = (rp_name or "").strip() or (user.display_name or "").strip() or None
+
+    org_name: Optional[str] = None
+    if doc.tracked_job_id:
+        org_name = (
+            await db.execute(
+                select(Organization.name)
+                .join(TrackedJob, TrackedJob.organization_id == Organization.id)
+                .where(TrackedJob.id == doc.tracked_job_id)
+            )
+        ).scalar_one_or_none()
+
+    name_tok = _fn_token(name)
+    type_tok = _fn_token(_DOC_TYPE_FILENAME.get(doc.doc_type) or doc.doc_type)
+    org_tok = _fn_token(org_name)
+    pieces = [t for t in (name_tok, type_tok, org_tok) if t]
+    if len(pieces) >= 2:
+        base = "_".join(pieces)
+    else:
+        fallback = _fn_token(doc.title) or "Document"
+        base = fallback if not pieces else f"{pieces[0]}_{fallback}"
+    # Content-Disposition filenames must be latin-1-safe.
+    base = base.encode("latin-1", "ignore").decode("latin-1").strip("-_")
+    return base[:120] or f"document-{doc.id}"
 
 
 @router.get("/{doc_id:int}/pdf")
@@ -392,11 +454,12 @@ async def download_document_pdf(
     except Exception as exc:  # pragma: no cover — malformed markdown, font issues
         log.exception("PDF render failed for document %d", doc_id)
         raise HTTPException(status_code=500, detail=f"PDF render failed: {exc}")
+    filename = await _pdf_filename_base(db, user, doc) + ".pdf"
     return Response(
         content=pdf,
         media_type="application/pdf",
         headers={
-            "Content-Disposition": f'attachment; filename="{_pdf_filename(doc.title, doc.id)}"',
+            "Content-Disposition": f'attachment; filename="{filename}"',
             "Content-Length": str(len(pdf)),
         },
     )

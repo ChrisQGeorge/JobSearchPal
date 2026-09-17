@@ -92,6 +92,9 @@ if settings.ALLOW_ALL_ORIGINS:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        # Let the browser read the server-chosen download filename on
+        # cross-origin fetches (PDF export).
+        expose_headers=["Content-Disposition"],
     )
 else:
     app.add_middleware(
@@ -101,6 +104,9 @@ else:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        # Let the browser read the server-chosen download filename on
+        # cross-origin fetches (PDF export).
+        expose_headers=["Content-Disposition"],
     )
 
 
