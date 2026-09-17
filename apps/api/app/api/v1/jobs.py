@@ -1128,9 +1128,12 @@ async def apply_queue(
         than starting new ones.
       * `status=interested` — triaged-as-worth-pursuing but not started.
 
-    Items carry their `status` so the frontend can render the two
-    cohorts differently if it wants to. Within each cohort, FIFO by
-    date_discovered then id.
+    Items carry their `status` plus `has_resume` / `has_cover_letter`
+    so the frontend can badge doc readiness. Within each cohort, jobs
+    whose tailored documents are already generated sort first (missing
+    one doc → next, missing both → last), then FIFO by date_discovered
+    then id — so the user applies with ready documents while the queue
+    worker catches up on the rest.
     """
     from sqlalchemy import case
 
@@ -1173,6 +1176,43 @@ async def apply_queue(
             if isinstance(r.fit_summary, dict)
             and r.fit_summary.get("score") is not None
         ]
+
+    # Document-readiness ranking: jobs whose tailored resume + cover
+    # letter are already generated sort FIRST within their status cohort;
+    # jobs missing one doc come next; jobs missing both come last — so
+    # the user works through ready applications while the queue worker
+    # generates documents for the rest. "Ready" = a non-deleted doc of
+    # that type with a non-empty body (a placeholder still generating
+    # doesn't count).
+    from app.models.documents import GeneratedDocument as _GD
+
+    docs_by_job: dict[int, set[str]] = {}
+    if rows:
+        doc_rows = (
+            await db.execute(
+                select(_GD.tracked_job_id, _GD.doc_type)
+                .where(
+                    _GD.tracked_job_id.in_([r.id for r in rows]),
+                    _GD.deleted_at.is_(None),
+                    _GD.doc_type.in_(("resume", "cover_letter")),
+                    func.coalesce(func.length(func.trim(_GD.content_md)), 0) > 0,
+                )
+                .distinct()
+            )
+        ).all()
+        for tj_id, dt in doc_rows:
+            docs_by_job.setdefault(tj_id, set()).add(dt)
+
+    _status_rank = {"in_progress": 0, "interested": 1}
+    # Python's sort is stable, so the SQL FIFO (date_discovered, id)
+    # order is preserved within each (status, readiness) tier.
+    rows.sort(
+        key=lambda r: (
+            _status_rank.get(r.status, 2),
+            2 - len(docs_by_job.get(r.id, ())),
+        )
+    )
+
     org_ids = {r.organization_id for r in rows if r.organization_id}
     org_names = await _org_names_for(db, org_ids)
     items = [
@@ -1193,6 +1233,8 @@ async def apply_queue(
                 else None
             ),
             "status": r.status,
+            "has_resume": "resume" in docs_by_job.get(r.id, ()),
+            "has_cover_letter": "cover_letter" in docs_by_job.get(r.id, ()),
         }
         for r in rows
     ]

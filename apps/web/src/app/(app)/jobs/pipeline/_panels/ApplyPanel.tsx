@@ -17,6 +17,10 @@ type ApplyItem = {
   // (started but not confirmed). in_progress rows sort first because
   // they're loose-ended work.
   status: "interested" | "in_progress";
+  // Doc readiness — within each status cohort the backend sorts jobs
+  // with both docs ready first, missing-docs jobs last.
+  has_resume?: boolean;
+  has_cover_letter?: boolean;
 };
 
 type ApplyQueueOut = {
@@ -77,7 +81,11 @@ export function ApplyPanel() {
         `${interestedCount} queued to apply`,
       );
     }
-    return parts.join(" · ") + ". Work through them with the apply-flow buttons on each detail page.";
+    return (
+      parts.join(" · ") +
+      ". Jobs with a ready resume + cover letter sort first — write docs " +
+      "for the rest while you work through them."
+    );
   })();
 
   return (
@@ -155,6 +163,31 @@ export function ApplyPanel() {
                         In progress
                       </span>
                     ) : null}
+                    {it.has_resume && it.has_cover_letter ? (
+                      <span
+                        className="text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded-full border border-emerald-500/40 bg-emerald-500/10 text-emerald-300 shrink-0"
+                        title="Tailored resume and cover letter are both generated — the Apply button will download them."
+                      >
+                        Docs ready
+                      </span>
+                    ) : (
+                      <span
+                        className="text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded-full border border-corp-accent2/40 bg-corp-accent2/10 text-corp-accent2 shrink-0"
+                        title={
+                          it.has_resume
+                            ? "Resume is ready; no cover letter yet. Sorted after fully-ready jobs — open the job to write the missing doc."
+                            : it.has_cover_letter
+                              ? "Cover letter is ready; no resume yet. Sorted after fully-ready jobs — open the job to write the missing doc."
+                              : "No tailored resume or cover letter yet. Sorted last so there's time to generate them — open the job and hit Write resume / Write cover letter."
+                        }
+                      >
+                        {it.has_resume
+                          ? "Needs letter"
+                          : it.has_cover_letter
+                            ? "Needs resume"
+                            : "Needs docs"}
+                      </span>
+                    )}
                   </div>
                   <div className="text-xs text-corp-muted truncate">
                     {[
