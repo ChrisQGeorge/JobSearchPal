@@ -3240,7 +3240,8 @@ async def cancel_activity_task(
 
 
 class _WorkerSettingsIn(BaseModel):
-    max_parallel: int = Field(ge=1, le=8)
+    # Upper bound mirrors worker_settings._MAX — keep in sync.
+    max_parallel: int = Field(ge=1, le=16)
 
 
 @router.get("/worker-settings")

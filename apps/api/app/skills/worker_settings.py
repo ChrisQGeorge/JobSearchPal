@@ -21,14 +21,16 @@ log = logging.getLogger(__name__)
 
 _PATH = Path("/root/.claude/jsp-worker-settings.json")
 _DEFAULT_MAX_PARALLEL = int(os.environ.get("JSP_WORKER_PARALLEL", "1"))
-# Clamp range. Below 1 nothing runs. Each Claude subprocess is a Node
-# process peaking at ~0.5-1 GB RSS with heavy CPU bursts — at the old
-# ceiling of 8, a queue drain could flatten the whole host (the api
-# container's default memory fence is 3g; see docker-compose.yml). 4
-# already saturates a typical single-user box; raise API_MEM_LIMIT
-# before raising this.
+# Clamp range. Below 1 nothing runs. The RAM cost of a slot depends on
+# what runs in it: a CLAUDE task spawns a Node CLI subprocess peaking at
+# ~0.5-1 GB RSS (so N Claude slots need roughly N GB of API_MEM_LIMIT
+# headroom — see docker-compose.yml), while an EXTERNAL-provider task
+# (ext:deepseek/…, local Ollama, …) is just an HTTP call and costs
+# almost nothing. 16 is sized for external-heavy queues; if your queue
+# mixes in Claude tasks, keep the setting near API_MEM_LIMIT/1GB or
+# expect OOM-killed tasks (they error + retry; the host stays fenced).
 _MIN = 1
-_MAX = 4
+_MAX = 16
 
 
 def get_max_parallel() -> int:
