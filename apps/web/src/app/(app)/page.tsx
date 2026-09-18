@@ -599,16 +599,59 @@ function SourceFunnelPanel() {
 }
 
 
+type StrategyLatest = {
+  computed_at: string | null;
+  result: StrategyResult | null;
+};
+
 function StrategyPanel() {
   const [result, setResult] = useState<StrategyResult | null>(null);
+  const [computedAt, setComputedAt] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
+  // Show the last stored briefing on load — runs are queued now, so the
+  // result outlives the request (and the page).
+  useEffect(() => {
+    api
+      .get<StrategyLatest>("/api/v1/metrics/strategy/latest")
+      .then((d) => {
+        if (d.result) {
+          setResult(d.result);
+          setComputedAt(d.computed_at);
+        }
+      })
+      .catch(() => {
+        /* non-fatal — panel just starts empty */
+      });
+  }, []);
+
+  // Queue the run (fast request — the advisor itself executes on the
+  // Companion task queue; the old foreground call outlived the Next.js
+  // proxy timeout and surfaced as a bodyless 500), then poll the stored
+  // result until a briefing newer than what we had appears.
   async function run() {
     setRunning(true);
     setErr(null);
+    const prev = computedAt;
     try {
-      setResult(await api.post<StrategyResult>("/api/v1/metrics/strategy"));
+      await api.post("/api/v1/metrics/strategy");
+      const deadline = Date.now() + 5 * 60_000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 5000));
+        const latest = await api.get<StrategyLatest>(
+          "/api/v1/metrics/strategy/latest",
+        );
+        if (latest.result && latest.computed_at && latest.computed_at !== prev) {
+          setResult(latest.result);
+          setComputedAt(latest.computed_at);
+          return;
+        }
+      }
+      setErr(
+        "Still running (queued behind other Companion tasks?) — check the " +
+          "Activity page; the briefing will appear here once it finishes.",
+      );
     } catch (e) {
       setErr(
         e instanceof ApiError
@@ -662,6 +705,11 @@ function StrategyPanel() {
       {err ? <div className="text-xs text-corp-danger mt-2">{err}</div> : null}
       {result ? (
         <div className="mt-3 space-y-3">
+          {computedAt ? (
+            <div className="text-[10px] uppercase tracking-wider text-corp-muted">
+              Briefing from {new Date(computedAt).toLocaleString()}
+            </div>
+          ) : null}
           {result.warning ? (
             <div className="text-xs text-corp-accent2 bg-corp-accent2/10 border border-corp-accent2/40 p-2 rounded">
               ⚠ {result.warning}

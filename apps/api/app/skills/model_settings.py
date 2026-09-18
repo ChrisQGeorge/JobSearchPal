@@ -63,6 +63,7 @@ EXT_COMPATIBLE_ACTIONS = frozenset({
     "tailor_other",
     "humanize",
     "org_research",      # pipeline fetches pages itself; Claude only parses
+    "strategy",          # snapshot/history/hot-jobs all inlined; no tools
 })
 
 # Models we surface in the Settings dropdown.

@@ -1612,6 +1612,86 @@ async def _handle_prep(item: JobFetchQueue) -> None:
         )
 
 
+async def _handle_strategy(item: JobFetchQueue) -> None:
+    """Run the strategy advisor and store the briefing as a
+    `strategy_briefing` MetricSnapshot (read back via
+    GET /metrics/strategy/latest). Queued because the model call takes
+    30-120s — far past what the Next.js proxy tolerates in the
+    foreground. One-shot on bad output; rate limits park as usual."""
+    from datetime import date as _date
+
+    from app.api.v1.metrics import build_strategy_prompt, parse_strategy_output
+    from app.models.operational import MetricSnapshot
+    from app.skills.runner import ClaudeCodeError
+    from app.skills import queue_bus
+
+    async with SessionLocal() as db:
+        row = (
+            await db.execute(select(JobFetchQueue).where(JobFetchQueue.id == item.id))
+        ).scalar_one_or_none()
+        if row is None:
+            return
+
+        prompt = await build_strategy_prompt(db, row.user_id)
+        label = row.label or "Strategy briefing"
+        try:
+            final_text = await queue_bus.run_claude_to_bus(
+                prompt=prompt,
+                source="strategy",
+                item_id=f"queue:{row.id}",
+                label=label,
+                allowed_tools=[],
+                timeout_seconds=240,
+                action="strategy",
+            )
+        except ClaudeCodeError as exc:
+            err = str(exc)
+            if _is_rate_limited(err):
+                await _handle_rate_limit(db, row, err)
+                return
+            await _fail(db, row, err, permanent=True)
+            return
+        except Exception as exc:  # pragma: no cover
+            await _fail(db, row, f"Unexpected error: {exc}", permanent=True)
+            log.exception("Strategy task %d unhandled error", row.id)
+            return
+
+        try:
+            data = parse_strategy_output(final_text)
+        except ValueError as exc:
+            # Usage-cap messages come back as successful exit-0 output —
+            # park instead of burning the task (see _handle_score).
+            if _is_rate_limited(final_text):
+                await _handle_rate_limit(db, row, final_text)
+                return
+            await _fail(db, row, str(exc), permanent=True)
+            return
+
+        snap = MetricSnapshot(
+            user_id=row.user_id,
+            metric_key="strategy_briefing",
+            period="ad_hoc",
+            period_start=None,
+            period_end=_date.today(),
+            value=data,
+            computed_at=datetime.now(tz=timezone.utc),
+        )
+        db.add(snap)
+        await db.flush()
+        row.state = "done"
+        row.result = {"metric_snapshot_id": snap.id}
+        row.error_message = None
+        if isinstance(row.payload, dict) and "rate_limit_count" in row.payload:
+            new_payload = dict(row.payload)
+            new_payload.pop("rate_limit_count", None)
+            row.payload = new_payload or None
+        await db.commit()
+        log.info(
+            "Strategy task %d → stored briefing as MetricSnapshot %d",
+            row.id, snap.id,
+        )
+
+
 # kind → handler. Extensible: add new kinds here.
 _HANDLERS = {
     "fetch": _handle_fetch,
@@ -1620,6 +1700,7 @@ _HANDLERS = {
     "humanize": _handle_humanize,
     "org_research": _handle_org_research,
     "prep": _handle_prep,
+    "strategy": _handle_strategy,
 }
 
 

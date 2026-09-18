@@ -6,8 +6,8 @@ import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,7 +16,6 @@ from app.core.deps import get_current_user
 from app.models.jobs import InterviewRound, TrackedJob
 from app.models.operational import MetricSnapshot
 from app.models.user import User
-from app.skills.runner import ClaudeCodeError, run_claude_prompt
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/metrics", tags=["metrics"])
@@ -348,20 +347,24 @@ def _extract_json(text: str) -> Optional[dict]:
     return _extract_json_object(text)
 
 
-@router.post("/strategy", response_model=StrategyOut)
-async def job_strategy(
-    db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
-) -> StrategyOut:
+async def build_strategy_prompt(db: AsyncSession, user_id: int) -> str:
+    """Assemble the strategy-advisor prompt: fresh snapshot + snapshot
+    history + hot jobs, all inlined (no tools needed at run time).
+    Shared by the queue worker's `strategy` handler."""
     # Fresh snapshot for the live view.
-    current = await _compute_snapshot(db, user.id)
+    current = await _compute_snapshot(db, user_id)
 
-    # Previous snapshots for trend-spotting.
+    # Previous snapshots for trend-spotting. Filter to pipeline_summary —
+    # the table also stores strategy_briefing RESULTS now, which must not
+    # feed back into the prompt as "history".
     past = list(
         (
             await db.execute(
                 select(MetricSnapshot)
-                .where(MetricSnapshot.user_id == user.id)
+                .where(
+                    MetricSnapshot.user_id == user_id,
+                    MetricSnapshot.metric_key == "pipeline_summary",
+                )
                 .order_by(MetricSnapshot.computed_at.desc())
                 .limit(5)
             )
@@ -380,7 +383,7 @@ async def job_strategy(
             await db.execute(
                 select(TrackedJob)
                 .where(
-                    TrackedJob.user_id == user.id,
+                    TrackedJob.user_id == user_id,
                     TrackedJob.deleted_at.is_(None),
                     TrackedJob.status.in_(
                         [
@@ -414,51 +417,29 @@ async def job_strategy(
         for j in hot_jobs
     ]
 
-    prompt = _STRATEGY_PROMPT.format(
+    return _STRATEGY_PROMPT.format(
         snapshot=json.dumps(current, indent=2),
         history=json.dumps(history, indent=2) if history else "(no history yet)",
         hot_jobs=json.dumps(hot, indent=2) if hot else "(no active jobs)",
     )
 
-    from app.skills.queue_bus import run_claude_to_bus
 
-    try:
-        final_text = await run_claude_to_bus(
-            prompt=prompt,
-            source="strategy",
-            item_id=f"strategy:{user.id}",
-            label="Strategy briefing",
-            allowed_tools=[],
-            timeout_seconds=120,
-            action="strategy",
-        )
-    except ClaudeCodeError as exc:
-        log.warning("strategy failed: %s", exc)
-        raise HTTPException(status_code=502, detail=f"Claude Code error: {exc}")
-    except Exception as exc:  # pragma: no cover
-        log.exception("strategy unhandled error")
-        raise HTTPException(
-            status_code=502,
-            detail=f"Unexpected error talking to Claude: {type(exc).__name__}: {exc}",
-        )
-
+def parse_strategy_output(final_text: str) -> dict:
+    """Extract + normalize the advisor's JSON into a StrategyOut-shaped
+    dict. Raises ValueError with a raw-output snippet on garbage so the
+    queue worker can decide between rate-limit parking and a permanent
+    failure. Shared by the worker's `strategy` handler."""
     data = _extract_json(final_text)
     if not isinstance(data, dict):
-        # Surface what Claude actually returned so this stops being a
-        # mystery 502. Mirrors the score-task error format.
         snippet = (final_text or "").strip()
         if len(snippet) > 600:
             snippet = snippet[:300] + " […] " + snippet[-300:]
-        log.warning("strategy parse failure. Raw: %r", snippet)
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Strategy skill returned no parseable JSON object. "
-                f"Raw Claude output (truncated): {snippet!r}"
-            ),
+        raise ValueError(
+            "Strategy skill returned no parseable JSON object. "
+            f"Raw output (truncated): {snippet!r}"
         )
 
-    # Defensive coercion: Claude sometimes returns strings where lists
+    # Defensive coercion: the model sometimes returns strings where lists
     # are expected, or vice versa. Normalize to the schema or skip.
     def _as_str_list(v: Any) -> list[str]:
         if isinstance(v, list):
@@ -469,10 +450,7 @@ async def job_strategy(
 
     headline = str(data.get("headline") or "").strip()
     if not headline:
-        raise HTTPException(
-            status_code=502,
-            detail="Strategy skill returned a JSON object with no headline.",
-        )
+        raise ValueError("Strategy skill returned a JSON object with no headline.")
     return StrategyOut(
         headline=headline,
         working_well=_as_str_list(data.get("working_well"))[:6],
@@ -480,4 +458,54 @@ async def job_strategy(
         next_actions=_as_str_list(data.get("next_actions"))[:8],
         risks=_as_str_list(data.get("risks"))[:4],
         warning=(str(data["warning"]) if data.get("warning") else None),
+    ).model_dump()
+
+
+@router.post("/strategy")
+async def job_strategy(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Queue a strategy-briefing run. The advisor takes 30-120s of model
+    time — previously this endpoint ran it in the foreground and the
+    Next.js proxy would time the request out into a bodyless 500 (the
+    same failure that moved tailoring to the queue). The worker stores
+    the finished briefing as a `strategy_briefing` MetricSnapshot;
+    fetch it via GET /metrics/strategy/latest."""
+    from app.models.jobs import JobFetchQueue
+
+    task = JobFetchQueue(
+        user_id=user.id,
+        kind="strategy",
+        label="Strategy briefing",
+        url="",
+        payload={},
+        state="queued",
     )
+    db.add(task)
+    await db.commit()
+    await db.refresh(task)
+    return {"queued": True, "queue_id": task.id}
+
+
+@router.get("/strategy/latest")
+async def latest_strategy(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Newest stored strategy briefing (or nulls when none exists yet).
+    The dashboard shows this on load and polls it after queueing a run."""
+    snap = (
+        await db.execute(
+            select(MetricSnapshot)
+            .where(
+                MetricSnapshot.user_id == user.id,
+                MetricSnapshot.metric_key == "strategy_briefing",
+            )
+            .order_by(MetricSnapshot.computed_at.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    if snap is None or not isinstance(snap.value, dict):
+        return {"computed_at": None, "result": None}
+    return {"computed_at": snap.computed_at.isoformat(), "result": snap.value}
