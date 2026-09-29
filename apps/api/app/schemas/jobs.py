@@ -268,6 +268,15 @@ class FetchedJobInfo(BaseModel):
     URL itself, and are written back onto the matched/created Organization
     record in fields the user hasn't already populated."""
 
+    # Which layer produced the fields: "deterministic" (generated
+    # extractor / JSON-LD — no LLM ran) or "llm". Informational.
+    parse_engine: Optional[str] = None
+    # Set when an LLM parse succeeded on a domain that has no generated
+    # extractor yet — signals the queue worker to enqueue an
+    # extractor_gen task (the HTML sample + expected output were already
+    # saved to the extractors volume). {"domain": str}
+    extractor_candidate: Optional[dict] = None
+
     title: Optional[str] = None
     organization_name: Optional[str] = None
     organization_id: Optional[int] = None

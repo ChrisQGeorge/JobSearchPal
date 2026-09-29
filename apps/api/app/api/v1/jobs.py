@@ -2669,11 +2669,14 @@ _PAGE_TEXT_BUDGET = 60_000  # chars sent to Claude in the parse step.
 _PAGE_TEXT_MIN = 400  # below this we treat the direct fetch as a JS-shell.
 
 
-async def _direct_fetch_page(url: str) -> tuple[str, Optional[str]]:
-    """Single httpx GET → cleaned markdown. Returns
-    `(text, error_reason)`. On success error_reason is None and text is
-    the page body trimmed to _PAGE_TEXT_BUDGET. On failure text is "" and
-    error_reason describes why so the fallback prompt can quote it.
+async def _direct_fetch_page(url: str) -> tuple[str, str, Optional[str]]:
+    """Single httpx GET → cleaned markdown + the raw HTML. Returns
+    `(text, raw_html, error_reason)`. On success error_reason is None and
+    text is the page body trimmed to _PAGE_TEXT_BUDGET; raw_html is the
+    undoctored body (for the deterministic extractors, which need
+    JSON-LD blocks and DOM structure the markdown pass strips). On
+    failure text and raw_html are "" and error_reason describes why so
+    the fallback prompt can quote it.
 
     For URLs hosted on known job boards / ATSes (greenhouse, lever, ashby,
     workday, indeed, etc.) we slice the HTML down to the posting-relevant
@@ -2689,27 +2692,117 @@ async def _direct_fetch_page(url: str) -> tuple[str, Optional[str]]:
     import httpx
 
     try:
-        body = await http_get_text(url, timeout=25.0)
+        raw_html = await http_get_text(url, timeout=25.0)
     except UpstreamGateError as exc:
-        return "", f"bot-gated: {exc}"
+        return "", "", f"bot-gated: {exc}"
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code if exc.response is not None else "?"
-        return "", f"HTTP {code}"
+        return "", "", f"HTTP {code}"
     except httpx.HTTPError as exc:
-        return "", f"transport error: {exc}"
+        return "", "", f"transport error: {exc}"
     except Exception as exc:  # pragma: no cover  (defensive)
-        return "", f"{type(exc).__name__}: {exc}"
+        return "", "", f"{type(exc).__name__}: {exc}"
 
-    body = extract_relevant_html(url, body)
+    body = extract_relevant_html(url, raw_html)
     md = html_to_md(body)
     if not md or len(md.strip()) < _PAGE_TEXT_MIN:
-        return "", (
+        # Even a JS shell can carry a complete JSON-LD JobPosting in the
+        # head — hand the raw HTML back so the deterministic layer gets
+        # its shot before the WebFetch fallback.
+        return "", raw_html, (
             "page returned <400 chars of usable text — likely a "
             "JS-rendered SPA shell"
         )
     if len(md) > _PAGE_TEXT_BUDGET:
         md = md[:_PAGE_TEXT_BUDGET] + "\n\n[… truncated for parse budget …]"
-    return md, None
+    return md, raw_html, None
+
+
+async def _extract_skills_via_llm(
+    lines: list[str],
+    headings: list[str] | None = None,
+) -> tuple[list[str], list[str], dict[str, list[str]]]:
+    """Focused escalation for the coverage gate: extract skill terms
+    from the handful of requirement lines the lexicon couldn't account
+    for, and classify section headings the marker vocabulary didn't
+    recognize (so "Must haves:" gets learned as a requirements marker
+    generically, not per-site). Sends ONLY those lines/headings — never
+    the page. Best-effort: any failure returns empty results rather
+    than blocking the fetch. Honors the user's "URL fetch" model
+    routing (external providers included — it's a pure text task).
+
+    Returns (required, nice_to_have, markers) where markers is
+    {"required": [...], "nice": [...], "other": [...]} heading phrases
+    for skills_lexicon.learn_heading_markers."""
+    parts: list[str] = []
+    if lines:
+        numbered = "\n".join(f"- {ln}" for ln in lines[:10])
+        parts.append(
+            "These lines come from a job posting's requirements section "
+            "but matched no known skill keywords. Extract the concrete "
+            "skill / technology / tool / methodology / certification "
+            "terms they ask for, exactly as written (preserve casing "
+            "like PostgreSQL, C++). Ignore soft-skill and culture "
+            "boilerplate (communication, team player, fast-paced, …) — "
+            "return nothing for those lines.\n\n" + numbered
+        )
+    if headings:
+        hlist = "\n".join(f"- {h}" for h in headings[:8])
+        parts.append(
+            "Separately, these section HEADINGS from the same posting "
+            "matched no known section marker. Classify each: does it "
+            "open a requirements/qualifications section, a nice-to-have/"
+            "preferred section, or something else (benefits, "
+            "responsibilities, company blurb, …)? For each, give the "
+            "generic marker phrase from within the heading that "
+            "signals the section type — lowercase, reusable across "
+            "postings (e.g. \"must haves\", \"what we're looking "
+            "for\"), not the full site-specific heading.\n\n" + hlist
+        )
+    schema = (
+        'Return ONE JSON object, no prose: {"required": string[], '
+        '"nice_to_have": string[], "section_markers": {"required": '
+        'string[], "nice_to_have": string[], "other": string[]}} '
+        "(nice_to_have skills only for terms the line itself marks as "
+        "preferred/bonus; omit section_markers lists that don't apply)."
+    )
+    prompt = "\n\n".join(parts + [schema])
+    empty_markers: dict[str, list[str]] = {"required": [], "nice": [], "other": []}
+    try:
+        result = await run_claude_prompt(
+            prompt=prompt,
+            output_format="json",
+            allowed_tools=[],
+            timeout_seconds=60,
+            action="fetch",
+        )
+        data = _extract_json_object(result.result) or {}
+        req = [
+            str(s).strip()
+            for s in (data.get("required") or [])
+            if str(s).strip()
+        ]
+        nice = [
+            str(s).strip()
+            for s in (data.get("nice_to_have") or [])
+            if str(s).strip()
+        ]
+        raw_markers = data.get("section_markers") or {}
+        markers = {
+            "required": [
+                str(s) for s in (raw_markers.get("required") or []) if str(s).strip()
+            ][:8],
+            "nice": [
+                str(s) for s in (raw_markers.get("nice_to_have") or []) if str(s).strip()
+            ][:8],
+            "other": [
+                str(s) for s in (raw_markers.get("other") or []) if str(s).strip()
+            ][:8],
+        }
+        return req[:20], nice[:10], markers
+    except Exception as exc:
+        log.warning("Coverage-gap skill extraction failed: %s", exc)
+        return [], [], empty_markers
 
 
 async def perform_fetch(
@@ -2758,10 +2851,167 @@ async def perform_fetch(
 
     # Stage 1 — direct download.
     _emit({"kind": "system", "text": f"Fetching {url}"})
-    page_text, fail_reason = await _direct_fetch_page(url)
+    page_text, raw_html, fail_reason = await _direct_fetch_page(url)
     today_iso = _date.today().isoformat()
 
-    if page_text:
+    # Stage 1.5 — deterministic extraction: a generated per-domain
+    # extractor, then schema.org JSON-LD. When either produces a
+    # validated result, NO model call happens at all; the skills lists
+    # come from the self-growing keyword lexicon. The LLM below is now
+    # the exception path, not the norm.
+    data: Optional[dict] = None
+    parse_engine = "llm"
+    if raw_html:
+        from app.skills.extractors import deterministic_extract
+
+        try:
+            det = await deterministic_extract(url, raw_html)
+        except Exception as exc:  # pragma: no cover — never block the fetch
+            log.warning("Deterministic extraction error for %s: %s", url, exc)
+            det = None
+        if det is not None:
+            data, det_engine = det
+            parse_engine = "deterministic"
+            _emit(
+                {
+                    "kind": "system",
+                    "text": f"Parsed via {det_engine} — no model call needed.",
+                }
+            )
+            if not data.get("required_skills"):
+                from app.skills.skills_lexicon import extract_skills_from_text
+
+                try:
+                    req, nice = await extract_skills_from_text(
+                        data.get("job_description") or ""
+                    )
+                    if req:
+                        data["required_skills"] = req
+                    if nice:
+                        data["nice_to_have_skills"] = nice
+                except Exception as exc:  # pragma: no cover
+                    log.warning("Skills lexicon extraction failed: %s", exc)
+
+            # Coverage gate — "code coverage for the requirements
+            # section". Every requirement bullet must be accounted for by
+            # a lexicon skill match or a known non-skill pattern (years /
+            # degree / visa / soft-skill boilerplate). When too many
+            # lines escape, ONLY those lines go to a small model call —
+            # never the page — and the terms it extracts persist onto
+            # the job, teaching the lexicon so the same vocabulary is
+            # covered deterministically next time.
+            try:
+                from app.skills.skills_lexicon import (
+                    assess_requirements_coverage,
+                    learn_heading_markers,
+                )
+
+                desc_text = data.get("job_description") or ""
+                cov = await assess_requirements_coverage(desc_text)
+                unknown = cov.get("unknown_headings") or []
+                low_cov = (
+                    cov["total"] >= 3
+                    and cov["coverage"] < 0.7
+                    and cov["uncovered_lines"]
+                )
+                if low_cov or unknown:
+                    bits = []
+                    if low_cov:
+                        bits.append(
+                            f"coverage {int(cov['coverage'] * 100)}% "
+                            f"({cov['covered']}/{cov['total']} lines)"
+                        )
+                    if unknown:
+                        bits.append(
+                            f"{len(unknown)} unrecognized section heading(s)"
+                        )
+                    _emit({
+                        "kind": "system",
+                        "text": (
+                            "Requirements " + ", ".join(bits) + " — asking "
+                            "the model about those items only."
+                        ),
+                    })
+                    extra_req, extra_nice, markers = (
+                        await _extract_skills_via_llm(
+                            cov["uncovered_lines"] if low_cov else [],
+                            unknown or None,
+                        )
+                    )
+
+                    def _merge_skills(er: list, en: list) -> int:
+                        merged_req = list(data.get("required_skills") or [])
+                        merged_req += [s for s in er if s not in merged_req]
+                        data["required_skills"] = merged_req[:30]
+                        merged_nice = list(data.get("nice_to_have_skills") or [])
+                        merged_nice += [s for s in en if s not in merged_nice]
+                        data["nice_to_have_skills"] = merged_nice[:20]
+                        return len(er) + len(en)
+
+                    n_terms = _merge_skills(extra_req, extra_nice)
+                    if n_terms:
+                        _emit({
+                            "kind": "system",
+                            "text": (
+                                f"Added {n_terms} skill term(s) — the lexicon "
+                                "learns these for future fetches."
+                            ),
+                        })
+                    if unknown and any(markers.values()):
+                        n_markers = learn_heading_markers(
+                            required=markers["required"],
+                            nice=markers["nice"],
+                            other=markers["other"],
+                            seen_in=unknown,
+                        )
+                        if n_markers:
+                            _emit({
+                                "kind": "system",
+                                "text": (
+                                    f"Learned {n_markers} section-heading "
+                                    "marker(s) — these sections parse "
+                                    "deterministically from now on."
+                                ),
+                            })
+                            # New markers may have opened a requirements
+                            # section that was invisible on the first
+                            # pass — re-assess once (at most one extra
+                            # focused call, no loop).
+                            cov2 = await assess_requirements_coverage(desc_text)
+                            if (
+                                cov2["total"] > cov["total"]
+                                and cov2["coverage"] < 0.7
+                                and cov2["uncovered_lines"]
+                            ):
+                                r2, n2, _m2 = await _extract_skills_via_llm(
+                                    cov2["uncovered_lines"]
+                                )
+                                extra2 = _merge_skills(r2, n2)
+                                if extra2:
+                                    _emit({
+                                        "kind": "system",
+                                        "text": (
+                                            f"Newly recognized section: added "
+                                            f"{extra2} more skill term(s)."
+                                        ),
+                                    })
+                elif cov["total"]:
+                    _emit({
+                        "kind": "system",
+                        "text": (
+                            f"Requirements coverage {int(cov['coverage'] * 100)}% "
+                            f"({cov['covered']}/{cov['total']} lines) — no model "
+                            "needed."
+                        ),
+                    })
+            except Exception as exc:  # pragma: no cover — gate is best-effort
+                log.warning("Requirements-coverage gate failed: %s", exc)
+
+    prompt = ""
+    allowed_tools: list[str] = []
+    if data is not None:
+        pass  # deterministic result — no prompt, no model run
+    elif page_text:
         _emit(
             {
                 "kind": "system",
@@ -2771,7 +3021,6 @@ async def perform_fetch(
         prompt = _FETCH_PARSE_PROMPT.format(
             url=url, today=today_iso, page_text=page_text
         )
-        allowed_tools: list[str] = []
     else:
         # Stage 1 failed — fall back to ONE Claude WebFetch.
         _emit(
@@ -2810,7 +3059,7 @@ async def perform_fetch(
             fetch_action = None
 
     final_text = ""
-    if on_event is not None:
+    if data is None and on_event is not None:
         from app.skills.runner import (
             ClaudeCodeError as _CCE,
             stream_claude_prompt as _scp,
@@ -2876,7 +3125,7 @@ async def perform_fetch(
         final_text = "".join(collected)
         if had_error and not final_text:
             raise _CCE(had_error)
-    else:
+    elif data is None:
         result = await run_claude_prompt(
             prompt=prompt,
             output_format="json",
@@ -2886,7 +3135,8 @@ async def perform_fetch(
         )
         final_text = result.result
 
-    data = _extract_json_object(final_text) or {}
+    if data is None:
+        data = _extract_json_object(final_text) or {}
     if data.get("remote_policy") not in (None, "remote", "hybrid", "onsite"):
         data["remote_policy"] = None
     if data.get("source_platform") not in (
@@ -2899,8 +3149,14 @@ async def perform_fetch(
         data["source_platform"] = None
 
     out = FetchedJobInfo(
-        **{k: v for k, v in data.items() if k in FetchedJobInfo.model_fields},
+        **{
+            k: v
+            for k, v in data.items()
+            if k in FetchedJobInfo.model_fields
+            and k not in ("source_url", "parse_engine", "extractor_candidate")
+        },
         source_url=url,
+        parse_engine=parse_engine,
     )
 
     if out.organization_name:
@@ -2956,6 +3212,27 @@ async def perform_fetch(
             "Couldn't extract recognizable job info from that URL. "
             "The page may require sign-in, be JavaScript-only, or not be a job posting."
         )
+
+    # A successful LLM parse of a domain with no working generated
+    # extractor is exactly the ground truth needed to write one. Save
+    # the (HTML, validated fields) sample and flag the caller — the
+    # queue worker enqueues the extractor_gen task so this domain stops
+    # needing the model.
+    if parse_engine == "llm" and raw_html and out.warning is None:
+        from app.skills.extractors import (
+            domain_for,
+            save_sample,
+            should_generate,
+            validate_extracted,
+        )
+
+        dom = domain_for(url)
+        if dom and should_generate(dom) and validate_extracted(data):
+            try:
+                save_sample(dom, raw_html, data)
+                out.extractor_candidate = {"domain": dom}
+            except Exception as exc:  # pragma: no cover
+                log.warning("Could not save extractor sample for %s: %s", dom, exc)
 
     return out
 

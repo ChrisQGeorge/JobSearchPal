@@ -618,6 +618,47 @@ async def cancel_pending_tasks_for_job(
     return dropped
 
 
+async def _maybe_enqueue_extractor_gen(
+    db: "AsyncSession", user_id: int, fetched: "object"
+) -> None:
+    """When a fetch had to fall back to the LLM on a domain with no
+    generated extractor, queue an extractor_gen task so Claude writes
+    one and the domain stops needing a model. Dedupes against pending
+    tasks; the (HTML, expected-output) sample was already saved by
+    perform_fetch. Caller commits."""
+    candidate = getattr(fetched, "extractor_candidate", None)
+    if not isinstance(candidate, dict):
+        return
+    domain = candidate.get("domain")
+    if not domain:
+        return
+    pending = (
+        await db.execute(
+            select(JobFetchQueue).where(
+                JobFetchQueue.user_id == user_id,
+                JobFetchQueue.kind == "extractor_gen",
+                JobFetchQueue.state.in_(("queued", "processing")),
+            )
+        )
+    ).scalars().all()
+    if any(
+        isinstance(p.payload, dict) and p.payload.get("domain") == domain
+        for p in pending
+    ):
+        return
+    db.add(
+        JobFetchQueue(
+            user_id=user_id,
+            kind="extractor_gen",
+            label=f"Write extractor: {domain}"[:512],
+            url="",
+            payload={"domain": domain},
+            state="queued",
+        )
+    )
+    log.info("Queued extractor generation for domain %s", domain)
+
+
 async def _handle_fetch(item: JobFetchQueue) -> None:
     """Claim-a-URL → fetch → create OR enrich a TrackedJob.
 
@@ -773,6 +814,7 @@ async def _handle_fetch(item: JobFetchQueue) -> None:
                 # there's nothing to score or the org's already
                 # researched.
                 await _enqueue_followups(db, existing)
+                await _maybe_enqueue_extractor_gen(db, row.user_id, fetched)
                 await db.commit()
                 queue_bus.publish({
                     "item_id": f"queue:{item_id}", "source": "fetch",
@@ -882,6 +924,7 @@ async def _handle_fetch(item: JobFetchQueue) -> None:
         # Auto-queue JD-analyze + company-research so the new row
         # lands fully enriched without the user clicking Score / Research.
         await _enqueue_followups(db, job)
+        await _maybe_enqueue_extractor_gen(db, row.user_id, fetched)
         await db.commit()
         queue_bus.publish({
             "item_id": f"queue:{item_id}", "source": "fetch",
@@ -1750,6 +1793,148 @@ async def _handle_strategy(item: JobFetchQueue) -> None:
         )
 
 
+def _extract_python_block(text: str) -> str:
+    """Pull the python code block out of a codegen response. Falls back
+    to the whole text when it already looks like bare module code."""
+    blocks = re.findall(r"```(?:python)?\s*\n(.*?)```", text or "", re.DOTALL)
+    if blocks:
+        return max(blocks, key=len).strip()
+    if "def extract(" in (text or ""):
+        return text.strip()
+    return ""
+
+
+async def _handle_extractor_gen(item: JobFetchQueue) -> None:
+    """Have Claude WRITE a per-domain fetch extractor module, test it
+    against the saved (HTML, expected-fields) sample, and install it
+    only if the output matches. This is the self-healing fetcher loop:
+    the model reads HTML once per domain to author + validate code; the
+    installed module then handles every future fetch of that domain
+    with no model at all. One-shot on failure (a 7-day cooldown in the
+    extractor registry stops re-generation thrash)."""
+    import json as _json
+
+    from app.skills import extractors as _ex
+    from app.skills import queue_bus
+    from app.skills.runner import ClaudeCodeError
+
+    async with SessionLocal() as db:
+        row = (
+            await db.execute(select(JobFetchQueue).where(JobFetchQueue.id == item.id))
+        ).scalar_one_or_none()
+        if row is None:
+            return
+        domain = (row.payload or {}).get("domain") if isinstance(row.payload, dict) else None
+        if not domain:
+            await _fail(db, row, "extractor_gen task missing domain", permanent=True)
+            return
+        if not _ex.should_generate(domain):
+            row.state = "done"
+            row.result = {"domain": domain, "skipped": "installed or cooling down"}
+            await db.commit()
+            return
+        sample = _ex.load_sample(domain)
+        if sample is None:
+            await _fail(
+                db, row, f"no saved sample for {domain}", permanent=True
+            )
+            return
+        html, expected = sample
+
+        # Built by concatenation, not .format() — the HTML is full of braces.
+        prompt = (
+            "You are writing a small Python extractor module for job postings "
+            f"on the domain `{domain}`.\n\n"
+            "CONTRACT — the module must define exactly:\n\n"
+            "    def extract(html: str) -> dict | None\n\n"
+            "returning a dict with EXACTLY these keys (None when a value "
+            "isn't on the page): title, organization_name, location, "
+            "remote_policy ('remote' | 'hybrid' | 'onsite' | None), "
+            "employment_type, salary_min (float | None), salary_max "
+            "(float | None), salary_currency, date_posted ('YYYY-MM-DD' | "
+            "None), job_description (plain text or markdown — NEVER raw "
+            "HTML).\n\n"
+            "Hard rules:\n"
+            "- Imports allowed ONLY from: re, json, html, datetime, "
+            "urllib.parse, bs4 (BeautifulSoup). No network, no file IO, no "
+            "exec/eval, no other imports.\n"
+            "- Return None when the page doesn't look like a job posting.\n"
+            "- Prefer STABLE signals: JSON blobs embedded in <script> tags, "
+            "data-* attributes, semantic ids/classes — never brittle text "
+            "offsets. The module must generalize to OTHER postings on this "
+            "domain, not just this sample.\n"
+            "- Be defensive: missing nodes → None fields, never exceptions.\n\n"
+            "Return ONLY one ```python code block. No prose.\n\n"
+            "EXPECTED OUTPUT for the sample below (from a validated parse — "
+            "your code's output must match its title and reach at least "
+            "half its description length):\n"
+            + _json.dumps(expected, indent=2, default=str)
+            + "\n\nHTML SAMPLE (truncated):\n"
+            + html[:150_000]
+        )
+
+        label = row.label or f"Write extractor: {domain}"
+        try:
+            final_text = await queue_bus.run_claude_to_bus(
+                prompt=prompt,
+                source="extractor_gen",
+                item_id=f"queue:{row.id}",
+                label=label,
+                allowed_tools=[],
+                timeout_seconds=600,
+                action=None,
+            )
+        except ClaudeCodeError as exc:
+            err = str(exc)
+            if _is_rate_limited(err):
+                await _handle_rate_limit(db, row, err)
+                return
+            await _fail(db, row, err, permanent=True)
+            return
+        except Exception as exc:  # pragma: no cover
+            await _fail(db, row, f"Unexpected error: {exc}", permanent=True)
+            log.exception("extractor_gen task %d unhandled error", row.id)
+            return
+
+        code = _extract_python_block(final_text)
+        if not code:
+            if _is_rate_limited(final_text):
+                await _handle_rate_limit(db, row, final_text)
+                return
+            _ex.record_gen_failure(domain, "response contained no python code block")
+            await _fail(
+                db, row,
+                "Extractor generation returned no python code block.",
+                permanent=True,
+            )
+            return
+
+        try:
+            ok, detail = await asyncio.wait_for(
+                asyncio.to_thread(_ex.test_candidate, code, html, expected),
+                timeout=30,
+            )
+        except Exception as exc:
+            ok, detail = False, f"test harness error: {exc}"
+        if not ok:
+            _ex.record_gen_failure(domain, detail)
+            await _fail(
+                db, row,
+                f"Generated extractor for {domain} failed validation: {detail}",
+                permanent=True,
+            )
+            return
+
+        _ex.install_module(domain, code)
+        row.state = "done"
+        row.result = {"domain": domain, "installed": True}
+        row.error_message = None
+        await db.commit()
+        log.info(
+            "extractor_gen task %d → installed extractor for %s", row.id, domain
+        )
+
+
 # kind → handler. Extensible: add new kinds here.
 _HANDLERS = {
     "fetch": _handle_fetch,
@@ -1759,6 +1944,7 @@ _HANDLERS = {
     "org_research": _handle_org_research,
     "prep": _handle_prep,
     "strategy": _handle_strategy,
+    "extractor_gen": _handle_extractor_gen,
 }
 
 
