@@ -539,6 +539,42 @@ export default function JobTrackerPage() {
     setTimeout(() => setBulkMsg(null), 15000);
   }
 
+  /**
+   * Re-run scoring (Jev when a key is configured, LLM analyzer
+   * otherwise) for every selected job. One POST — the backend enqueues
+   * a score task per job and the queue worker drains them, so this
+   * returns instantly. Selection implies force: already-scored rows
+   * get fresh scores.
+   */
+  async function bulkRescore() {
+    const ids = [...selectedIds];
+    if (ids.length === 0) return;
+    setBulkRunning(true);
+    setBulkMsg(null);
+    try {
+      const r = await api.post<{
+        enqueued: number;
+        skipped_no_description: number;
+      }>("/api/v1/jobs/batch-analyze-jd", { ids });
+      let m = `Queued ${r.enqueued} of ${ids.length} for rescoring`;
+      if (r.skipped_no_description) m += ` · ${r.skipped_no_description} skipped (no JD)`;
+      const dup = ids.length - r.enqueued - (r.skipped_no_description ?? 0);
+      if (dup > 0) m += ` · ${dup} already queued`;
+      if (r.enqueued > 0) m += " · see Companion Activity for progress";
+      setBulkMsg(m);
+      setSelectedIds(new Set());
+    } catch (e) {
+      setBulkMsg(
+        e instanceof ApiError
+          ? `Rescore failed (HTTP ${e.status}).`
+          : "Rescore failed.",
+      );
+    } finally {
+      setBulkRunning(false);
+      setTimeout(() => setBulkMsg(null), 15000);
+    }
+  }
+
   async function onQueueImport(file: File | null) {
     if (!file) return;
     setQueueImporting(true);
@@ -784,6 +820,22 @@ export default function JobTrackerPage() {
               title="Queue both a resume and a cover letter per selected job"
             >
               {bulkRunning ? "Queuing…" : "Both"}
+            </button>
+          </div>
+
+          {/* Score group — one queue task per selected job, Jev-first. */}
+          <div className="flex items-center gap-1.5 px-2 py-1 rounded border border-corp-border">
+            <span className="text-[10px] uppercase tracking-wider text-corp-muted">
+              Score
+            </span>
+            <button
+              type="button"
+              className="jsp-btn-ghost text-xs"
+              onClick={bulkRescore}
+              disabled={bulkRunning}
+              title="Queue a fresh scoring run (Jev when configured) for each selected job — replaces existing scores"
+            >
+              {bulkRunning ? "Queuing…" : "Rescore"}
             </button>
           </div>
 

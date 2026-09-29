@@ -2136,6 +2136,7 @@ def _override_fit_with_jev(job: TrackedJob, jev_data: dict) -> None:
     fs = dict(job.fit_summary) if isinstance(job.fit_summary, dict) else {}
     fs["score"] = jev_data.get("fit_score")
     fs["score_engine"] = "jev"
+    fs["scored_by"] = "jev"
     job.fit_summary = fs
 
 
@@ -2154,6 +2155,12 @@ def _apply_jd_analysis_to_job(job: TrackedJob, data: dict) -> None:
     out = dict(prior)
     if analysis.fit_summary:
         out["summary"] = analysis.fit_summary
+    if data.get("engine") != "jev":
+        # A non-Jev analyzer is taking over: drop the Jev marker so the
+        # deterministic recompute that follows owns the headline again
+        # (apply_fit_score_to_job preserves the headline while the
+        # marker is present).
+        out.pop("score_engine", None)
     job.fit_summary = out
 
 
@@ -2364,23 +2371,46 @@ class BatchAnalyzeOut(BaseModel):
     errors: list[dict] = []
 
 
+class BatchAnalyzeIn(BaseModel):
+    """Optional body for /batch-analyze-jd. `ids` scopes the run to those
+    tracked jobs (the tracker's "Rescore selected" bulk action); an
+    explicit selection always rescores, even rows that already have a
+    score. Omitted/empty body keeps the original score-everything-
+    unscored behavior."""
+
+    ids: Optional[list[int]] = None
+    force: bool = False
+
+
 @router.post("/batch-analyze-jd", response_model=BatchAnalyzeOut)
 async def batch_analyze_jd(
+    body: Optional[BatchAnalyzeIn] = None,
     force: bool = False,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> BatchAnalyzeOut:
-    """Enqueue a JD-analysis task for every TrackedJob that has a description.
+    """Enqueue a JD-analysis task (Jev-first when a key is on file) for
+    tracked jobs with a description.
 
-    Default: only scores jobs without a fit_score yet. `?force=1` rescores
-    everything. Returns immediately with counts — the queue worker drains
-    the tasks serially (to respect Claude's rate limits) and each task
-    appears live on the Companion Activity page.
+    Default: only scores jobs without a fit_score yet. `?force=1` (or
+    body.force) rescores everything; body.ids scopes the run to a
+    selection and implies force for those rows. Returns immediately with
+    counts — the queue worker drains the tasks (respecting rate limits)
+    and each task appears live on the Companion Activity page.
     """
+    ids: Optional[set[int]] = None
+    if body is not None:
+        force = force or body.force
+        if body.ids:
+            ids = {int(i) for i in body.ids}
+            force = True  # explicit selection = rescore even if scored
+
     stmt = select(TrackedJob).where(
         TrackedJob.user_id == user.id,
         TrackedJob.deleted_at.is_(None),
     )
+    if ids:
+        stmt = stmt.where(TrackedJob.id.in_(ids))
     jobs = list((await db.execute(stmt)).scalars().all())
 
     # Resolve org names once so labels read nicely.

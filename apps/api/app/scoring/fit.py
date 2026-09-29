@@ -240,10 +240,9 @@ def _score_salary(
         if prefs.salary_unacceptable_below is not None
         else None
     )
-    # Use the high end of the posted range to evaluate "could meet
-    # target", and the low end to evaluate "definitely below floor".
+    # Evaluate on the high end of the posted range: "could meet target",
+    # and for the veto, "even the best case is below the hard floor".
     high = job_max if job_max is not None else job_min
-    low = job_min if job_min is not None else job_max
     if veto is not None and high is not None and high < veto:
         return Component(
             key="salary",
@@ -962,6 +961,18 @@ def apply_fit_score_to_job(job: TrackedJob, result: FitResult) -> None:
     out["veto_reason"] = result.veto_reason
     out["breakdown"] = [c.to_dict() for c in result.components]
     out["scored_by"] = "deterministic"
+    # The raw engine number is always kept alongside, so the breakdown
+    # panel can show it even when Jev owns the headline.
+    out["deterministic_score"] = result.score
+    # A Jev headline score is authoritative until Jev itself rescores
+    # (queue score task) or a non-Jev analyzer takes over (which clears
+    # score_engine in _apply_jd_analysis_to_job). Deterministic
+    # recomputes — job edits, preference changes, "Recompute fit" —
+    # refresh the breakdown and veto flags but must NOT replace the
+    # headline number the tracker / review / apply flows act on.
+    if prior.get("score_engine") == "jev" and prior.get("score") is not None:
+        out["score"] = prior["score"]
+        out["scored_by"] = "jev"
 
     # Pull the required-skill counts out of the skills component (if it
     # ran). Store have/total/pct so _compute_job_summaries can read them.
