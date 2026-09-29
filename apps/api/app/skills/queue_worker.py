@@ -930,7 +930,63 @@ async def _handle_score(item: JobFetchQueue) -> None:
             _build_jd_analyze_prompt,
             _extract_json_object,
             _apply_jd_analysis_to_job,
+            run_jev_score,
         )
+        from app.models.user import User as _User
+        from app.skills.jev import JevError
+
+        # Jev-first: when the user has a TypeSafe Jev key on file, initial
+        # scoring is one calibrated evaluation call — no LLM, no narrative
+        # pros/cons. Falls through to the LLM analyzer when unconfigured.
+        score_user = (
+            await db.execute(select(_User).where(_User.id == row.user_id))
+        ).scalar_one_or_none()
+        if score_user is not None:
+            try:
+                jev_data = await run_jev_score(db, score_user, job)
+            except JevError as exc:
+                err = str(exc)
+                if _is_rate_limited(err):
+                    await _handle_rate_limit(db, row, err)
+                    return
+                await _fail(db, row, err, permanent=True)
+                return
+            if jev_data is not None:
+                _apply_jd_analysis_to_job(job, jev_data)
+                try:
+                    from app.scoring.fit import (
+                        apply_fit_score_to_job,
+                        compute_fit_score,
+                    )
+
+                    fit_result = await compute_fit_score(db, score_user, job)
+                    apply_fit_score_to_job(job, fit_result)
+                except Exception as exc:  # pragma: no cover
+                    log.warning(
+                        "Score task %d: jev analysis persisted but fit-score "
+                        "recompute failed: %s",
+                        row.id, exc,
+                    )
+                row.state = "done"
+                row.result = {
+                    "tracked_job_id": job.id,
+                    "engine": "jev",
+                    "fit_score": jev_data.get("fit_score"),
+                    "recommendation": jev_data.get("recommendation"),
+                }
+                row.error_message = None
+                if isinstance(row.payload, dict) and "rate_limit_count" in row.payload:
+                    new_payload = dict(row.payload)
+                    new_payload.pop("rate_limit_count", None)
+                    row.payload = new_payload or None
+                await db.commit()
+                log.info(
+                    "Score task %d → Jev scored TrackedJob %d (fit=%s, rec=%s)",
+                    row.id, job.id,
+                    jev_data.get("fit_score"), jev_data.get("recommendation"),
+                )
+                return
+
         prompt = _build_jd_analyze_prompt(job)
 
         from app.core.security import create_access_token

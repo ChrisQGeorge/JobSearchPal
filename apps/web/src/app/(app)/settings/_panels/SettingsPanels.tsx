@@ -174,6 +174,17 @@ const KNOWN_PROVIDERS: { value: string; label: string; hint: string }[] = [
       "Find your key at brightdata.com → Account Settings → API tokens."
     ),
   },
+  {
+    // Keep in sync with JEV_PROVIDER in apps/api/app/skills/jev.py.
+    value: "typesafe_jev",
+    label: "TypeSafe Jev",
+    hint: (
+      "When set, initial job scoring runs on TypeSafe's Jev evaluation " +
+      "model instead of an LLM — one calibrated fit score + go/no-go " +
+      "verdict per job, no narrative pros/cons. Remove the key to fall " +
+      "back to the LLM analyzer. Get a key from your TypeSafe account."
+    ),
+  },
 ];
 
 export function ApiKeysPanel() {

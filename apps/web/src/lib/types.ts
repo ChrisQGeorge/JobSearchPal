@@ -432,6 +432,12 @@ export type JdAnalysis = {
   recommendation?: string | null; // "go" | "no-go" | "maybe"
   pros?: string[] | null;
   cons?: string[] | null;
+  // Jev (TypeSafe System One) scoring — engine === "jev" means the row
+  // was scored by a calibrated evaluation model with no narrative
+  // pros/cons (by design, not missing data).
+  engine?: string | null;
+  confidence?: number | null;
+  apply_probability?: number | null;
   // Legacy fields from the pre-slim prompt — kept so rows analyzed
   // under the old schema still render. The UI falls back to these
   // when pros/cons aren't present on the row.

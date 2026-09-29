@@ -1940,6 +1940,12 @@ class JdAnalysis(BaseModel):
     recommendation: Optional[str] = None  # "go" | "no-go" | "maybe"
     pros: Optional[list[str]] = None
     cons: Optional[list[str]] = None
+    # --- Jev (TypeSafe System One) scoring fields. When engine == "jev"
+    # the analysis is a calibrated numeric judgment with NO narrative
+    # pros/cons — that's by design, not missing data. ---
+    engine: Optional[str] = None  # "jev" | None (None = LLM analyzer)
+    confidence: Optional[float] = None
+    apply_probability: Optional[float] = None
     # --- legacy (pre-slim) fields, retained for back-compat reads ---
     strengths: Optional[list[str]] = None
     gaps: Optional[list[str]] = None
@@ -2041,6 +2047,49 @@ def _build_jd_analyze_prompt(job: TrackedJob, org_name: Optional[str] = None) ->
     )
 
 
+async def run_jev_score(
+    db: AsyncSession, user: User, job: TrackedJob
+) -> Optional[dict]:
+    """Score `job` with TypeSafe's Jev model when the user has a
+    typesafe_jev API key on file (Settings → API Keys). Returns a
+    jd_analysis-shaped dict, or None when no key is configured (caller
+    falls back to the LLM analyzer). Raises JevError on API failure —
+    the message carries the HTTP status so rate-limit parking works.
+
+    The state sent to Jev inlines everything (posting + candidate
+    profile); unlike the LLM analyzer there are no tool calls."""
+    from app.api.v1.api_credentials import get_user_secret
+    from app.skills.jev import JEV_PROVIDER, score_job_fit
+
+    api_key = await get_user_secret(db, user.id, JEV_PROVIDER)
+    if not api_key:
+        return None
+
+    from app.api.v1.documents import _build_candidate_profile_block
+
+    org_name = await _resolve_org_name(db, job.organization_id)
+    candidate_profile = await _build_candidate_profile_block(db, user)
+    job_state = {
+        "job_posting": {
+            "title": job.title,
+            "organization": org_name,
+            "location": job.location,
+            "remote_policy": job.remote_policy,
+            "employment_type": job.employment_type,
+            "experience_level": job.experience_level,
+            "experience_years_min": job.experience_years_min,
+            "experience_years_max": job.experience_years_max,
+            "salary_min": float(job.salary_min) if job.salary_min is not None else None,
+            "salary_max": float(job.salary_max) if job.salary_max is not None else None,
+            "required_skills": job.required_skills or [],
+            "nice_to_have_skills": job.nice_to_have_skills or [],
+            "description": job.job_description or "",
+        },
+        "candidate_profile": candidate_profile,
+    }
+    return await score_job_fit(api_key, job_state=job_state)
+
+
 def _apply_jd_analysis_to_job(job: TrackedJob, data: dict) -> None:
     """Normalize Claude's response and persist it onto the TrackedJob. Shared
     between the single-job endpoint and the batch queue handler.
@@ -2089,6 +2138,24 @@ async def analyze_jd(
             status_code=422,
             detail="No job description stored. Paste one in before analyzing.",
         )
+
+    # Jev-first: when a TypeSafe key is on file (Settings → API Keys →
+    # TypeSafe Jev), initial scoring is one calibrated evaluation call —
+    # no LLM, no narrative pros/cons. Falls through to the LLM analyzer
+    # when no key is configured.
+    from app.skills.jev import JevError
+
+    try:
+        jev = await run_jev_score(db, user, job)
+    except JevError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    if jev is not None:
+        _apply_jd_analysis_to_job(job, jev)
+        result = await compute_fit_score(db, user, job)
+        apply_fit_score_to_job(job, result)
+        await db.commit()
+        await db.refresh(job)
+        return job
 
     org_name = await _resolve_org_name(db, job.organization_id)
     prompt = _build_jd_analyze_prompt(job, org_name)

@@ -3379,6 +3379,20 @@ function JdAnalysisBody({ analysis }: { analysis: JdAnalysis }) {
       ? [...(analysis.red_flags ?? []), ...(analysis.gaps ?? [])]
       : null);
   if (!pros && !cons) {
+    if (analysis.engine === "jev") {
+      return (
+        <p className="text-xs text-corp-muted">
+          Scored by TypeSafe Jev — a calibrated evaluation model that
+          returns a numeric judgment rather than narrative reasons.
+          {typeof analysis.confidence === "number"
+            ? ` Confidence ${Math.round(analysis.confidence * 100)}%.`
+            : ""}
+          {typeof analysis.apply_probability === "number"
+            ? ` Worth-applying probability ${Math.round(analysis.apply_probability * 100)}%.`
+            : ""}
+        </p>
+      );
+    }
     return (
       <p className="text-xs text-corp-muted">
         No structured pros / cons captured — re-analyze for the new short
