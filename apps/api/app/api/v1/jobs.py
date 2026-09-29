@@ -2732,19 +2732,23 @@ async def _extract_skills_via_llm(
     routing (external providers included — it's a pure text task).
 
     Returns (required, nice_to_have, markers) where markers is
-    {"required": [...], "nice": [...], "other": [...]} heading phrases
-    for skills_lexicon.learn_heading_markers."""
+    {"required": [...], "nice": [...], "other": [...], "cues": [...]}
+    heading/cue phrases for skills_lexicon.learn_heading_markers."""
     parts: list[str] = []
     if lines:
         numbered = "\n".join(f"- {ln}" for ln in lines[:10])
         parts.append(
-            "These lines come from a job posting's requirements section "
-            "but matched no known skill keywords. Extract the concrete "
-            "skill / technology / tool / methodology / certification "
-            "terms they ask for, exactly as written (preserve casing "
-            "like PostgreSQL, C++). Ignore soft-skill and culture "
-            "boilerplate (communication, team player, fast-paced, …) — "
-            "return nothing for those lines.\n\n" + numbered
+            "These lines come from a job posting but matched no known "
+            "skill keywords. Extract the concrete skill / technology / "
+            "tool / methodology / certification terms they ask for, "
+            "exactly as written (preserve casing like PostgreSQL, C++). "
+            "Ignore soft-skill and culture boilerplate (communication, "
+            "team player, fast-paced, …) — return nothing for those "
+            "lines. Additionally, for any line that STATES a candidate "
+            "requirement, give the short generic cue phrase (2-4 words, "
+            "lowercase) within it that signals this — e.g. \"experience "
+            "with\", \"you'll need\", \"comfortable using\" — reusable "
+            "across postings.\n\n" + numbered
         )
     if headings:
         hlist = "\n".join(f"- {h}" for h in headings[:8])
@@ -2761,13 +2765,16 @@ async def _extract_skills_via_llm(
         )
     schema = (
         'Return ONE JSON object, no prose: {"required": string[], '
-        '"nice_to_have": string[], "section_markers": {"required": '
-        'string[], "nice_to_have": string[], "other": string[]}} '
-        "(nice_to_have skills only for terms the line itself marks as "
-        "preferred/bonus; omit section_markers lists that don't apply)."
+        '"nice_to_have": string[], "requirement_cues": string[], '
+        '"section_markers": {"required": string[], "nice_to_have": '
+        'string[], "other": string[]}} (nice_to_have skills only for '
+        "terms the line itself marks as preferred/bonus; omit lists "
+        "that don't apply)."
     )
     prompt = "\n\n".join(parts + [schema])
-    empty_markers: dict[str, list[str]] = {"required": [], "nice": [], "other": []}
+    empty_markers: dict[str, list[str]] = {
+        "required": [], "nice": [], "other": [], "cues": [],
+    }
     try:
         result = await run_claude_prompt(
             prompt=prompt,
@@ -2797,6 +2804,11 @@ async def _extract_skills_via_llm(
             ][:8],
             "other": [
                 str(s) for s in (raw_markers.get("other") or []) if str(s).strip()
+            ][:8],
+            "cues": [
+                str(s)
+                for s in (data.get("requirement_cues") or [])
+                if str(s).strip()
             ][:8],
         }
         return req[:20], nice[:10], markers
@@ -2914,13 +2926,33 @@ async def perform_fetch(
                     and cov["coverage"] < 0.7
                     and cov["uncovered_lines"]
                 )
-                if low_cov or unknown:
+                # Zero-skills tripwire: a non-trivial posting where the
+                # lexicon found NOTHING is suspect no matter what the
+                # coverage math says (informal prose may dodge every
+                # known cue) — escalate with a capped sample of the
+                # non-fluff segments.
+                no_skills = (
+                    not (
+                        data.get("required_skills")
+                        or data.get("nice_to_have_skills")
+                    )
+                    and len(desc_text.strip()) >= 300
+                    and bool(cov.get("candidate_lines"))
+                )
+                if low_cov or unknown or no_skills:
+                    esc_lines = (
+                        cov["uncovered_lines"]
+                        if low_cov
+                        else (cov.get("candidate_lines") or [] if no_skills else [])
+                    )
                     bits = []
                     if low_cov:
                         bits.append(
                             f"coverage {int(cov['coverage'] * 100)}% "
                             f"({cov['covered']}/{cov['total']} lines)"
                         )
+                    if no_skills:
+                        bits.append("0 skill terms recognized")
                     if unknown:
                         bits.append(
                             f"{len(unknown)} unrecognized section heading(s)"
@@ -2928,14 +2960,13 @@ async def perform_fetch(
                     _emit({
                         "kind": "system",
                         "text": (
-                            "Requirements " + ", ".join(bits) + " — asking "
-                            "the model about those items only."
+                            "Requirements check: " + ", ".join(bits) +
+                            " — asking the model about those items only."
                         ),
                     })
                     extra_req, extra_nice, markers = (
                         await _extract_skills_via_llm(
-                            cov["uncovered_lines"] if low_cov else [],
-                            unknown or None,
+                            esc_lines, unknown or None
                         )
                     )
 
@@ -2957,26 +2988,28 @@ async def perform_fetch(
                                 "learns these for future fetches."
                             ),
                         })
-                    if unknown and any(markers.values()):
+                    if any(markers.values()):
                         n_markers = learn_heading_markers(
                             required=markers["required"],
                             nice=markers["nice"],
                             other=markers["other"],
-                            seen_in=unknown,
+                            cues=markers.get("cues") or [],
+                            seen_in=list(unknown) + list(esc_lines),
                         )
                         if n_markers:
                             _emit({
                                 "kind": "system",
                                 "text": (
-                                    f"Learned {n_markers} section-heading "
-                                    "marker(s) — these sections parse "
-                                    "deterministically from now on."
+                                    f"Learned {n_markers} section marker/"
+                                    "requirement-cue phrase(s) — these "
+                                    "patterns parse deterministically "
+                                    "from now on."
                                 ),
                             })
-                            # New markers may have opened a requirements
-                            # section that was invisible on the first
-                            # pass — re-assess once (at most one extra
-                            # focused call, no loop).
+                            # New markers/cues may have made requirement
+                            # statements visible that weren't on the
+                            # first pass — re-assess once (at most one
+                            # extra focused call, no loop).
                             cov2 = await assess_requirements_coverage(desc_text)
                             if (
                                 cov2["total"] > cov["total"]

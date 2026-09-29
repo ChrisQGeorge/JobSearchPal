@@ -83,6 +83,28 @@ _SEED_OTHER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Cue phrases that mark a PROSE sentence as stating a candidate
+# requirement, for postings with informal structure (no headings, no
+# bullets). Like the heading markers, this vocabulary self-heals: the
+# escalation call can return new generic cues, persisted under "cues"
+# in the same store.
+_SEED_CUE_RE = re.compile(
+    r"(experience (?:with|in|using|of)|years? of experience|proficien"
+    r"|expertise|knowledge of|familiar(?:ity)? with|working knowledge"
+    r"|understanding of|must (?:have|be|know)|should (?:have|be|know)"
+    r"|need(?:s|ed)? to (?:have|know|be)|you.{0,3}ll need"
+    r"|we.{0,3}re looking for|looking for someone|ideal candidate"
+    r"|qualified candidates?|ability to|able to|capable of"
+    r"|strong background|background in|track record|hands[- ]on"
+    r"|skilled (?:in|at)|competenc|certif(?:ied|ication)|degree in"
+    r"|you (?:have|are|bring|know)|required|requirements?|prerequisit"
+    r"|a plus|bonus if|nice to have|comfortable (?:with|using))",
+    re.IGNORECASE,
+)
+
+# Sentence/clause boundaries for prose segmentation.
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\s*;\s+")
+
 # (loaded_monotonic, {"required": re|None, "nice": re|None, "other": re|None})
 _MARKER_CACHE: Optional[tuple[float, dict[str, Optional[re.Pattern]]]] = None
 
@@ -93,7 +115,7 @@ def _load_marker_store() -> dict[str, list[str]]:
     except Exception:
         raw = {}
     out: dict[str, list[str]] = {}
-    for kind in ("required", "nice", "other"):
+    for kind in ("required", "nice", "other", "cues"):
         vals = raw.get(kind) if isinstance(raw, dict) else None
         out[kind] = [
             str(v) for v in vals if str(v).strip()
@@ -164,12 +186,14 @@ def learn_heading_markers(
     required: list[str] | None = None,
     nice: list[str] | None = None,
     other: list[str] | None = None,
+    cues: list[str] | None = None,
     seen_in: list[str] | None = None,
 ) -> int:
-    """Persist new section-heading marker phrases. Each phrase must
-    actually occur in one of the `seen_in` heading lines (case-
-    insensitive) — a model can only teach markers it was shown, never
-    invent them. Returns how many phrases were newly added."""
+    """Persist new section-heading marker phrases and requirement-cue
+    phrases. Each phrase must actually occur in one of the `seen_in`
+    lines (case-insensitive) — a model can only teach markers it was
+    shown, never invent them. Returns how many phrases were newly
+    added."""
     global _MARKER_CACHE
     haystack = "\n".join(seen_in or []).lower()
     store = _load_marker_store()
@@ -180,7 +204,8 @@ def learn_heading_markers(
     }
     added = 0
     for kind, phrases in (
-        ("required", required), ("nice", nice), ("other", other)
+        ("required", required), ("nice", nice), ("other", other),
+        ("cues", cues),
     ):
         for raw in phrases or []:
             p = _normalize_marker(raw)
@@ -313,63 +338,116 @@ _NONSKILL_REQ_RE = re.compile(
 )
 
 
+def _segment_text(text: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """Split a JD into (content, context) segments regardless of
+    formatting: bullets become one segment each, prose is split into
+    sentences/clauses. Context is the classification of the nearest
+    heading above ('req' / 'other' / 'unknown') or 'none' when the text
+    has no headings at all — structure is a hint, never a requirement.
+    Also returns unknown_headings: heading-ish lines with meaningful
+    content beneath (≥2 bullets or ≥150 chars of prose) that matched no
+    known section marker."""
+    segments: list[tuple[str, str]] = []
+    unknown_headings: list[str] = []
+    context = "none"
+    pending_unknown: Optional[str] = None
+    pending_weight = 0  # bullets count 100 each; prose counts its chars
+    prose_buf: list[str] = []
+
+    def _flush_prose() -> None:
+        nonlocal prose_buf
+        if not prose_buf:
+            return
+        block = " ".join(prose_buf)
+        prose_buf = []
+        for sent in _SENT_SPLIT_RE.split(block):
+            s = sent.strip()
+            if len(s) >= 25:
+                segments.append((s[:250], context))
+
+    def _flush_unknown() -> None:
+        nonlocal pending_unknown, pending_weight
+        if (
+            pending_unknown
+            and pending_weight >= 150
+            and len(unknown_headings) < 8
+        ):
+            unknown_headings.append(pending_unknown)
+        pending_unknown = None
+        pending_weight = 0
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            _flush_prose()
+            continue
+        if _HEADING_LINE_RE.match(line):
+            _flush_prose()
+            _flush_unknown()
+            context = _heading_kind(stripped)
+            if context == "unknown":
+                pending_unknown = stripped.lstrip("#* ").rstrip("* ")[:100]
+            continue
+        m = _BULLET_RE.match(line)
+        if m:
+            _flush_prose()
+            segments.append((m.group(1).strip()[:250], context))
+            if pending_unknown:
+                pending_weight += 100
+            continue
+        prose_buf.append(stripped)
+        if pending_unknown:
+            pending_weight += len(stripped)
+    _flush_prose()
+    _flush_unknown()
+    return segments, unknown_headings
+
+
 async def assess_requirements_coverage(text: str) -> dict:
-    """Coverage report over the JD's requirement bullets. Returns
-    {total, covered, coverage (0-1), uncovered_lines,
-    unknown_headings}. total == 0 means no recognizable requirements
-    section — nothing to gate on. unknown_headings are heading-ish
-    lines with ≥2 bullets beneath them that matched NO known section
-    marker (requirements, nice-to-have, or other): candidates for the
-    model to classify so the marker vocabulary heals itself."""
+    """Coverage report over the JD's requirement statements — bullets
+    OR prose, formal structure not required. A segment enters the
+    denominator when it sits under a requirements-style heading, or
+    (with no heading context) when it matches a requirement cue phrase
+    ("experience with", "must have", …). Segments under recognized
+    non-requirements sections (benefits, company blurb) never enter.
+
+    Returns {total, covered, coverage (0-1), uncovered_lines,
+    unknown_headings, candidate_lines}. total == 0 means nothing
+    recognizable to gate on. unknown_headings are headings the marker
+    vocabulary couldn't classify. candidate_lines is a capped sample of
+    all non-fluff segments — the escalation payload for the
+    zero-skills-found case, where coverage math alone can't be
+    trusted."""
     empty = {
         "total": 0,
         "covered": 0,
         "coverage": 1.0,
         "uncovered_lines": [],
         "unknown_headings": [],
+        "candidate_lines": [],
     }
     if not text or not text.strip():
         return empty
     lexicon = await get_lexicon()
+    learned_cues = _learned_res()["cues"]
 
-    in_req = False
+    def _cue(content: str) -> bool:
+        if _SEED_CUE_RE.search(content):
+            return True
+        return learned_cues is not None and learned_cues.search(content) is not None
+
+    segments, unknown_headings = _segment_text(text)
     total = 0
     covered = 0
     uncovered: list[str] = []
-    unknown_headings: list[str] = []
-    pending_unknown: Optional[str] = None
-    pending_bullets = 0
-
-    def _flush_unknown() -> None:
-        nonlocal pending_unknown, pending_bullets
-        if (
-            pending_unknown
-            and pending_bullets >= 2
-            and len(unknown_headings) < 8
-        ):
-            unknown_headings.append(pending_unknown)
-        pending_unknown = None
-        pending_bullets = 0
-
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
+    candidates: list[str] = []
+    for content, ctx in segments:
+        if ctx == "other":
             continue
-        if _HEADING_LINE_RE.match(line):
-            _flush_unknown()
-            kind = _heading_kind(stripped)
-            in_req = kind == "req"
-            if kind == "unknown":
-                pending_unknown = stripped.lstrip("#* ").rstrip("* ")[:100]
+        if len(candidates) < 10:
+            candidates.append(content[:200])
+        if ctx != "req" and not _cue(content):
             continue
-        if not in_req:
-            if pending_unknown and _BULLET_RE.match(line):
-                pending_bullets += 1
-            continue
-        m = _BULLET_RE.match(line)
-        if not m:
-            continue
-        content = m.group(1).strip()
         total += 1
         hit = _NONSKILL_REQ_RE.search(content) is not None or any(
             pat.search(content) for pat, _ in lexicon
@@ -378,15 +456,19 @@ async def assess_requirements_coverage(text: str) -> dict:
             covered += 1
         elif len(uncovered) < 10:
             uncovered.append(content[:200])
-    _flush_unknown()
     if total == 0:
-        return {**empty, "unknown_headings": unknown_headings}
+        return {
+            **empty,
+            "unknown_headings": unknown_headings,
+            "candidate_lines": candidates,
+        }
     return {
         "total": total,
         "covered": covered,
         "coverage": covered / total,
         "uncovered_lines": uncovered,
         "unknown_headings": unknown_headings,
+        "candidate_lines": candidates,
     }
 
 
