@@ -152,6 +152,130 @@ function SortableTh({
   );
 }
 
+// Statuses the score rule may act ON — mirror of the backend's
+// _SCORE_RULE_SOURCE_STATUSES. Pipeline-stage rows (applied,
+// interviewing, …) are never flipped by a rule.
+const SCORE_RULE_SOURCES: ReadonlySet<string> = new Set([
+  "to_review",
+  "reviewed",
+  "watching",
+]);
+
+/** "Set status by score" rule: flip every triage-stage job whose fit
+ * score clears a threshold to a chosen status in one server-side sweep —
+ * e.g. ≤ 30 → not_interested, ≥ 70 → interested. */
+function ScoreRuleBar({
+  items,
+  onApplied,
+}: {
+  items: TrackedJobSummary[];
+  onApplied: () => void;
+}) {
+  const [op, setOp] = useState<"gte" | "lte">("lte");
+  const [threshold, setThreshold] = useState("30");
+  const [target, setTarget] = useState<JobStatus>("not_interested");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const th = parseInt(threshold, 10);
+  // Preview from the loaded rows. Approximate when a status filter pill
+  // is active (the list only holds that status) — the server sweeps all
+  // triage-stage rows regardless and reports the real count.
+  const previewCount = Number.isNaN(th)
+    ? 0
+    : items.filter(
+        (j) =>
+          j.fit_score != null &&
+          SCORE_RULE_SOURCES.has(j.status) &&
+          j.status !== target &&
+          (op === "gte" ? j.fit_score >= th : j.fit_score <= th),
+      ).length;
+
+  async function apply() {
+    if (Number.isNaN(th)) return;
+    const opLabel = op === "gte" ? "≥" : "≤";
+    if (
+      !confirm(
+        `Set every to-review / reviewed / watching job with fit score ${opLabel} ${th} ` +
+          `to "${target}"? (${previewCount} visible match${previewCount === 1 ? "" : "es"}; ` +
+          "the rule sweeps all triage-stage jobs server-side, so the final " +
+          "count may differ if the list is filtered.)",
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setMsg(null);
+    try {
+      const res = await api.post<{ changed: number; examined: number }>(
+        "/api/v1/jobs/bulk-status-by-score",
+        { op, threshold: th, status: target },
+      );
+      setMsg(`${res.changed} job(s) → ${target}.`);
+      onApplied();
+    } catch (e) {
+      setMsg(
+        e instanceof ApiError ? `Rule failed (HTTP ${e.status}).` : "Rule failed.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      className="inline-flex items-center gap-1.5 ml-auto"
+      title={
+        "Bulk-triage by score: flips to-review / reviewed / watching jobs " +
+        "whose fit score clears the threshold. Jobs already in the " +
+        "pipeline (applied, interviewing, …) and unscored jobs are never touched."
+      }
+    >
+      <span className="uppercase tracking-wider">Score rule:</span>
+      <select
+        className="jsp-input text-xs py-0.5 px-1"
+        value={op}
+        onChange={(e) => setOp(e.target.value as "gte" | "lte")}
+        disabled={busy}
+      >
+        <option value="gte">≥</option>
+        <option value="lte">≤</option>
+      </select>
+      <input
+        type="number"
+        min={0}
+        max={100}
+        className="jsp-input text-xs py-0.5 px-1 w-14"
+        value={threshold}
+        onChange={(e) => setThreshold(e.target.value)}
+        disabled={busy}
+      />
+      <span>→</span>
+      <select
+        className="jsp-input text-xs py-0.5 px-1"
+        value={target}
+        onChange={(e) => setTarget(e.target.value as JobStatus)}
+        disabled={busy}
+      >
+        {JOB_STATUSES.map((s) => (
+          <option key={s} value={s}>
+            {s}
+          </option>
+        ))}
+      </select>
+      <button
+        type="button"
+        className="jsp-btn-ghost text-xs"
+        onClick={apply}
+        disabled={busy || Number.isNaN(th)}
+      >
+        {busy ? "Applying…" : `Apply (${previewCount})`}
+      </button>
+      {msg ? <span className="text-corp-muted">{msg}</span> : null}
+    </div>
+  );
+}
+
 export default function JobTrackerPage() {
   const [items, setItems] = useState<TrackedJobSummary[]>([]);
   const [loading, setLoading] = useState(true);
@@ -688,6 +812,7 @@ export default function JobTrackerPage() {
           value={coverFilter}
           onChange={setCoverFilter}
         />
+        <ScoreRuleBar items={items} onApplied={refresh} />
       </div>
 
       {creating ? (

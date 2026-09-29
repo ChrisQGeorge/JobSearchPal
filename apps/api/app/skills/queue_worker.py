@@ -930,6 +930,7 @@ async def _handle_score(item: JobFetchQueue) -> None:
             _build_jd_analyze_prompt,
             _extract_json_object,
             _apply_jd_analysis_to_job,
+            _override_fit_with_jev,
             run_jev_score,
         )
         from app.models.user import User as _User
@@ -967,6 +968,7 @@ async def _handle_score(item: JobFetchQueue) -> None:
                         "recompute failed: %s",
                         row.id, exc,
                     )
+                _override_fit_with_jev(job, jev_data)
                 row.state = "done"
                 row.result = {
                     "tracked_job_id": job.id,

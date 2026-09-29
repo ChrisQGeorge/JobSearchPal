@@ -3368,6 +3368,15 @@ function RecommendationBadge({ value }: { value: string }) {
   );
 }
 
+// Keep in sync with SCORE_DIMENSIONS in apps/api/app/skills/jev.py.
+const JEV_DIMENSION_LABELS: Record<string, string> = {
+  skills_fit: "Skills & requirements",
+  job_quality: "Job quality",
+  location_fit: "Location",
+  career_fit: "Career trajectory",
+  posting_quality: "Posting credibility",
+};
+
 function JdAnalysisBody({ analysis }: { analysis: JdAnalysis }) {
   // Prefer the slim-prompt fields (pros / cons). Fall back to the
   // pre-slim shape (strengths + gaps + red_flags) for rows analyzed
@@ -3381,16 +3390,48 @@ function JdAnalysisBody({ analysis }: { analysis: JdAnalysis }) {
   if (!pros && !cons) {
     if (analysis.engine === "jev") {
       return (
-        <p className="text-xs text-corp-muted">
-          Scored by TypeSafe Jev — a calibrated evaluation model that
-          returns a numeric judgment rather than narrative reasons.
-          {typeof analysis.confidence === "number"
-            ? ` Confidence ${Math.round(analysis.confidence * 100)}%.`
-            : ""}
-          {typeof analysis.apply_probability === "number"
-            ? ` Worth-applying probability ${Math.round(analysis.apply_probability * 100)}%.`
-            : ""}
-        </p>
+        <div className="space-y-2">
+          {analysis.scores ? (
+            <div className="grid grid-cols-2 md:grid-cols-3 gap-x-4 gap-y-1 text-sm">
+              {Object.entries(JEV_DIMENSION_LABELS).map(([key, label]) => {
+                const s = analysis.scores?.[key];
+                if (!s || typeof s.score !== "number") return null;
+                return (
+                  <div key={key} className="flex justify-between gap-2">
+                    <span className="text-corp-muted">{label}</span>
+                    <span
+                      className={
+                        s.score >= 70
+                          ? "text-emerald-300"
+                          : s.score <= 30
+                            ? "text-corp-danger"
+                            : "text-corp-accent2"
+                      }
+                      title={
+                        typeof s.confidence === "number"
+                          ? `Confidence ${Math.round(s.confidence * 100)}%`
+                          : undefined
+                      }
+                    >
+                      {s.score}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
+          <p className="text-xs text-corp-muted">
+            Scored by TypeSafe Jev — a calibrated evaluation model; the fit
+            score is the average of the dimensions above, with no narrative
+            reasons by design.
+            {typeof analysis.confidence === "number"
+              ? ` Mean confidence ${Math.round(analysis.confidence * 100)}%.`
+              : ""}
+            {typeof analysis.apply_probability === "number"
+              ? ` Worth-applying probability ${Math.round(analysis.apply_probability * 100)}%.`
+              : ""}
+          </p>
+        </div>
       );
     }
     return (

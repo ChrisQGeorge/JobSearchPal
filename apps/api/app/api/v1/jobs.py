@@ -937,6 +937,126 @@ def _status_to_event_type(status: str) -> str:
     }.get(status, "note")
 
 
+class BulkStatusByScoreIn(BaseModel):
+    op: str = Field(pattern="^(gte|lte)$")
+    threshold: int = Field(ge=0, le=100)
+    status: str = Field(min_length=1, max_length=32)
+
+
+# Score rules only touch triage-stage rows. Flipping a job that's already
+# applied / interviewing / offered based on a score would wreck real
+# pipeline state — those stay manual.
+_SCORE_RULE_SOURCE_STATUSES = ("to_review", "reviewed", "watching")
+
+
+@router.post("/bulk-status-by-score")
+async def bulk_status_by_score(
+    payload: BulkStatusByScoreIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Set every triage-stage job whose fit score clears a threshold to a
+    given status — e.g. score ≤ 30 → not_interested, or ≥ 70 →
+    interested. Mirrors the per-job status-change side effects: an
+    ApplicationEvent per change, date_closed stamping, interested
+    follow-up tasks, and cancellation of pending score/prep tasks on
+    not_interested. Unscored jobs are never touched."""
+    _validate_status(payload.status)
+    rows = list(
+        (
+            await db.execute(
+                select(TrackedJob)
+                .options(
+                    load_only(
+                        TrackedJob.title,
+                        TrackedJob.status,
+                        TrackedJob.fit_summary,
+                        TrackedJob.date_closed,
+                        TrackedJob.date_applied,
+                        TrackedJob.organization_id,
+                        TrackedJob.job_description,
+                    )
+                )
+                .where(
+                    TrackedJob.user_id == user.id,
+                    TrackedJob.deleted_at.is_(None),
+                    TrackedJob.status.in_(_SCORE_RULE_SOURCE_STATUSES),
+                )
+            )
+        ).scalars().all()
+    )
+
+    changed: list[TrackedJob] = []
+    for j in rows:
+        score = (
+            j.fit_summary.get("score") if isinstance(j.fit_summary, dict) else None
+        )
+        if not isinstance(score, (int, float)):
+            continue
+        hit = (
+            score >= payload.threshold
+            if payload.op == "gte"
+            else score <= payload.threshold
+        )
+        if not hit or j.status == payload.status:
+            continue
+        prior = j.status
+        j.status = payload.status
+        op_label = "≥" if payload.op == "gte" else "≤"
+        db.add(
+            ApplicationEvent(
+                tracked_job_id=j.id,
+                event_type=_status_to_event_type(payload.status),
+                event_date=datetime.now(tz=timezone.utc),
+                details_md=(
+                    f"Status changed: `{prior}` → `{payload.status}` by score "
+                    f"rule (fit {int(score)} {op_label} {payload.threshold})."
+                ),
+            )
+        )
+        if (
+            payload.status
+            in {"won", "lost", "withdrawn", "ghosted", "archived", "not_interested"}
+            and j.date_closed is None
+        ):
+            j.date_closed = date.today()
+        if payload.status == "interested":
+            from app.skills.queue_worker import enqueue_interested_followups
+            await enqueue_interested_followups(db, j)
+        changed.append(j)
+
+    # Bulk-cancel pending analysis tasks for jobs ruled out — same policy
+    # as the single-job not_interested flip, done in one sweep instead of
+    # a per-job query.
+    if payload.status == "not_interested" and changed:
+        changed_ids = {j.id for j in changed}
+        pending = (
+            await db.execute(
+                select(JobFetchQueue).where(
+                    JobFetchQueue.user_id == user.id,
+                    JobFetchQueue.state == "queued",
+                    JobFetchQueue.kind.in_(("score", "prep")),
+                )
+            )
+        ).scalars().all()
+        cancelled = 0
+        for task in pending:
+            if (
+                isinstance(task.payload, dict)
+                and task.payload.get("tracked_job_id") in changed_ids
+            ):
+                await db.delete(task)
+                cancelled += 1
+        if cancelled:
+            log.info(
+                "Score rule: cancelled %d pending analysis task(s) for "
+                "ruled-out jobs", cancelled,
+            )
+
+    await db.commit()
+    return {"changed": len(changed), "examined": len(rows)}
+
+
 @router.delete("/{job_id:int}", status_code=http_status.HTTP_204_NO_CONTENT)
 async def delete_job(
     job_id: int,
@@ -1946,6 +2066,9 @@ class JdAnalysis(BaseModel):
     engine: Optional[str] = None  # "jev" | None (None = LLM analyzer)
     confidence: Optional[float] = None
     apply_probability: Optional[float] = None
+    # Per-dimension subscores: {dimension_key: {score: 0-100, confidence}}.
+    # fit_score is their average. Keys come from jev.SCORE_DIMENSIONS.
+    scores: Optional[dict] = None
     # --- legacy (pre-slim) fields, retained for back-compat reads ---
     strengths: Optional[list[str]] = None
     gaps: Optional[list[str]] = None
@@ -2066,9 +2189,40 @@ async def run_jev_score(
         return None
 
     from app.api.v1.documents import _build_candidate_profile_block
+    from app.models.preferences import JobPreferences
 
     org_name = await _resolve_org_name(db, job.organization_id)
     candidate_profile = await _build_candidate_profile_block(db, user)
+
+    # Job preferences feed the quality/location dimensions — the profile
+    # block covers history and skills but not salary targets, acceptable
+    # remote policies, preferred locations, or benefit requirements.
+    prefs = (
+        await db.execute(
+            select(JobPreferences).where(
+                JobPreferences.user_id == user.id,
+                JobPreferences.deleted_at.is_(None),
+            )
+        )
+    ).scalars().first()
+    candidate_preferences: dict = {}
+    if prefs is not None:
+        candidate_preferences = {
+            "salary_currency": prefs.salary_currency,
+            "salary_preferred_target": float(prefs.salary_preferred_target)
+            if prefs.salary_preferred_target is not None else None,
+            "salary_acceptable_min": float(prefs.salary_acceptable_min)
+            if prefs.salary_acceptable_min is not None else None,
+            "salary_unacceptable_below": float(prefs.salary_unacceptable_below)
+            if prefs.salary_unacceptable_below is not None else None,
+            "remote_policies_acceptable": prefs.remote_policies_acceptable or [],
+            "remote_policies_unacceptable": prefs.remote_policies_unacceptable or [],
+            "willing_to_relocate": prefs.willing_to_relocate,
+            "preferred_locations": prefs.preferred_locations or [],
+            "benefits_required": prefs.benefits_required or [],
+            "benefits_preferred": prefs.benefits_preferred or [],
+        }
+
     job_state = {
         "job_posting": {
             "title": job.title,
@@ -2086,8 +2240,21 @@ async def run_jev_score(
             "description": job.job_description or "",
         },
         "candidate_profile": candidate_profile,
+        "candidate_preferences": candidate_preferences,
     }
     return await score_job_fit(api_key, job_state=job_state)
+
+
+def _override_fit_with_jev(job: TrackedJob, jev_data: dict) -> None:
+    """Make the Jev average THE displayed fit score. The deterministic
+    recompute (run just before this) keeps the breakdown panel's
+    components fresh, but its headline score is replaced so the tracker
+    pill, the review/apply queues, and the score-threshold rules all act
+    on Jev's number."""
+    fs = dict(job.fit_summary) if isinstance(job.fit_summary, dict) else {}
+    fs["score"] = jev_data.get("fit_score")
+    fs["score_engine"] = "jev"
+    job.fit_summary = fs
 
 
 def _apply_jd_analysis_to_job(job: TrackedJob, data: dict) -> None:
@@ -2153,6 +2320,7 @@ async def analyze_jd(
         _apply_jd_analysis_to_job(job, jev)
         result = await compute_fit_score(db, user, job)
         apply_fit_score_to_job(job, result)
+        _override_fit_with_jev(job, jev)
         await db.commit()
         await db.refresh(job)
         return job

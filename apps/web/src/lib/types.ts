@@ -438,6 +438,11 @@ export type JdAnalysis = {
   engine?: string | null;
   confidence?: number | null;
   apply_probability?: number | null;
+  // Per-dimension Jev subscores; fit_score is their average.
+  scores?: Record<
+    string,
+    { score?: number | null; confidence?: number | null }
+  > | null;
   // Legacy fields from the pre-slim prompt — kept so rows analyzed
   // under the old schema still render. The UI falls back to these
   // when pros/cons aren't present on the row.
