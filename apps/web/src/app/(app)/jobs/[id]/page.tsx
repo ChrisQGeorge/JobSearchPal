@@ -183,6 +183,7 @@ export default function JobDetailPage({
         </div>
       }
     >
+      <MobileDecisionStrip job={job} />
       <Link href="/jobs" className="text-sm text-corp-muted hover:text-corp-accent">
         ← All jobs
       </Link>
@@ -3085,6 +3086,123 @@ function PrepPanel({
   );
 }
 
+
+// ---------- Mobile decision strip (top of the page, phones only) ----------
+//
+// On a phone, the decision-critical numbers — the Jev fit score, the
+// per-dimension subscores, pay, and location/remote — were a long
+// scroll below the header, tabs, and research panel. This strip pins
+// them directly under the title on every tab so a review decision
+// (Interested / Not interested / Skip live in the header actions right
+// above it) takes one glance, no scrolling. Desktop keeps the fuller
+// At-a-glance + analysis panels.
+
+function MobileDecisionStrip({ job }: { job: TrackedJob }) {
+  const fs = (job.fit_summary ?? null) as {
+    score?: number | null;
+    vetoed?: boolean;
+  } | null;
+  const analysis = (job.jd_analysis ?? null) as JdAnalysis | null;
+  const score = typeof fs?.score === "number" ? fs.score : null;
+  const vetoed = !!fs?.vetoed;
+
+  const fmt = (n: number | null | undefined) =>
+    n == null
+      ? null
+      : new Intl.NumberFormat("en-US", {
+          style: "currency",
+          currency: (job.salary_currency || "USD").toUpperCase(),
+          maximumFractionDigits: 0,
+        }).format(n);
+  const lo = fmt(job.salary_min);
+  const hi = fmt(job.salary_max);
+  const salaryText =
+    lo && hi ? (lo === hi ? lo : `${lo}–${hi}`) : lo ? `${lo}+` : hi ? `≤${hi}` : null;
+
+  const jevScores =
+    analysis?.engine === "jev" && analysis.scores ? analysis.scores : null;
+  const rec = analysis?.recommendation ?? null;
+
+  const facts = [
+    job.location,
+    job.remote_policy ? job.remote_policy.replace(/_/g, " ") : null,
+    job.employment_type ? job.employment_type.replace(/_/g, " ") : null,
+  ].filter(Boolean);
+
+  if (score == null && !salaryText && !jevScores && facts.length === 0) {
+    return null;
+  }
+
+  const scoreTone = vetoed
+    ? "bg-corp-danger/20 text-corp-danger border-corp-danger/40"
+    : score == null
+      ? "bg-corp-surface2 text-corp-muted border-corp-border"
+      : score >= 70
+        ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
+        : score >= 40
+          ? "bg-corp-accent/20 text-corp-accent border-corp-accent/40"
+          : "bg-corp-danger/20 text-corp-danger border-corp-danger/40";
+
+  return (
+    <div className="jsp-card p-3 mb-3 md:hidden space-y-2">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span
+          className={`inline-flex items-baseline gap-1.5 px-2.5 py-1 rounded-full border text-xs font-semibold ${scoreTone}`}
+        >
+          <span className="uppercase tracking-wider">Fit</span>
+          <span className="text-lg leading-none">
+            {vetoed ? "VETO" : score == null ? "—" : score}
+          </span>
+        </span>
+        {rec ? (
+          <span
+            className={`inline-block px-2 py-0.5 rounded-full text-[11px] font-semibold uppercase tracking-wider border ${
+              rec === "go"
+                ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
+                : rec === "no-go"
+                  ? "bg-corp-danger/20 text-corp-danger border-corp-danger/40"
+                  : "bg-corp-accent/20 text-corp-accent border-corp-accent/40"
+            }`}
+          >
+            {rec === "go" ? "GO" : rec === "no-go" ? "NO-GO" : rec}
+          </span>
+        ) : null}
+        {salaryText ? (
+          <span className="ml-auto text-sm font-semibold whitespace-nowrap">
+            {salaryText}
+          </span>
+        ) : null}
+      </div>
+      {jevScores ? (
+        <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px]">
+          {Object.entries(JEV_DIMENSION_LABELS).map(([key, label]) => {
+            const s = jevScores[key];
+            if (!s || typeof s.score !== "number") return null;
+            return (
+              <span key={key} className="whitespace-nowrap">
+                <span className="text-corp-muted">{label}: </span>
+                <span
+                  className={
+                    s.score >= 70
+                      ? "text-emerald-300"
+                      : s.score <= 30
+                        ? "text-corp-danger"
+                        : "text-corp-accent2"
+                  }
+                >
+                  {s.score}
+                </span>
+              </span>
+            );
+          })}
+        </div>
+      ) : null}
+      {facts.length > 0 ? (
+        <div className="text-[11px] text-corp-muted">{facts.join(" · ")}</div>
+      ) : null}
+    </div>
+  );
+}
 
 // ---------- At-a-glance panel (top of Overview, above JD Analysis) ----------
 
