@@ -65,6 +65,19 @@ async def _brightdata_glassdoor_adapter(
     )
 
 
+async def _brightdata_keyword_adapter(
+    slug_or_url: str, ctx: dict[str, Any]
+) -> list[RawLead]:
+    return await brightdata.fetch_linkedin_keyword(
+        slug_or_url,
+        api_key=ctx.get("api_key"),
+        filters=ctx.get("filters"),
+        dataset_id=ctx.get("dataset_id"),
+        limit=ctx.get("max_leads_per_poll"),
+        wait_seconds=ctx.get("snapshot_wait_seconds"),
+    )
+
+
 ADAPTERS: dict[str, Adapter] = {
     "greenhouse": _wrap_simple(greenhouse.fetch),
     "lever": _wrap_simple(lever.fetch),
@@ -74,6 +87,7 @@ ADAPTERS: dict[str, Adapter] = {
     "yc": _wrap_simple(yc.fetch),
     "brightdata_linkedin": _brightdata_linkedin_adapter,
     "brightdata_glassdoor": _brightdata_glassdoor_adapter,
+    "brightdata_keyword": _brightdata_keyword_adapter,
 }
 
 KIND_LABELS: dict[str, str] = {
@@ -85,6 +99,7 @@ KIND_LABELS: dict[str, str] = {
     "yc": "Y Combinator Jobs RSS",
     "brightdata_linkedin": "Bright Data — LinkedIn Jobs (paid API)",
     "brightdata_glassdoor": "Bright Data — Glassdoor Jobs (paid API)",
+    "brightdata_keyword": "Bright Data — LinkedIn keyword discovery (saved query)",
 }
 
 KIND_HINTS: dict[str, str] = {
@@ -105,6 +120,13 @@ KIND_HINTS: dict[str, str] = {
         "or a search keyword (e.g. 'data scientist'). Set "
         "filters.location_include for a city / country, or check "
         "remote_only. Requires a Bright Data API key on the Settings page."
+    ),
+    "brightdata_keyword": (
+        "A saved multi-row keyword query (location / keyword / country / "
+        "time_range / company / location_radius) — enter rows in the "
+        "editor or upload the dataset's input CSV. Each run imports "
+        "listings from the chosen time range (default: Past week). "
+        "Requires a Bright Data API key on the Settings page."
     ),
 }
 
@@ -172,6 +194,9 @@ KIND_EXAMPLES: dict[str, list[dict[str, str]]] = {
         {"label": "Product manager", "value": "product manager"},
         {"label": "Data scientist", "value": "data scientist"},
     ],
+    # Keyword-discovery sources are edited through the structured row
+    # editor, not the slug field — no click-to-fill examples.
+    "brightdata_keyword": [],
 }
 
 

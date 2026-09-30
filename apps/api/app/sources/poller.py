@@ -18,7 +18,7 @@ import asyncio
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -98,7 +98,9 @@ async def _build_ctx(
         "filters": source.filters,
         "max_leads_per_poll": max(1, int(source.max_leads_per_poll or 100)),
     }
-    if source.kind in ("brightdata_linkedin", "brightdata_glassdoor"):
+    if source.kind in (
+        "brightdata_linkedin", "brightdata_glassdoor", "brightdata_keyword"
+    ):
         from app.api.v1.api_credentials import get_user_secret
 
         ctx["api_key"] = await get_user_secret(
@@ -112,13 +114,51 @@ async def _build_ctx(
     return ctx
 
 
-async def poll_source(db: AsyncSession, source: JobSource) -> tuple[int, Optional[str]]:
+async def poll_source(
+    db: AsyncSession, source: JobSource, *, quick: bool = False
+) -> tuple[int, Optional[str]]:
     """Fetch + persist new leads for a single source. Returns
-    (new_lead_count, error_message). Caller commits."""
+    (new_lead_count, error_message). Caller commits.
+
+    `quick=True` (foreground "Poll now" requests) caps the Bright Data
+    snapshot wait at ~20s so the HTTP request returns before any proxy
+    timeout: a slow run parks as pending and this background worker
+    finishes collecting it within the next tick."""
+    from app.sources.brightdata import SnapshotPending
+
     try:
         ctx = await _build_ctx(db, source)
+        if quick:
+            ctx["snapshot_wait_seconds"] = 20
         raw_leads = await _adapter_fetch(source.kind, source.slug_or_url, ctx)
+    except SnapshotPending as sp:
+        # The paid run was triggered but isn't done collecting. Park the
+        # snapshot_id on the source so the next attempt RESUMES it
+        # instead of triggering (and paying for) a fresh run.
+        # last_polled_at is deliberately NOT bumped — the source stays
+        # "due", so the next poller tick (60s) picks collection back up.
+        f = dict(source.filters or {})
+        f["pending_snapshot_id"] = sp.snapshot_id
+        source.filters = f
+        source.last_error = (
+            f"Bright Data is still collecting (snapshot {sp.snapshot_id}) "
+            "— resuming automatically."
+        )[:1000]
+        log.info(
+            "source %s/%s snapshot pending: %s",
+            source.kind, source.slug_or_url, sp.snapshot_id,
+        )
+        return 0, None
     except Exception as exc:  # noqa: BLE001
+        # A parked snapshot that errors out (dead snapshot, auth change)
+        # must not wedge the source forever — drop it so the next
+        # scheduled poll triggers a fresh run.
+        if isinstance(source.filters, dict) and source.filters.get(
+            "pending_snapshot_id"
+        ):
+            f = dict(source.filters)
+            f.pop("pending_snapshot_id", None)
+            source.filters = f
         # Format a more actionable message for the most common failure
         # modes — httpx 4xx, transport errors, bot-gate interstitials.
         msg = str(exc)
@@ -193,6 +233,14 @@ async def poll_source(db: AsyncSession, source: JobSource) -> tuple[int, Optiona
         source.last_polled_at = _now()
         source.last_error = msg[:1000]
         return 0, msg
+
+    # Successful fetch — clear any parked snapshot (it was collected).
+    if isinstance(source.filters, dict) and source.filters.get(
+        "pending_snapshot_id"
+    ):
+        f = dict(source.filters)
+        f.pop("pending_snapshot_id", None)
+        source.filters = f
 
     now = _now()
     expires = now + timedelta(hours=max(1, source.lead_ttl_hours))

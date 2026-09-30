@@ -7,10 +7,20 @@ interested/watching, which auto-creates a TrackedJob and queues a
 score task. Dismissed and expired leads are filtered out by default."""
 from __future__ import annotations
 
+import csv
+import io
 from datetime import date, datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -147,6 +157,16 @@ class SourceFiltersIn(BaseModel):
     location_include: Optional[str] = None
     location_exclude: Optional[str] = None
     remote_only: Optional[bool] = None
+    # Bright Data extras. `dataset_id` overrides the kind's default
+    # dataset (any brightdata_* kind). The rest belong to
+    # kind=brightdata_keyword: `inputs` is the saved query — one row
+    # per discovery input, same columns as the dataset's CSV
+    # (location/keyword/country/time_range/company/location_radius) —
+    # and `time_range_override` replaces every row's time_range at run
+    # time ("Past week" by default; empty string = use row values).
+    dataset_id: Optional[str] = Field(default=None, max_length=64)
+    inputs: Optional[list[dict]] = None
+    time_range_override: Optional[str] = Field(default=None, max_length=32)
 
 
 class SourceIn(BaseModel):
@@ -343,6 +363,42 @@ def _validate_slug_or_url(kind: str, raw: str) -> str:
     return cleaned
 
 
+def _prepare_keyword_filters(filters: Optional[dict]) -> dict:
+    """Validate + normalize the saved query for kind=brightdata_keyword:
+    input rows are cleaned to the dataset's columns (rows without a
+    keyword dropped), and time_range_override defaults to "Past week" so
+    every run imports the previous week's listings unless the user
+    explicitly picked another range (empty string = use each row's own
+    time_range)."""
+    from app.sources.brightdata import KEYWORD_TIME_RANGES, clean_keyword_inputs
+
+    f = dict(filters or {})
+    cleaned = clean_keyword_inputs(f.get("inputs"))
+    if not cleaned:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "A keyword-discovery source needs at least one input row "
+                "with a keyword. Add rows in the editor or upload the "
+                "input CSV."
+            ),
+        )
+    f["inputs"] = cleaned
+    override = f.get("time_range_override")
+    if override is None:
+        f["time_range_override"] = "Past week"
+    elif override and override not in KEYWORD_TIME_RANGES:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "time_range_override must be one of "
+                f"{list(KEYWORD_TIME_RANGES)}, or empty to use each "
+                "row's own time_range."
+            ),
+        )
+    return f
+
+
 @router.post("", response_model=SourceOut, status_code=status.HTTP_201_CREATED)
 async def create_source(
     payload: SourceIn,
@@ -355,13 +411,18 @@ async def create_source(
             detail=f"Unknown source kind '{payload.kind}'. Allowed: {sorted(SOURCE_KINDS)}",
         )
     cleaned_slug = _validate_slug_or_url(payload.kind, payload.slug_or_url)
+    filters = (
+        payload.filters.model_dump(exclude_none=True) if payload.filters else None
+    )
+    if payload.kind == "brightdata_keyword":
+        filters = _prepare_keyword_filters(filters)
     src = JobSource(
         user_id=user.id,
         kind=payload.kind,
         slug_or_url=cleaned_slug,
         label=(payload.label or "").strip() or None,
         enabled=payload.enabled,
-        filters=payload.filters.model_dump(exclude_none=True) if payload.filters else None,
+        filters=filters,
         poll_interval_hours=payload.poll_interval_hours,
         lead_ttl_hours=payload.lead_ttl_hours,
         max_leads_per_poll=payload.max_leads_per_poll,
@@ -382,7 +443,9 @@ async def update_source(
     src = await _owned_source(db, source_id, user.id)
     data = payload.model_dump(exclude_unset=True)
     if "filters" in data:
-        if data["filters"] is None:
+        if src.kind == "brightdata_keyword":
+            src.filters = _prepare_keyword_filters(data["filters"])
+        elif data["filters"] is None:
             src.filters = None
         else:
             src.filters = data["filters"]
@@ -466,6 +529,53 @@ async def seed_defaults(
     )
 
 
+class KeywordCsvOut(BaseModel):
+    inputs: list[dict]
+    skipped_rows: int = 0
+
+
+@router.post("/parse-keyword-csv", response_model=KeywordCsvOut)
+async def parse_keyword_csv(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+) -> KeywordCsvOut:
+    """Parse a Bright Data keyword-discovery input CSV (the dataset's
+    own format: location,keyword,country,time_range,company,
+    location_radius) into input rows for the source editor. Handles the
+    dataset's quoting quirks (e.g. \"\"\"python developer\"\"\" → a
+    keyword with literal quotes for exact-phrase search). Nothing is
+    saved — the rows are returned for the editor to hold until the
+    source is saved."""
+    from app.sources.brightdata import clean_keyword_inputs
+
+    raw = await file.read()
+    if len(raw) > 1_000_000:
+        raise HTTPException(status_code=413, detail="CSV larger than 1 MB.")
+    text = raw.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    fieldnames = [fn for fn in (reader.fieldnames or []) if fn]
+    norm = {fn: fn.strip().lower().replace(" ", "_") for fn in fieldnames}
+    if "keyword" not in norm.values():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "CSV is missing a 'keyword' column. Expected the Bright "
+                "Data input header: location,keyword,country,time_range,"
+                "company,location_radius."
+            ),
+        )
+    rows: list[dict] = []
+    for rec in reader:
+        rows.append({norm.get(k, k): v for k, v in rec.items() if k})
+    cleaned = clean_keyword_inputs(rows)
+    nonempty = sum(
+        1 for r in rows if any(str(v or "").strip() for v in r.values())
+    )
+    return KeywordCsvOut(
+        inputs=cleaned, skipped_rows=max(0, nonempty - len(cleaned))
+    )
+
+
 @router.post("/{source_id:int}/poll", response_model=SourceOut)
 async def poll_now(
     source_id: int,
@@ -476,7 +586,7 @@ async def poll_now(
     setup and for "I added a filter, refresh the inbox" flows. The
     background worker will continue to poll on schedule."""
     src = await _owned_source(db, source_id, user.id)
-    inserted, err = await poll_source(db, src)
+    inserted, err = await poll_source(db, src, quick=True)
     if err is not None:
         # Persist the error state but don't 500 — the poll is best-effort.
         await db.commit()

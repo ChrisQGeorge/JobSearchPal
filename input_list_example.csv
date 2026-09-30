@@ -1,0 +1,3 @@
+location,keyword,country,time_range,company,location_radius
+paris,product manager,FR,Past month,,
+New York,"""python developer""",,,,

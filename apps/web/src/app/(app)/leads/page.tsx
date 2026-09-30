@@ -12,7 +12,7 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { PageShell } from "@/components/PageShell";
-import { api, ApiError } from "@/lib/api";
+import { api, apiUrl, ApiError } from "@/lib/api";
 
 type SourceKindExample = { label: string; value: string };
 
@@ -61,6 +61,39 @@ type Lead = {
   relevance_score: number | null;
 };
 
+// One input row of a Bright Data keyword-discovery query — the same
+// columns as the dataset's input CSV.
+type BdInputRow = {
+  location: string;
+  keyword: string;
+  country: string;
+  time_range: string;
+  company: string;
+  location_radius: string;
+};
+
+const BD_KEYWORD_KIND = "brightdata_keyword";
+const BD_COLUMNS: { key: keyof BdInputRow; label: string; hint: string }[] = [
+  { key: "keyword", label: "Keyword *", hint: 'e.g. "python developer" (quotes = exact phrase)' },
+  { key: "location", label: "Location", hint: "e.g. New York" },
+  { key: "country", label: "Country", hint: "2-letter code, e.g. US / FR" },
+  { key: "time_range", label: "Time range", hint: "used only when the run range is 'each row's own'" },
+  { key: "company", label: "Company", hint: "optional company filter" },
+  { key: "location_radius", label: "Radius", hint: "optional search radius" },
+];
+const BD_TIME_RANGES = ["Past 24 hours", "Past week", "Past month", "Any time"];
+
+function emptyBdRow(): BdInputRow {
+  return {
+    location: "",
+    keyword: "",
+    country: "",
+    time_range: "",
+    company: "",
+    location_radius: "",
+  };
+}
+
 type SourceForm = {
   id?: number;
   kind: string;
@@ -75,6 +108,9 @@ type SourceForm = {
   location_include: string;
   location_exclude: string;
   remote_only: boolean;
+  // brightdata_keyword only: the saved query rows + run-time range.
+  bd_inputs: BdInputRow[];
+  bd_time_range: string; // "" = use each row's own time_range
 };
 
 function emptyForm(kinds: SourceKind[]): SourceForm {
@@ -91,11 +127,22 @@ function emptyForm(kinds: SourceKind[]): SourceForm {
     location_include: "",
     location_exclude: "",
     remote_only: false,
+    bd_inputs: [emptyBdRow()],
+    bd_time_range: "Past week",
   };
 }
 
 function formFromSource(s: Source): SourceForm {
-  const f = (s.filters ?? {}) as Record<string, string | boolean | undefined>;
+  const f = (s.filters ?? {}) as Record<string, unknown>;
+  const rawInputs = Array.isArray(f.inputs) ? (f.inputs as Record<string, unknown>[]) : [];
+  const bdInputs: BdInputRow[] = rawInputs.map((r) => ({
+    location: String(r.location ?? ""),
+    keyword: String(r.keyword ?? ""),
+    country: String(r.country ?? ""),
+    time_range: String(r.time_range ?? ""),
+    company: String(r.company ?? ""),
+    location_radius: String(r.location_radius ?? ""),
+  }));
   return {
     id: s.id,
     kind: s.kind,
@@ -110,6 +157,11 @@ function formFromSource(s: Source): SourceForm {
     location_include: (f.location_include as string) ?? "",
     location_exclude: (f.location_exclude as string) ?? "",
     remote_only: !!f.remote_only,
+    bd_inputs: bdInputs.length ? bdInputs : [emptyBdRow()],
+    bd_time_range:
+      typeof f.time_range_override === "string"
+        ? (f.time_range_override as string)
+        : "Past week",
   };
 }
 
@@ -122,9 +174,21 @@ function formPayload(f: SourceForm) {
   if (f.location_exclude.trim())
     filters.location_exclude = f.location_exclude.trim();
   if (f.remote_only) filters.remote_only = true;
+  const isBdKeyword = f.kind === BD_KEYWORD_KIND;
+  let slug = f.slug_or_url.trim();
+  if (isBdKeyword) {
+    const rows = f.bd_inputs.filter((r) => r.keyword.trim());
+    filters.inputs = rows;
+    filters.time_range_override = f.bd_time_range;
+    // slug_or_url is just a display summary for this kind.
+    slug = rows
+      .map((r) => r.keyword + (r.location ? ` @ ${r.location}` : ""))
+      .join("; ")
+      .slice(0, 500) || "keyword query";
+  }
   return {
     kind: f.kind,
-    slug_or_url: f.slug_or_url.trim(),
+    slug_or_url: slug,
     label: f.label.trim() || null,
     enabled: f.enabled,
     filters: Object.keys(filters).length ? filters : null,
@@ -459,8 +523,20 @@ export default function LeadsPage() {
                   className="jsp-btn-ghost text-xs"
                   onClick={() => pollNow(s.id)}
                   disabled={polling === s.id}
+                  title={
+                    s.kind === BD_KEYWORD_KIND
+                      ? `Run the saved keyword query now (${
+                          (s.filters?.time_range_override as string) ||
+                          "each row's own time range"
+                        }). Large runs keep collecting in the background.`
+                      : "Poll this source now"
+                  }
                 >
-                  {polling === s.id ? "…" : "Poll now"}
+                  {polling === s.id
+                    ? "…"
+                    : s.kind === BD_KEYWORD_KIND
+                      ? "Import now"
+                      : "Poll now"}
                 </button>
                 <button
                   type="button"
@@ -728,6 +804,51 @@ function SourceEditor({
   const activeKind = kinds.find((k) => k.kind === form.kind);
   const hint = activeKind?.hint ?? "";
   const examples = activeKind?.examples ?? [];
+  const isBdKeyword = form.kind === BD_KEYWORD_KIND;
+  const [csvMsg, setCsvMsg] = useState<string | null>(null);
+
+  async function uploadCsv(file: File | null) {
+    if (!file) return;
+    setCsvMsg(null);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await fetch(apiUrl("/api/v1/job-sources/parse-keyword-csv"), {
+        method: "POST",
+        credentials: "include",
+        body: fd,
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text.slice(0, 300));
+      }
+      const out = (await res.json()) as {
+        inputs: BdInputRow[];
+        skipped_rows: number;
+      };
+      if (!out.inputs.length) {
+        setCsvMsg("No usable rows in that CSV (every row needs a keyword).");
+        return;
+      }
+      onChange({ ...form, bd_inputs: out.inputs });
+      setCsvMsg(
+        `Loaded ${out.inputs.length} row${out.inputs.length === 1 ? "" : "s"}` +
+          (out.skipped_rows ? ` (${out.skipped_rows} skipped — no keyword)` : "") +
+          ". Save the source to keep them.",
+      );
+    } catch (e) {
+      setCsvMsg(
+        `CSV parse failed: ${e instanceof Error ? e.message : "unknown error"}`,
+      );
+    }
+  }
+
+  function setBdRow(i: number, patch: Partial<BdInputRow>) {
+    const rows = form.bd_inputs.slice();
+    rows[i] = { ...rows[i], ...patch };
+    onChange({ ...form, bd_inputs: rows });
+  }
+
   return (
     <div className="jsp-card p-4 mb-3 space-y-3">
       <h3 className="text-sm uppercase tracking-wider text-corp-muted">
@@ -739,7 +860,17 @@ function SourceEditor({
           <select
             className="jsp-input"
             value={form.kind}
-            onChange={(e) => onChange({ ...form, kind: e.target.value })}
+            onChange={(e) => {
+              const kind = e.target.value;
+              onChange({
+                ...form,
+                kind,
+                // Keyword discovery is a paid weekly import by default.
+                ...(kind === BD_KEYWORD_KIND && !form.id
+                  ? { poll_interval_hours: 168 }
+                  : {}),
+              });
+            }}
             disabled={saving || !!form.id}
           >
             {kinds.map((k) => (
@@ -749,7 +880,7 @@ function SourceEditor({
             ))}
           </select>
         </div>
-        <div>
+        <div className={isBdKeyword ? "hidden" : undefined}>
           <label className="jsp-label">Slug or URL</label>
           <input
             className="jsp-input"
@@ -782,6 +913,147 @@ function SourceEditor({
           ) : null}
         </div>
       </div>
+      {isBdKeyword ? (
+        <fieldset className="border border-corp-accent/40 rounded p-3 space-y-2">
+          <legend className="text-[10px] uppercase tracking-wider text-corp-accent px-2">
+            Keyword query (one Bright Data input per row)
+          </legend>
+          <p className="text-[11px] text-corp-muted">
+            {hint} Wrap a keyword in quotes for an exact phrase. Each run
+            imports listings from the selected time range below — the
+            weekly schedule + &quot;Import now&quot; both use it.
+          </p>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr>
+                  {BD_COLUMNS.map((c) => (
+                    <th
+                      key={c.key}
+                      className="text-left text-[10px] uppercase tracking-wider text-corp-muted font-normal pb-1 pr-2"
+                      title={c.hint}
+                    >
+                      {c.label}
+                    </th>
+                  ))}
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                {form.bd_inputs.map((row, i) => (
+                  <tr key={i}>
+                    {BD_COLUMNS.map((c) => (
+                      <td key={c.key} className="pr-2 pb-1.5">
+                        {c.key === "time_range" ? (
+                          <select
+                            className="jsp-input text-xs py-1"
+                            value={row.time_range}
+                            onChange={(e) =>
+                              setBdRow(i, { time_range: e.target.value })
+                            }
+                            disabled={saving}
+                          >
+                            <option value="">—</option>
+                            {BD_TIME_RANGES.map((t) => (
+                              <option key={t} value={t}>
+                                {t}
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <input
+                            className="jsp-input text-xs py-1"
+                            value={row[c.key]}
+                            onChange={(e) =>
+                              setBdRow(i, { [c.key]: e.target.value })
+                            }
+                            placeholder={c.hint}
+                            disabled={saving}
+                          />
+                        )}
+                      </td>
+                    ))}
+                    <td className="pb-1.5">
+                      <button
+                        type="button"
+                        className="jsp-btn-ghost text-xs text-corp-danger"
+                        onClick={() =>
+                          onChange({
+                            ...form,
+                            bd_inputs:
+                              form.bd_inputs.length > 1
+                                ? form.bd_inputs.filter((_, j) => j !== i)
+                                : [emptyBdRow()],
+                          })
+                        }
+                        disabled={saving}
+                        title="Remove this row"
+                      >
+                        ✕
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              className="jsp-btn-ghost text-xs"
+              onClick={() =>
+                onChange({ ...form, bd_inputs: [...form.bd_inputs, emptyBdRow()] })
+              }
+              disabled={saving}
+            >
+              + Add row
+            </button>
+            <label className="jsp-btn-ghost text-xs cursor-pointer">
+              Upload input CSV
+              <input
+                type="file"
+                accept=".csv,text/csv"
+                className="hidden"
+                onChange={(e) => {
+                  uploadCsv(e.target.files?.[0] ?? null);
+                  e.target.value = "";
+                }}
+                disabled={saving}
+              />
+            </label>
+            <span
+              className="text-[10px] text-corp-muted"
+              title="Header: location,keyword,country,time_range,company,location_radius"
+            >
+              same CSV format as the Bright Data dashboard export
+            </span>
+            <div className="ml-auto flex items-center gap-1.5">
+              <span className="text-[10px] uppercase tracking-wider text-corp-muted">
+                Import time range
+              </span>
+              <select
+                className="jsp-input text-xs py-1 w-44"
+                value={form.bd_time_range}
+                onChange={(e) =>
+                  onChange({ ...form, bd_time_range: e.target.value })
+                }
+                disabled={saving}
+                title="Applied to every row on each run. Pick the empty option to use each row's own time_range instead."
+              >
+                {BD_TIME_RANGES.map((t) => (
+                  <option key={t} value={t}>
+                    {t}
+                  </option>
+                ))}
+                <option value="">Use each row&apos;s time_range</option>
+              </select>
+            </div>
+          </div>
+          {csvMsg ? (
+            <p className="text-[11px] text-corp-muted">{csvMsg}</p>
+          ) : null}
+        </fieldset>
+      ) : null}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <div>
           <label className="jsp-label">Label (optional)</label>
@@ -943,7 +1215,12 @@ function SourceEditor({
           type="button"
           className="jsp-btn-primary"
           onClick={onSave}
-          disabled={saving || !form.slug_or_url.trim()}
+          disabled={
+            saving ||
+            (isBdKeyword
+              ? !form.bd_inputs.some((r) => r.keyword.trim())
+              : !form.slug_or_url.trim())
+          }
         >
           {saving ? "Saving…" : form.id ? "Update" : "Create"}
         </button>

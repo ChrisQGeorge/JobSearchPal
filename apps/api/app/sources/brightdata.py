@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import quote_plus
 
@@ -43,9 +42,60 @@ BRIGHTDATA_API_BASE = "https://api.brightdata.com"
 TRIGGER_TIMEOUT_SECONDS = 30
 POLL_TIMEOUT_SECONDS = 120
 POLL_INTERVAL_SECONDS = 5
+# Keyword discovery scrapes result pages per input row — noticeably
+# slower than a single-URL collect, so it gets a bigger first-wait
+# budget, and a timeout parks the snapshot for resumption instead of
+# failing (see SnapshotPending).
+KEYWORD_WAIT_SECONDS = 240
+RESUME_WAIT_SECONDS = 45
 
 DEFAULT_DATASET_LINKEDIN = "gd_lpfll7v5hcqtkxl6l"
 DEFAULT_DATASET_GLASSDOOR = "gd_l7j0bx501ockwldaqf"
+
+# Input-row shape for keyword discovery — matches the CSV header
+# Bright Data's dashboard exports for the LinkedIn jobs dataset:
+#   location,keyword,country,time_range,company,location_radius
+KEYWORD_DISCOVERY_FIELDS = (
+    "location",
+    "keyword",
+    "country",
+    "time_range",
+    "company",
+    "location_radius",
+)
+KEYWORD_TIME_RANGES = ("Past 24 hours", "Past week", "Past month", "Any time")
+MAX_KEYWORD_INPUT_ROWS = 50
+
+
+class SnapshotPending(RuntimeError):
+    """A triggered snapshot wasn't ready within the wait budget. The
+    poller persists `snapshot_id` on the source and resumes collecting
+    next tick instead of re-triggering (and re-paying for) the run."""
+
+    def __init__(self, snapshot_id: str, message: str):
+        super().__init__(message)
+        self.snapshot_id = snapshot_id
+
+
+def clean_keyword_inputs(rows: Any) -> list[dict[str, str]]:
+    """Normalize user-supplied keyword-discovery rows: known columns
+    only, everything stringified/stripped, rows without a keyword
+    dropped, capped at MAX_KEYWORD_INPUT_ROWS. Shared by the API
+    validators, the CSV parser, and the adapter itself."""
+    out: list[dict[str, str]] = []
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        row = {
+            k: str(r.get(k) if r.get(k) is not None else "").strip()[:200]
+            for k in KEYWORD_DISCOVERY_FIELDS
+        }
+        if not row["keyword"]:
+            continue
+        out.append(row)
+        if len(out) >= MAX_KEYWORD_INPUT_ROWS:
+            break
+    return out
 
 
 async def _trigger(
@@ -53,6 +103,7 @@ async def _trigger(
     dataset_id: str,
     inputs: list[dict[str, Any]],
     limit_per_input: Optional[int] = None,
+    extra_params: Optional[dict[str, str]] = None,
 ) -> str:
     """Kick off a snapshot, return the snapshot_id. Raises RuntimeError
     on transport / 4xx / 5xx errors with an actionable message.
@@ -68,6 +119,8 @@ async def _trigger(
     }
     if limit_per_input is not None and limit_per_input > 0:
         params["limit_per_input"] = limit_per_input
+    if extra_params:
+        params.update(extra_params)
     async with httpx.AsyncClient(
         timeout=TRIGGER_TIMEOUT_SECONDS,
         headers={
@@ -100,17 +153,20 @@ async def _trigger(
 
 
 async def _poll_snapshot(
-    api_key: str, snapshot_id: str
+    api_key: str,
+    snapshot_id: str,
+    wait_seconds: int = POLL_TIMEOUT_SECONDS,
 ) -> list[dict[str, Any]]:
-    """Wait up to POLL_TIMEOUT_SECONDS for the snapshot to be ready,
-    then return the parsed JSON array. Raises RuntimeError if the
-    snapshot times out or errors."""
+    """Wait up to `wait_seconds` for the snapshot to be ready, then
+    return the parsed JSON array. Raises SnapshotPending when the run
+    is healthy but slow (caller can resume later without re-paying),
+    RuntimeError on real errors."""
     url = f"{BRIGHTDATA_API_BASE}/datasets/v3/snapshot/{snapshot_id}"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "User-Agent": USER_AGENT,
     }
-    deadline = asyncio.get_event_loop().time() + POLL_TIMEOUT_SECONDS
+    deadline = asyncio.get_event_loop().time() + wait_seconds
     async with httpx.AsyncClient(timeout=30, headers=headers) as client:
         while True:
             try:
@@ -138,10 +194,11 @@ async def _poll_snapshot(
             if resp.status_code == 202:
                 # Still running.
                 if asyncio.get_event_loop().time() >= deadline:
-                    raise RuntimeError(
+                    raise SnapshotPending(
+                        snapshot_id,
                         f"Bright Data snapshot {snapshot_id} not ready "
-                        f"after {POLL_TIMEOUT_SECONDS}s — try Poll now "
-                        "again in a minute to collect."
+                        f"after {wait_seconds}s — collection resumes on "
+                        "the next poll.",
                     )
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
                 continue
@@ -349,6 +406,83 @@ async def fetch_linkedin(
         record_to_lead=_to_lead_linkedin,
         limit=limit,
     )
+
+
+async def fetch_linkedin_keyword(
+    slug_or_url: str,
+    *,
+    api_key: Optional[str] = None,
+    filters: Optional[dict] = None,
+    dataset_id: Optional[str] = None,
+    limit: Optional[int] = None,
+    wait_seconds: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """Keyword-discovery mode (type=discover_new&discover_by=keyword):
+    the saved query is a LIST of input rows (location / keyword /
+    country / time_range / company / location_radius) stored in
+    filters["inputs"] — the same shape as the dashboard's CSV export.
+    `slug_or_url` is a display summary only.
+
+    filters["time_range_override"] (default behavior: "Past week", set
+    at save time) replaces every row's time_range for the run — that's
+    what makes the scheduled/manual import mean "the previous week's
+    worth of listings". An empty override means "use each row's own
+    time_range".
+
+    filters["pending_snapshot_id"] resumes a parked run instead of
+    triggering (and paying for) a new one."""
+    if not api_key:
+        raise RuntimeError(
+            "Bright Data API key required. Add one on the Settings page "
+            "(provider=brightdata) and try again."
+        )
+    f = filters if isinstance(filters, dict) else {}
+
+    pending = f.get("pending_snapshot_id")
+    if isinstance(pending, str) and pending.strip():
+        records = await _poll_snapshot(
+            api_key,
+            pending.strip(),
+            wait_seconds=wait_seconds or RESUME_WAIT_SECONDS,
+        )
+    else:
+        inputs = clean_keyword_inputs(f.get("inputs"))
+        if not inputs:
+            raise RuntimeError(
+                "No keyword input rows saved on this source. Add rows "
+                "(or upload the input CSV) in the source editor."
+            )
+        override = f.get("time_range_override")
+        if isinstance(override, str) and override.strip():
+            inputs = [
+                {**row, "time_range": override.strip()} for row in inputs
+            ]
+        snapshot_id = await _trigger(
+            api_key,
+            (dataset_id or DEFAULT_DATASET_LINKEDIN),
+            inputs,
+            limit_per_input=limit,
+            extra_params={
+                "type": "discover_new",
+                "discover_by": "keyword",
+            },
+        )
+        log.info(
+            "Bright Data keyword discovery triggered snapshot=%s rows=%d",
+            snapshot_id, len(inputs),
+        )
+        records = await _poll_snapshot(
+            api_key,
+            snapshot_id,
+            wait_seconds=wait_seconds or KEYWORD_WAIT_SECONDS,
+        )
+
+    out: list[dict[str, Any]] = []
+    for rec in records:
+        lead = _to_lead_linkedin(rec)
+        if lead is not None:
+            out.append(lead)
+    return out
 
 
 async def fetch_glassdoor(
