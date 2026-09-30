@@ -16,6 +16,7 @@ from app.api.v1 import cover_letter_library as cover_letter_library_router
 from app.api.v1 import documents as documents_router
 from app.api.v1 import email_ingest as email_ingest_router
 from app.api.v1 import history as history_router
+from app.api.v1 import jev_settings as jev_settings_router
 from app.api.v1 import jobs as jobs_router
 from app.api.v1 import organizations as organizations_router
 from app.api.v1 import personas as personas_router
@@ -174,6 +175,7 @@ app.include_router(api_credentials_router.router, prefix="/api/v1")
 app.include_router(history_router.router, prefix="/api/v1")
 app.include_router(organizations_router.router, prefix="/api/v1")
 app.include_router(jobs_router.router, prefix="/api/v1")
+app.include_router(jev_settings_router.router, prefix="/api/v1")
 app.include_router(documents_router.router, prefix="/api/v1")
 app.include_router(personas_router.router, prefix="/api/v1")
 app.include_router(preferences_router.router, prefix="/api/v1")

@@ -285,6 +285,10 @@ export default function JobTrackerPage() {
 
   // Per-column filters, applied client-side on top of the status pills
   // and the free-text search. Empty string = column not filtered.
+  // Mobile: the per-column filter row lives in the table header, which
+  // is hidden on phones — this toggles the stacked filter/sort panel
+  // that mirrors the same state.
+  const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
   const [colFilters, setColFilters] = useState({
     title: "",
     org: "",
@@ -853,15 +857,140 @@ export default function JobTrackerPage() {
         </div>
       ) : null}
 
-      <div className="mt-3 mb-2">
+      <div className="mt-3 mb-2 flex gap-2">
         <input
           type="text"
-          className="jsp-input"
+          className="jsp-input flex-1 min-w-0"
           placeholder="Search jobs by title, organization, or location…"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
+        {/* Phones can't reach the filter row inside the table header —
+            give them a stacked panel with the same state. */}
+        <button
+          type="button"
+          className={`jsp-btn-ghost text-xs md:hidden shrink-0 ${
+            anyColFilter || sortKey !== "none" ? "border-corp-accent text-corp-accent" : ""
+          }`}
+          onClick={() => setMobileFiltersOpen((v) => !v)}
+        >
+          {mobileFiltersOpen ? "Hide filters" : "Filters / sort"}
+        </button>
       </div>
+
+      {mobileFiltersOpen ? (
+        <div className="jsp-card p-3 mb-2 md:hidden space-y-2">
+          <div className="grid grid-cols-2 gap-2">
+            <input
+              type="text"
+              className="jsp-input text-xs"
+              placeholder="Filter title…"
+              value={colFilters.title}
+              onChange={(e) => setColFilter("title", e.target.value)}
+            />
+            <input
+              type="text"
+              className="jsp-input text-xs"
+              placeholder="Filter org…"
+              value={colFilters.org}
+              onChange={(e) => setColFilter("org", e.target.value)}
+            />
+            <div className="flex gap-1 items-center">
+              <input
+                type="number"
+                min={0}
+                max={100}
+                className="jsp-input text-xs w-full"
+                placeholder="Fit ≥"
+                value={colFilters.fitMin}
+                onChange={(e) => setColFilter("fitMin", e.target.value)}
+              />
+              <input
+                type="number"
+                min={0}
+                max={100}
+                className="jsp-input text-xs w-full"
+                placeholder="Fit ≤"
+                value={colFilters.fitMax}
+                onChange={(e) => setColFilter("fitMax", e.target.value)}
+              />
+            </div>
+            <input
+              type="number"
+              step={1000}
+              className="jsp-input text-xs"
+              placeholder="Salary ≥"
+              value={colFilters.salaryMin}
+              onChange={(e) => setColFilter("salaryMin", e.target.value)}
+            />
+            <select
+              className="jsp-input text-xs"
+              value={colFilters.industry}
+              onChange={(e) => setColFilter("industry", e.target.value)}
+            >
+              <option value="">All industries</option>
+              {industries.map((ind) => (
+                <option key={ind} value={ind}>
+                  {ind}
+                </option>
+              ))}
+            </select>
+            <div className="flex gap-1">
+              <select
+                className="jsp-input text-xs flex-1 min-w-0"
+                value={sortKey}
+                onChange={(e) => {
+                  const k = e.target.value as SortKey;
+                  setSortKey(k);
+                  if (k !== "none") {
+                    setSortDir(NUMERIC_SORT_KEYS.has(k) ? "desc" : "asc");
+                  }
+                }}
+                aria-label="Sort by"
+              >
+                <option value="none">Sort: default</option>
+                <option value="fit">Sort: fit</option>
+                <option value="salary">Sort: salary</option>
+                <option value="skill_match_pct">Sort: skills %</option>
+                <option value="updated">Sort: updated</option>
+                <option value="applied">Sort: applied</option>
+                <option value="title">Sort: title</option>
+                <option value="org">Sort: organization</option>
+                <option value="industry">Sort: industry</option>
+              </select>
+              <button
+                type="button"
+                className="jsp-btn-ghost text-xs shrink-0"
+                onClick={() =>
+                  setSortDir((d) => (d === "asc" ? "desc" : "asc"))
+                }
+                disabled={sortKey === "none"}
+                title="Flip sort direction"
+              >
+                {sortDir === "asc" ? "↑" : "↓"}
+              </button>
+            </div>
+          </div>
+          {anyColFilter ? (
+            <button
+              type="button"
+              className="jsp-btn-ghost text-xs text-corp-danger"
+              onClick={() =>
+                setColFilters({
+                  title: "",
+                  org: "",
+                  industry: "",
+                  salaryMin: "",
+                  fitMin: "",
+                  fitMax: "",
+                })
+              }
+            >
+              Clear filters
+            </button>
+          ) : null}
+        </div>
+      ) : null}
 
       {refreshErr ? (
         <div className="text-xs text-corp-danger mt-2">{refreshErr}</div>
@@ -879,6 +1008,76 @@ export default function JobTrackerPage() {
         </div>
       ) : (
         <div className="jsp-card mt-4 overflow-hidden">
+          {/* Phone layout: stacked cards instead of the 11-column table.
+              Same selection set, status picker, and pagination. */}
+          <ul className="md:hidden divide-y divide-corp-border">
+            {pagedItems.length === 0 ? (
+              <li className="p-4 text-sm text-corp-muted text-center">
+                No jobs match the filters.
+              </li>
+            ) : null}
+            {pagedItems.map((j) => (
+              <li
+                key={j.id}
+                className={`p-3 ${selectedIds.has(j.id) ? "bg-corp-accent/10" : ""}`}
+              >
+                <div className="flex items-start gap-2.5">
+                  <input
+                    type="checkbox"
+                    className="accent-corp-accent mt-1 h-4 w-4 shrink-0"
+                    checked={selectedIds.has(j.id)}
+                    onChange={() => toggleSelected(j.id)}
+                    aria-label={`Select ${j.title}`}
+                  />
+                  <div className="min-w-0 flex-1">
+                    <Link
+                      href={`/jobs/${j.id}`}
+                      className="block text-sm font-medium hover:text-corp-accent"
+                    >
+                      {j.title}
+                    </Link>
+                    <div className="text-[11px] text-corp-muted truncate">
+                      {[
+                        j.organization_name,
+                        j.location,
+                        j.remote_policy,
+                        formatSalary(j) !== "—" ? formatSalary(j) : null,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </div>
+                    <div className="flex flex-wrap gap-1 items-center mt-1.5">
+                      <FitPill
+                        score={j.fit_score ?? null}
+                        redFlagCount={j.red_flag_count ?? 0}
+                      />
+                      <SkillMatchHeatmap
+                        pct={j.skill_match_pct ?? null}
+                        have={j.skill_match_have ?? null}
+                        total={j.skill_match_total ?? null}
+                      />
+                      <SalaryBadge job={j} prefs={prefs} />
+                      <LocationFitBadge job={j} prefs={prefs} />
+                    </div>
+                  </div>
+                  <div className="shrink-0">
+                    <InlineStatusPicker
+                      jobId={j.id}
+                      status={j.status}
+                      onChange={(next) =>
+                        setItems((prev) =>
+                          prev.map((row) =>
+                            row.id === j.id ? { ...row, status: next } : row,
+                          ),
+                        )
+                      }
+                    />
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+          <div className="hidden md:block overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
               <tr className="bg-corp-surface2 text-left text-[11px] uppercase tracking-wider text-corp-muted">
@@ -1166,6 +1365,7 @@ export default function JobTrackerPage() {
               ))}
             </tbody>
           </table>
+          </div>
           <Paginator
             page={pager.page}
             pageSize={pager.pageSize}

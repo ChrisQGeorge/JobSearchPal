@@ -1098,7 +1098,7 @@ function OverviewTab({
         />
       ) : null}
     <div className="jsp-card p-5 space-y-4">
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div className="col-span-2">
           <label className="jsp-label">Title</label>
           <input
@@ -1706,7 +1706,7 @@ function RetrospectiveForm({
             Re-run confidence: {result.rerun_confidence}/100
           </div>
         ) : null}
-        <div className="grid grid-cols-2 gap-3 text-sm">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
           {result.went_well.length ? (
             <BulletGroup label="Went well" items={result.went_well} tone="good" />
           ) : null}
@@ -1887,7 +1887,7 @@ function RoundForm({
 
   return (
     <form onSubmit={submit} className="space-y-3">
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div>
           <label className="jsp-label">Round #</label>
           <input
@@ -2376,7 +2376,7 @@ function ArtifactForm({
 
   return (
     <form onSubmit={submit} className="space-y-3">
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div>
           <label className="jsp-label">Kind</label>
           <select
@@ -2642,7 +2642,7 @@ function ContactsTab({ jobId }: { jobId: number }) {
 
       {picking ? (
         <form onSubmit={linkContact} className="jsp-card p-4 space-y-3">
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
               <label className="jsp-label">Contact</label>
               <select
@@ -3992,7 +3992,7 @@ function CompanyResearchPanel({
       ) : null}
 
       {rep ? (
-        <div className="grid grid-cols-2 gap-3 text-sm">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
           {rep.engineering_culture ? (
             <div>
               <div className="text-[10px] uppercase tracking-wider text-corp-muted">

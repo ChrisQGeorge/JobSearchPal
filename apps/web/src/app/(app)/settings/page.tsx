@@ -19,6 +19,7 @@ import {
   ResumeProfilePanel,
   WorkAuthorizationPanel,
 } from "./_panels/PreferencesPanels";
+import { JevScoringPanel } from "./_panels/JevScoringPanel";
 
 type Tab =
   | "resume"
@@ -29,6 +30,7 @@ type Tab =
   | "claude-auth"
   | "models"
   | "api-keys"
+  | "jev"
   | "personas"
   | "data-io";
 
@@ -43,6 +45,7 @@ const TABS: { key: Tab; label: string }[] = [
   { key: "claude-auth", label: "Claude Auth" },
   { key: "models", label: "Models" },
   { key: "api-keys", label: "API Keys" },
+  { key: "jev", label: "Jev Scoring" },
   { key: "personas", label: "Personas" },
   { key: "data-io", label: "Data Export / Import" },
 ];
@@ -98,6 +101,7 @@ export default function SettingsPage() {
         </div>
       )}
       {tab === "api-keys" && <ApiKeysPanel />}
+      {tab === "jev" && <JevScoringPanel />}
       {tab === "personas" && <PersonaManager />}
       {tab === "data-io" && <DataIoPanel />}
     </PageShell>

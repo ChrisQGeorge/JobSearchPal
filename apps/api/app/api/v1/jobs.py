@@ -2105,11 +2105,24 @@ async def run_jev_score(
             "benefits_preferred": prefs.benefits_preferred or [],
         }
 
+    # Head off the classic mis-score: a remote role whose posting lists
+    # the employer's office city. Without the note, evaluators punish
+    # "location" for being far from the candidate even though the
+    # candidate never has to go there.
+    location_note = None
+    if job.remote_policy == "remote":
+        location_note = (
+            "This is a REMOTE position. The 'location' field is the "
+            "employer's office city only — the candidate does NOT need "
+            "to live in or commute to it."
+        )
+
     job_state = {
         "job_posting": {
             "title": job.title,
             "organization": org_name,
             "location": job.location,
+            "location_note": location_note,
             "remote_policy": job.remote_policy,
             "employment_type": job.employment_type,
             "experience_level": job.experience_level,

@@ -19,8 +19,10 @@ managed on Settings → API Keys — never hardcoded, never in env.
 """
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any
+from pathlib import Path
+from typing import Any, Optional
 
 log = logging.getLogger(__name__)
 
@@ -92,25 +94,31 @@ _QUESTIONS: dict[str, Any] = {
     "location_fit": {
         "type": "score",
         "instructions": (
-            "Rate the location/logistics fit: is the job remote and the "
-            "candidate accepts remote? If onsite or hybrid, is it in or "
-            "near one of the candidate's preferred locations, or are they "
-            "willing to relocate? Treat an onsite role far from every "
-            "preferred location with no relocation willingness as the "
-            "worst level."
+            "Rate the location/logistics fit. IMPORTANT: if the job is "
+            "remote (see job_posting.remote_policy) and the candidate "
+            "accepts remote work, location fit is PERFECT regardless of "
+            "the city listed on the posting — for remote roles the posted "
+            "location is just the employer's office, not where the "
+            "candidate must live. Judge geography only for onsite or "
+            "hybrid roles: are they in or near one of the candidate's "
+            "preferred locations, or is the candidate willing to "
+            "relocate?"
         ),
         "criteria": [
-            "Hard conflict: onsite far outside every preferred location "
-            "and the candidate won't relocate, or a remote policy the "
-            "candidate finds unacceptable.",
-            "Poor: likely commuting/relocation burden the candidate has "
-            "not signaled willingness to accept.",
-            "Workable: hybrid or onsite within reach of a preferred "
+            "Hard conflict: an ONSITE or HYBRID role far outside every "
+            "preferred location with no relocation willingness, or a "
+            "workplace policy the candidate lists as unacceptable. Never "
+            "this level for a remote role the candidate accepts.",
+            "Poor: onsite/hybrid with a commuting or relocation burden "
+            "the candidate has not signaled willingness to accept.",
+            "Workable: onsite/hybrid within reach of a preferred "
             "location, with some friction.",
-            "Good: matches an accepted remote policy or sits comfortably "
+            "Good: onsite/hybrid comfortably in a preferred location, or "
+            "an accepted remote policy with minor caveats (e.g. "
+            "occasional office days).",
+            "Ideal: a REMOTE role and the candidate accepts remote (the "
+            "posted office city is irrelevant), or onsite/hybrid exactly "
             "in a preferred location.",
-            "Ideal: fully matches the candidate's stated location and "
-            "remote-policy preferences.",
         ],
     },
     "career_fit": {
@@ -174,7 +182,135 @@ _QUESTIONS: dict[str, Any] = {
     },
 }
 
-_LEVELS_PER_DIMENSION = 5
+# ---- User-tunable scoring prompts -----------------------------------------
+#
+# The five dimension prompts (instructions + ordered criteria) and their
+# weights in the overall average are editable from Settings → Jev
+# scoring. Overrides persist on the claude_config volume (same git-proof
+# home as the worker settings), so "tell Jev what to prioritize" is a
+# settings edit, not a code change. The candidate profile/state and the
+# apply yes/no judgment are NOT exposed. A dimension's criteria list may
+# be 2-10 levels (worst → best); scores rescale to 0-100 by its own
+# length.
+
+_SETTINGS_PATH = Path("/root/.claude/jsp-jev-settings.json")
+MIN_CRITERIA = 2
+MAX_CRITERIA = 10
+MAX_WEIGHT = 5.0
+
+
+def _load_settings() -> dict:
+    try:
+        data = json.loads(_SETTINGS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+        return {}
+
+
+def _valid_override(o: Any) -> Optional[dict]:
+    """Return a cleaned {instructions, criteria} override, or None if
+    unusable (falls back to the default prompt)."""
+    if not isinstance(o, dict):
+        return None
+    instructions = str(o.get("instructions") or "").strip()[:2000]
+    criteria = [
+        str(c).strip()[:600]
+        for c in (o.get("criteria") or [])
+        if str(c).strip()
+    ]
+    if not instructions or not (MIN_CRITERIA <= len(criteria) <= MAX_CRITERIA):
+        return None
+    return {"instructions": instructions, "criteria": criteria}
+
+
+def get_scoring_config() -> dict:
+    """Effective per-dimension config for the API/UI: prompt text,
+    criteria, weight, and whether it's overridden — plus the defaults so
+    the UI can offer reset."""
+    data = _load_settings()
+    overrides = data.get("overrides") if isinstance(data.get("overrides"), dict) else {}
+    weights = data.get("weights") if isinstance(data.get("weights"), dict) else {}
+    dims = []
+    for key, label in SCORE_DIMENSIONS:
+        default = _QUESTIONS[key]
+        ov = _valid_override(overrides.get(key))
+        try:
+            w = float(weights.get(key, 1.0))
+        except (TypeError, ValueError):
+            w = 1.0
+        dims.append({
+            "key": key,
+            "label": label,
+            "instructions": (ov or default)["instructions"],
+            "criteria": list((ov or default)["criteria"]),
+            "weight": max(0.0, min(MAX_WEIGHT, w)),
+            "overridden": ov is not None,
+            "default_instructions": default["instructions"],
+            "default_criteria": list(default["criteria"]),
+        })
+    return {"dimensions": dims}
+
+
+def save_scoring_config(
+    overrides: dict[str, Any], weights: dict[str, Any]
+) -> dict:
+    """Persist prompt overrides + weights. An override missing/invalid
+    for a key resets that dimension to the default. Returns the new
+    effective config."""
+    keys = {k for k, _ in SCORE_DIMENSIONS}
+    clean_ov: dict[str, dict] = {}
+    for key, o in (overrides or {}).items():
+        if key not in keys:
+            continue
+        v = _valid_override(o)
+        if v is not None:
+            default = _QUESTIONS[key]
+            # Storing a byte-identical copy of the default is noise, not
+            # an override.
+            if (
+                v["instructions"] != default["instructions"]
+                or v["criteria"] != list(default["criteria"])
+            ):
+                clean_ov[key] = v
+    clean_w: dict[str, float] = {}
+    for key, w in (weights or {}).items():
+        if key not in keys:
+            continue
+        try:
+            wf = float(w)
+        except (TypeError, ValueError):
+            continue
+        wf = max(0.0, min(MAX_WEIGHT, wf))
+        if wf != 1.0:
+            clean_w[key] = wf
+    try:
+        _SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _SETTINGS_PATH.write_text(
+            json.dumps({"overrides": clean_ov, "weights": clean_w}, indent=2),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        log.warning("Failed to persist Jev scoring settings: %s", exc)
+    return get_scoring_config()
+
+
+def _build_questions() -> tuple[dict[str, Any], dict[str, int], dict[str, float]]:
+    """Merged question map for the API call, plus per-dimension level
+    counts and weights."""
+    cfg = get_scoring_config()
+    questions: dict[str, Any] = {}
+    levels: dict[str, int] = {}
+    weights: dict[str, float] = {}
+    for d in cfg["dimensions"]:
+        questions[d["key"]] = {
+            "type": "score",
+            "instructions": d["instructions"],
+            "criteria": d["criteria"],
+        }
+        levels[d["key"]] = len(d["criteria"])
+        weights[d["key"]] = d["weight"]
+    questions["apply"] = _QUESTIONS["apply"]
+    return questions, levels, weights
 
 
 class JevError(RuntimeError):
@@ -198,7 +334,8 @@ async def score_job_fit(
      apply_probability (0-1), engine ("jev")}."""
     import httpx
 
-    payload = {"state": job_state, "model": _MODEL, "questions": _QUESTIONS}
+    questions, levels, weights = _build_questions()
+    payload = {"state": job_state, "model": _MODEL, "questions": questions}
     timeout = httpx.Timeout(connect=15.0, read=float(timeout_seconds), write=30.0, pool=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         try:
@@ -216,13 +353,13 @@ async def score_job_fit(
         raise JevError(
             f"Jev API HTTP {resp.status_code}: {resp.text[:500]}"
         )
-    def _to_pct(raw_score: float) -> int:
+    def _to_pct(raw_score: float, n: int) -> int:
         # Score answers are probability-weighted across the ordered levels
-        # (1..N). Rescale to 0-100, clamped defensively — a value outside
-        # the level range would otherwise produce a nonsense percentage.
-        n = _LEVELS_PER_DIMENSION
+        # (1..N, N = that dimension's criteria count). Rescale to 0-100,
+        # clamped defensively — a value outside the level range would
+        # otherwise produce a nonsense percentage.
         clamped = min(max(raw_score, 1.0), float(n))
-        return int(round((clamped - 1.0) / (n - 1) * 100.0))
+        return int(round((clamped - 1.0) / (max(n, 2) - 1) * 100.0))
 
     try:
         answers = resp.json()["answers"]
@@ -232,7 +369,7 @@ async def score_job_fit(
             ans = answers[key]
             conf = float(ans.get("confidence") or 0.0)
             scores[key] = {
-                "score": _to_pct(float(ans["score"])),
+                "score": _to_pct(float(ans["score"]), levels.get(key, 5)),
                 "confidence": round(conf, 3),
             }
             confidences.append(conf)
@@ -242,7 +379,24 @@ async def score_job_fit(
             f"Jev API returned an unexpected shape: {resp.text[:500]}"
         ) from exc
 
-    fit_score = int(round(sum(s["score"] for s in scores.values()) / len(scores)))
+    # Weighted average — Settings → Jev scoring controls the weights
+    # (0 drops a dimension from the headline while still reporting its
+    # subscore). All-zero weights degrade to a plain average.
+    total_w = sum(weights.get(k, 1.0) for k, _ in SCORE_DIMENSIONS)
+    if total_w <= 0:
+        fit_score = int(
+            round(sum(s["score"] for s in scores.values()) / len(scores))
+        )
+    else:
+        fit_score = int(
+            round(
+                sum(
+                    scores[k]["score"] * weights.get(k, 1.0)
+                    for k, _ in SCORE_DIMENSIONS
+                )
+                / total_w
+            )
+        )
     recommendation = (
         "go" if apply_p >= 0.65 else "no-go" if apply_p <= 0.35 else "maybe"
     )
@@ -250,6 +404,7 @@ async def score_job_fit(
         "engine": "jev",
         "fit_score": fit_score,
         "scores": scores,
+        "weights": {k: weights.get(k, 1.0) for k, _ in SCORE_DIMENSIONS},
         "recommendation": recommendation,
         "confidence": round(sum(confidences) / len(confidences), 3),
         "apply_probability": round(apply_p, 3),
