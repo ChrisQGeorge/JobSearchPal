@@ -28,6 +28,7 @@ from app.models.user import User
 from app.scoring import apply_fit_score_to_job, compute_fit_score
 from app.skills.queue_bus import run_claude_to_bus
 from app.skills.runner import ClaudeCodeError
+from app.skills.prompt_registry import render_prompt
 
 log = logging.getLogger(__name__)
 
@@ -299,7 +300,7 @@ async def parse_email(
         subject=str(user.id), extra={"purpose": "email_ingest"}
     )
 
-    prompt = _CLASSIFY_PROMPT.format(
+    prompt = render_prompt("email_classify", dict(
         from_address=payload.from_address or "(unknown)",
         subject=payload.subject or "(no subject)",
         received_at=(
@@ -310,7 +311,7 @@ async def parse_email(
         body=body[:18000],  # hard cap; very long emails are usually quoted threads
         api_base="http://localhost:8000",
         allowed_statuses=", ".join(sorted(ALLOWED_SUGGESTED_STATUSES)),
-    )
+    )).text
 
     try:
         final_text = await run_claude_to_bus(
@@ -388,14 +389,14 @@ async def reparse_email(
     api_token = create_access_token(
         subject=str(user.id), extra={"purpose": "email_ingest"}
     )
-    prompt = _CLASSIFY_PROMPT.format(
+    prompt = render_prompt("email_classify", dict(
         from_address=row.from_address or "(unknown)",
         subject=row.subject or "(no subject)",
         received_at=row.received_at.isoformat() if row.received_at else "(unknown)",
         body=body[:18000],
         api_base="http://localhost:8000",
         allowed_statuses=", ".join(sorted(ALLOWED_SUGGESTED_STATUSES)),
-    )
+    )).text
     try:
         final_text = await run_claude_to_bus(
             prompt=prompt,

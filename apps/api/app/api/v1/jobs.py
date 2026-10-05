@@ -42,6 +42,7 @@ from app.models.jobs import (
 )
 from app.models.user import User
 from app.scoring import apply_fit_score_to_job, compute_fit_score
+from app.skills.prompt_registry import render_prompt
 from app.schemas.jobs import (
     ApplicationEventIn,
     ApplicationEventOut,
@@ -1606,7 +1607,7 @@ async def interview_prep(
 
     rnd = await _get_owned_round(db, round_id, job_id, user.id)
 
-    prompt = _INTERVIEW_PREP_PROMPT.format(
+    prompt = render_prompt("interview_prep", dict(
         job_id=job_id,
         round_id=round_id,
         round_number=rnd.round_number,
@@ -1614,7 +1615,7 @@ async def interview_prep(
         scheduled_at=rnd.scheduled_at.isoformat() if rnd.scheduled_at else "(unscheduled)",
         format_=rnd.format or "(unspecified)",
         prep_notes_md=rnd.prep_notes_md or "(none yet)",
-    )
+    )).text
     if payload.extra_notes and payload.extra_notes.strip():
         prompt += "\n\nUser guidance for this prep pass:\n" + payload.extra_notes.strip()
 
@@ -1676,7 +1677,7 @@ async def interview_retrospective(
 ) -> InterviewRetroOut:
     rnd = await _get_owned_round(db, round_id, job_id, user.id)
 
-    prompt = _INTERVIEW_RETRO_PROMPT.format(
+    prompt = render_prompt("interview_retro", dict(
         job_id=job_id,
         round_id=round_id,
         round_number=rnd.round_number,
@@ -1685,7 +1686,7 @@ async def interview_retrospective(
         self_rating=rnd.self_rating if rnd.self_rating is not None else "(none)",
         notes_md=rnd.notes_md or "(none yet)",
         user_recap=payload.user_recap,
-    )
+    )).text
 
     from app.skills.queue_bus import run_claude_to_bus
 
@@ -2015,7 +2016,7 @@ beats "backend skills." Total output ≤ 350 words.
 
 
 def _build_jd_prep_prompt(job: TrackedJob, org_name: Optional[str] = None) -> str:
-    return _JD_PREP_PROMPT.format(
+    return render_prompt("jd_prep", dict(
         job_description=job.job_description or "",
         title=job.title or "(untitled)",
         organization=org_name or "(unknown)",
@@ -2025,13 +2026,13 @@ def _build_jd_prep_prompt(job: TrackedJob, org_name: Optional[str] = None) -> st
         employment_type=job.employment_type or "null",
         required_skills=", ".join(job.required_skills or []) or "(none)",
         nice_to_have_skills=", ".join(job.nice_to_have_skills or []) or "(none)",
-    )
+    )).text
 
 
 def _build_jd_analyze_prompt(job: TrackedJob, org_name: Optional[str] = None) -> str:
     """Assemble the JD-analyzer prompt from a TrackedJob. Shared by the
     foreground request-time call and the queue worker's score handler."""
-    return _JD_ANALYZE_PROMPT.format(
+    return render_prompt("jd_analyze", dict(
         job_description=job.job_description or "",
         title=job.title or "(untitled)",
         organization=org_name or "(unknown)",
@@ -2049,7 +2050,7 @@ def _build_jd_analyze_prompt(job: TrackedJob, org_name: Optional[str] = None) ->
         employment_type=job.employment_type or "null",
         required_skills=", ".join(job.required_skills or []) or "(none)",
         nice_to_have_skills=", ".join(job.nice_to_have_skills or []) or "(none)",
-    )
+    )).text
 
 
 async def run_jev_score(
@@ -3094,9 +3095,9 @@ async def perform_fetch(
                 "text": f"Page downloaded ({len(page_text):,} chars). Parsing…",
             }
         )
-        prompt = _FETCH_PARSE_PROMPT.format(
+        prompt = render_prompt("fetch_parse", dict(
             url=url, today=today_iso, page_text=page_text
-        )
+        )).text
     else:
         # Stage 1 failed — fall back to ONE Claude WebFetch.
         _emit(
@@ -3108,9 +3109,9 @@ async def perform_fetch(
                 ),
             }
         )
-        prompt = _FETCH_FALLBACK_PROMPT.format(
+        prompt = render_prompt("fetch_fallback", dict(
             url=url, today=today_iso, fail_reason=fail_reason or "unknown"
-        )
+        )).text
         allowed_tools = ["WebFetch"]
 
     # The parse stage is text-only and honors the user's "URL fetch" model

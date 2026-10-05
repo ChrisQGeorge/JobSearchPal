@@ -35,6 +35,11 @@ class GeneratedDocument(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     prompt_snapshot: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     source_skill: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     tags: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    # "<prompt key>:<variant id>" from app.skills.prompt_registry — which
+    # prompt variant wrote this doc, for A/B outcome stats.
+    prompt_variant: Mapped[Optional[str]] = mapped_column(
+        String(96), nullable=True, index=True
+    )
 
 
 class DocumentEdit(Base, IdMixin, TimestampMixin):

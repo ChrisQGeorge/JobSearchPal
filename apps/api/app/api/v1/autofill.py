@@ -32,6 +32,7 @@ from app.models.preferences import (
 )
 from app.models.user import User
 from app.skills.runner import ClaudeCodeError, run_claude_prompt
+from app.skills.prompt_registry import render_prompt
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/autofill", tags=["autofill"])
@@ -335,14 +336,14 @@ async def autofill(
         f"{i}. {q}" for i, q in enumerate(payload.questions, 1)
     )
 
-    prompt = _AUTOFILL_PROMPT.format(
+    prompt = render_prompt("autofill", dict(
         preferences=prefs_str,
         authorization=auth_str,
         job=job_str,
         extra_notes=payload.extra_notes or "(none)",
         questions_numbered=questions_numbered,
         placeholder_keys=", ".join(sorted(_DEMOGRAPHIC_PLACEHOLDERS.keys())),
-    )
+    )).text
 
     from app.skills.queue_bus import run_claude_to_bus
 

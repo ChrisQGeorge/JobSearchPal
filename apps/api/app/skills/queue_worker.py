@@ -1378,7 +1378,6 @@ async def _handle_humanize(item: JobFetchQueue) -> None:
         from app.api.v1.documents import (
             _extract_json_object,
             _validate_humanizer_output,
-            _HUMANIZE_FIX_PROMPT,
             _FIX_PRESERVE_IMPERFECTIONS,
             _FIX_NO_IMPERFECTIONS,
         )
@@ -1412,16 +1411,21 @@ async def _handle_humanize(item: JobFetchQueue) -> None:
                 row.id, pass_idx + 1, len(violations),
             )
             violations_block = "\n".join(f"- {v}" for v in violations)
-            fix_prompt = _HUMANIZE_FIX_PROMPT.format(
-                violations=violations_block,
-                previous_output=content_md.replace("{", "{{").replace("}", "}}"),
-                source_body=source_body.replace("{", "{{").replace("}", "}}"),
-                imperfections_directive=(
-                    _FIX_PRESERVE_IMPERFECTIONS
-                    if plant_mistakes
-                    else _FIX_NO_IMPERFECTIONS
-                ),
-            )
+            from app.skills.prompt_registry import render_prompt
+
+            fix_prompt = render_prompt(
+                "humanize_fix",
+                {
+                    "violations": violations_block,
+                    "previous_output": content_md,
+                    "source_body": source_body,
+                    "imperfections_directive": (
+                        _FIX_PRESERVE_IMPERFECTIONS
+                        if plant_mistakes
+                        else _FIX_NO_IMPERFECTIONS
+                    ),
+                },
+            ).text
             try:
                 fix_text = await queue_bus.run_claude_to_bus(
                     prompt=fix_prompt,

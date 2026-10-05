@@ -106,6 +106,7 @@ class GeneratedDocumentOut(BaseModel):
     persona_id: Optional[int] = None
     source_skill: Optional[str] = None
     tags: Optional[list[str]] = None
+    prompt_variant: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -130,6 +131,7 @@ class GeneratedDocumentSummary(BaseModel):
     persona_id: Optional[int] = None
     source_skill: Optional[str] = None
     tags: Optional[list[str]] = None
+    prompt_variant: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -284,6 +286,7 @@ async def list_documents(
             GeneratedDocument.persona_id,
             GeneratedDocument.source_skill,
             GeneratedDocument.tags,
+            GeneratedDocument.prompt_variant,
             GeneratedDocument.created_at,
             GeneratedDocument.updated_at,
         )
@@ -1135,15 +1138,15 @@ _EMAIL_PURPOSES = {
 
 
 def _prompt_for_doc_type(doc_type: str) -> tuple[str, dict]:
-    """Return (prompt_template, extra_format_args) for this doc_type."""
+    """Return (prompt registry key, extra_format_args) for this doc_type."""
     if doc_type == "resume":
-        return _TAILOR_RESUME_PROMPT, {}
+        return "tailor_resume", {}
     if doc_type == "cover_letter":
-        return _TAILOR_COVER_LETTER_PROMPT, {}
+        return "tailor_cover_letter", {}
     if doc_type in _EMAIL_PURPOSES:
-        return _TAILOR_EMAIL_PROMPT, {"purpose_label": _EMAIL_PURPOSES[doc_type]}
+        return "tailor_email", {"purpose_label": _EMAIL_PURPOSES[doc_type]}
     # Everything else (portfolio / reference / other / ...) uses the generic prompt.
-    return _TAILOR_GENERIC_PROMPT, {"doc_type": doc_type}
+    return "tailor_generic", {"doc_type": doc_type}
 
 
 # ----------------------------------------------------------------------------
@@ -1843,13 +1846,14 @@ async def _run_tailor(
     db: AsyncSession,
     user: User,
     job: TrackedJob,
-    prompt_template: str,
+    prompt_key: str,
     extra_notes: Optional[str],
     doc_type: str,
     persona_id: Optional[int],
     title_override: Optional[str],
     match_my_voice: bool = True,
     extra_format_args: Optional[dict] = None,
+    prompt_variant: Optional[str] = None,
 ) -> GeneratedDocument:
     if not (job.job_description and job.job_description.strip()):
         raise HTTPException(
@@ -1879,38 +1883,30 @@ async def _run_tailor(
         await _build_voice_samples_block(db, user) if match_my_voice else ""
     )
 
-    # User-supplied values may contain literal `{` / `}` (code blocks,
-    # `{foo}` template placeholders, JSON examples inside the JD, etc.).
-    # `format_map` interprets those as format-spec syntax and raises on
-    # things like `{foo.bar}` or `{0}`. Escape every user value first so the
-    # format engine treats their braces as literals.
-    def _esc(v: object) -> str:
-        return str(v).replace("{", "{{").replace("}", "}}")
-
+    # Values go in raw: the registry renderer inserts them literally and
+    # never re-parses them, so braces inside a JD or profile are safe.
     format_kwargs = {
-        "title": _esc(job.title or "(untitled)"),
-        "organization": _esc(org_name or "(unknown)"),
-        "location": _esc(job.location or "(unspecified)"),
-        "job_description": _esc(job.job_description),
-        "required_skills": _esc(", ".join(job.required_skills or []) or "(none)"),
-        "nice_to_have_skills": _esc(", ".join(job.nice_to_have_skills or []) or "(none)"),
-        "jd_analysis_blob": _esc(jd_analysis_blob),
-        "fit_summary_blob": _esc(fit_summary_blob),
-        "extra_notes": _esc(extra_notes or "(none)"),
-        "candidate_profile": _esc(candidate_profile),
-        "job_context": _esc(job_context),
-        "voice_samples_block": _esc(voice_samples_block),
+        "title": job.title or "(untitled)",
+        "organization": org_name or "(unknown)",
+        "location": job.location or "(unspecified)",
+        "job_description": job.job_description,
+        "required_skills": ", ".join(job.required_skills or []) or "(none)",
+        "nice_to_have_skills": ", ".join(job.nice_to_have_skills or []) or "(none)",
+        "jd_analysis_blob": jd_analysis_blob,
+        "fit_summary_blob": fit_summary_blob,
+        "extra_notes": extra_notes or "(none)",
+        "candidate_profile": candidate_profile,
+        "job_context": job_context,
+        "voice_samples_block": voice_samples_block,
     }
     if extra_format_args:
-        for k, v in extra_format_args.items():
-            format_kwargs[k] = _esc(v)
-    # str.format leaves any unknown placeholders alone-by-raising; since our
-    # prompt templates only reference a subset, we use a defaultdict-like dance
-    # to tolerate missing keys for the per-template optional placeholders.
-    class _SafeDict(dict):
-        def __missing__(self, key):
-            return "(n/a)"
-    prompt = prompt_template.format_map(_SafeDict(**format_kwargs))
+        format_kwargs.update(extra_format_args)
+    from app.skills.prompt_registry import render_prompt
+
+    rendered = render_prompt(
+        prompt_key, format_kwargs, variant_id=prompt_variant, missing="(n/a)"
+    )
+    prompt = rendered.text
 
     # Version: one more than the highest existing version for this job + doc_type.
     prev_row = (
@@ -1957,6 +1953,7 @@ async def _run_tailor(
         persona_id=persona_id,
         source_skill=f"tailor-{doc_type}",
         prompt_snapshot=prompt[:20000],
+        prompt_variant=rendered.attribution,
     )
     db.add(doc)
     await db.commit()
@@ -2005,7 +2002,7 @@ async def tailor_resume(
         db=db,
         user=user,
         job=job,
-        prompt_template=_TAILOR_RESUME_PROMPT,
+        prompt_key="tailor_resume",
         extra_notes=payload.extra_notes,
         doc_type="resume",
         persona_id=payload.persona_id,
@@ -2032,7 +2029,7 @@ async def tailor_cover_letter(
         db=db,
         user=user,
         job=job,
-        prompt_template=_TAILOR_COVER_LETTER_PROMPT,
+        prompt_key="tailor_cover_letter",
         extra_notes=payload.extra_notes,
         doc_type="cover_letter",
         persona_id=payload.persona_id,
@@ -2051,6 +2048,9 @@ class TailorAnyIn(BaseModel):
     title: Optional[str] = Field(default=None, max_length=255)
     persona_id: Optional[int] = None
     match_my_voice: Optional[bool] = True
+    # Force a specific prompt variant (Settings → Prompts) instead of the
+    # weighted random pick — e.g. generate A and B for the same job.
+    prompt_variant: Optional[str] = Field(default=None, max_length=32)
 
 
 @router.post(
@@ -2075,12 +2075,13 @@ async def tailor_any(
             detail=f"Unknown doc_type '{payload.doc_type}'. Allowed: {sorted(DOC_TYPES)}",
         )
     job = await _get_owned_job(db, job_id, user.id)
-    prompt_template, extra_args = _prompt_for_doc_type(payload.doc_type)
+    prompt_key, extra_args = _prompt_for_doc_type(payload.doc_type)
     return await _run_tailor(
         db=db,
         user=user,
         job=job,
-        prompt_template=prompt_template,
+        prompt_key=prompt_key,
+        prompt_variant=payload.prompt_variant,
         extra_notes=payload.extra_notes,
         doc_type=payload.doc_type,
         persona_id=payload.persona_id,
@@ -2581,11 +2582,11 @@ async def selection_edit(
         )
 
     if payload.mode == "rewrite":
-        prompt_template = _SELECTION_REWRITE_PROMPT
+        prompt_key = "selection_rewrite"
     elif payload.mode == "answer":
-        prompt_template = _SELECTION_ANSWER_PROMPT
+        prompt_key = "selection_answer"
     else:
-        prompt_template = _SELECTION_NEW_DOC_PROMPT
+        prompt_key = "selection_new_doc"
         if not payload.new_doc_type:
             raise HTTPException(
                 status_code=422, detail="mode='new_document' requires new_doc_type."
@@ -2596,25 +2597,21 @@ async def selection_edit(
                 detail=f"Unknown new_doc_type '{payload.new_doc_type}'. Allowed: {sorted(DOC_TYPES)}",
             )
 
-    class _SafeDict(dict):
-        def __missing__(self, key):
-            return "(n/a)"
+    from app.skills.prompt_registry import render_prompt
 
-    # Escape user values so `{...}` inside a document body doesn't break
-    # format_map parsing.
-    def _esc(v: object) -> str:
-        return str(v).replace("{", "{{").replace("}", "}}")
-
-    prompt = prompt_template.format_map(
-        _SafeDict(
-            doc_type=_esc(doc.doc_type),
-            title=_esc(doc.title),
-            instruction=_esc(payload.instruction.strip()),
-            full_body=_esc(full_body),
-            selection=_esc(payload.selection_text),
-            new_doc_type=_esc(payload.new_doc_type or ""),
-        )
+    rendered = render_prompt(
+        prompt_key,
+        {
+            "doc_type": doc.doc_type,
+            "title": doc.title,
+            "instruction": payload.instruction.strip(),
+            "full_body": full_body,
+            "selection": payload.selection_text,
+            "new_doc_type": payload.new_doc_type or "",
+        },
+        missing="(n/a)",
     )
+    prompt = rendered.text
 
     from app.skills.queue_bus import run_claude_to_bus
 
@@ -2727,6 +2724,7 @@ async def selection_edit(
         humanized=False,
         source_skill="selection-new-doc",
         prompt_snapshot=prompt[:20000],
+        prompt_variant=rendered.attribution,
     )
     db.add(new_doc)
     await db.commit()
@@ -3151,11 +3149,6 @@ async def humanize_document(
         )
     samples_block = "\n\n".join(samples_block_parts)
 
-    # Escape user content so `{...}` embedded in a document body / writing
-    # sample doesn't break format-string parsing.
-    def _esc_h(v: object) -> str:
-        return str(v).replace("{", "{{").replace("}", "}}")
-
     # Swap the imperfections block based on the user's checkbox. When off,
     # substitute a short "produce clean output" section and trim the
     # self-check's reference to planted mistakes so the prompt reads
@@ -3172,13 +3165,19 @@ async def humanize_document(
         self_check_mistakes = ""
         mistakes_schema_hint = "empty — imperfections disabled for this run"
 
-    prompt = _HUMANIZE_PROMPT.format(
-        source_body=_esc_h(source.content_md),
-        samples_block=_esc_h(samples_block),
-        imperfections_section=imperfections_section,
-        self_check_mistakes=self_check_mistakes,
-        mistakes_schema_hint=mistakes_schema_hint,
+    from app.skills.prompt_registry import render_prompt
+
+    rendered = render_prompt(
+        "humanize",
+        {
+            "source_body": source.content_md,
+            "samples_block": samples_block,
+            "imperfections_section": imperfections_section,
+            "self_check_mistakes": self_check_mistakes,
+            "mistakes_schema_hint": mistakes_schema_hint,
+        },
     )
+    prompt = rendered.text
 
     # Version per (user, tracked_job_id, doc_type). Humanized output lives in
     # the same stream as the original — it's just another version of the doc.
@@ -3221,6 +3220,7 @@ async def humanize_document(
         persona_id=source.persona_id,
         source_skill="humanizer",
         prompt_snapshot=prompt[:20000],
+        prompt_variant=rendered.attribution,
     )
     db.add(humanized_doc)
     await db.commit()

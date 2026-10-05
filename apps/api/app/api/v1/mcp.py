@@ -330,10 +330,15 @@ TOOLS: list[Tool] = [
         "tailor_document",
         "Queue a tailored document for a job (resume or cover_letter). "
         "Returns a placeholder document; poll get_document until it has content.",
-        _obj({"job_id": _INT, "doc_type": {**_STR, "description": "resume | cover_letter | …"}},
+        _obj({"job_id": _INT, "doc_type": {**_STR, "description": "resume | cover_letter | …"},
+              "prompt_variant": {**_STR, "description":
+                                 "Optional: force a prompt variant id (see Settings → Prompts)"}},
              ["job_id", "doc_type"]),
         lambda call, a: call("POST", f"/documents/tailor/{int(a['job_id'])}",
-                             json={"doc_type": a["doc_type"]}),
+                             json={k: v for k, v in {
+                                 "doc_type": a["doc_type"],
+                                 "prompt_variant": a.get("prompt_variant"),
+                             }.items() if v}),
         write=True,
     ),
     Tool(

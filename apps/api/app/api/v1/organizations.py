@@ -191,6 +191,7 @@ from typing import Optional as _Optional
 
 from pydantic import BaseModel as _BaseModel
 
+from app.skills.prompt_registry import render_prompt
 from app.skills.runner import (
     ClaudeCodeError as _ClaudeCodeError,
     run_claude_prompt as _run_claude_prompt,
@@ -472,21 +473,21 @@ async def run_org_research_pipeline(
     )
     if corpus:
         sources_block = "\n".join(f"- {u}" for u in sources)
-        prompt = _RESEARCH_PROMPT.format(
+        prompt = render_prompt("org_research", dict(
             name=obj.name,
             hint_block=hint_block,
             sources_block=sources_block,
             corpus=corpus,
-        )
+        )).text
         allowed_tools: list[str] = []
     else:
         # Stage 1 found nothing usable — fall back to Claude with a
         # tight tool budget. Caller will see this in the activity feed.
-        prompt = _RESEARCH_FALLBACK_PROMPT.format(
+        prompt = render_prompt("org_research_fallback", dict(
             name=obj.name,
             hint_block=hint_block,
             fail_reason=fail_reason or "unknown",
-        )
+        )).text
         allowed_tools = ["WebFetch", "WebSearch"]
 
     from app.skills.queue_bus import run_claude_to_bus

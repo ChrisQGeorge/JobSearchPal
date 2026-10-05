@@ -21,6 +21,7 @@ import {
 } from "./_panels/PreferencesPanels";
 import { JevScoringPanel } from "./_panels/JevScoringPanel";
 import { AgentAccessPanel } from "./_panels/AgentAccessPanel";
+import { PromptsPanel } from "./_panels/PromptsPanel";
 
 type Tab =
   | "resume"
@@ -32,6 +33,7 @@ type Tab =
   | "models"
   | "api-keys"
   | "jev"
+  | "prompts"
   | "agents"
   | "personas"
   | "data-io";
@@ -48,6 +50,7 @@ const TABS: { key: Tab; label: string }[] = [
   { key: "models", label: "Models" },
   { key: "api-keys", label: "API Keys" },
   { key: "jev", label: "Jev Scoring" },
+  { key: "prompts", label: "Prompts" },
   { key: "agents", label: "Agent Access" },
   { key: "personas", label: "Personas" },
   { key: "data-io", label: "Data Export / Import" },
@@ -105,6 +108,7 @@ export default function SettingsPage() {
       )}
       {tab === "api-keys" && <ApiKeysPanel />}
       {tab === "jev" && <JevScoringPanel />}
+      {tab === "prompts" && <PromptsPanel />}
       {tab === "agents" && <AgentAccessPanel />}
       {tab === "personas" && <PersonaManager />}
       {tab === "data-io" && <DataIoPanel />}

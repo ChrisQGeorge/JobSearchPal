@@ -16,6 +16,7 @@ from app.core.deps import get_current_user
 from app.models.jobs import InterviewRound, TrackedJob
 from app.models.operational import MetricSnapshot
 from app.models.user import User
+from app.skills.prompt_registry import render_prompt
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/metrics", tags=["metrics"])
@@ -417,11 +418,11 @@ async def build_strategy_prompt(db: AsyncSession, user_id: int) -> str:
         for j in hot_jobs
     ]
 
-    return _STRATEGY_PROMPT.format(
+    return render_prompt("strategy", dict(
         snapshot=json.dumps(current, indent=2),
         history=json.dumps(history, indent=2) if history else "(no history yet)",
         hot_jobs=json.dumps(hot, indent=2) if hot else "(no active jobs)",
-    )
+    )).text
 
 
 def parse_strategy_output(final_text: str) -> dict:

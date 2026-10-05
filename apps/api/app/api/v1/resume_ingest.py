@@ -35,6 +35,7 @@ from app.models.history import (
 from app.models.jobs import Organization
 from app.models.user import User
 from app.skills.runner import ClaudeCodeError, run_claude_prompt
+from app.skills.prompt_registry import render_prompt
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/history", tags=["resume-ingest"])
@@ -219,7 +220,7 @@ async def resume_ingest(
             detail="Document has no extractable text — ingest can't read it.",
         )
 
-    prompt = _INGEST_PROMPT.format(body=body[:80_000])
+    prompt = render_prompt("resume_ingest", dict(body=body[:80_000])).text
 
     from app.skills.queue_bus import run_claude_to_bus
 
