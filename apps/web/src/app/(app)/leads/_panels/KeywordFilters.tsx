@@ -11,6 +11,12 @@
 import { useState } from "react";
 import { api } from "@/lib/api";
 
+// Compact control style. (.jsp-input is unlayered CSS with w-full / py-2,
+// which overrides Tailwind size utilities — it made every filter control
+// a full-width row and the field picker look like a heading.)
+const CTRL =
+  "rounded border border-corp-border bg-corp-surface px-2 py-0.5 text-xs text-corp-text focus:outline-none focus:border-corp-accent";
+
 type TestResult = { field: FilterField; database: boolean | null; python: boolean | null }[];
 
 // "Try a title against this filter" — evaluated by the database's regex
@@ -44,7 +50,7 @@ function FilterTester({ filter }: { filter: KeywordFilter }) {
   return (
     <div className="pl-6 flex flex-wrap items-center gap-1.5 text-[11px]">
       <input
-        className="jsp-input text-xs py-0.5 flex-1 min-w-[12rem] max-w-md"
+        className={`${CTRL} flex-1 min-w-[12rem] max-w-md`}
         placeholder="Test: paste a job title / company…"
         value={text}
         onChange={(e) => {
@@ -101,6 +107,15 @@ const FIELD_LABELS: Record<FilterField, string> = {
   organization_name: "Company",
   location: "Location",
   description_md: "Description",
+};
+
+// Distinct colour per field so a Company condition can't be mistaken
+// for a Job title one at a glance.
+const FIELD_TONE: Record<FilterField, string> = {
+  title: "!border-sky-500/60 text-sky-300",
+  organization_name: "!border-amber-500/60 text-amber-300",
+  location: "!border-emerald-500/60 text-emerald-300",
+  description_md: "!border-violet-500/60 text-violet-300",
 };
 
 const MODE_LABELS: Record<KeywordFilter["mode"], string> = {
@@ -182,7 +197,7 @@ export function KeywordFilters({
         </button>
         {search && filters.length > 0 ? (
           <select
-            className="jsp-input text-xs py-0.5 w-auto"
+            className={CTRL}
             value=""
             onChange={(e) => {
               const [i, ci] = e.target.value.split(":").map(Number);
@@ -233,7 +248,7 @@ export function KeywordFilters({
                 {isCollapsed ? "▸" : "▾"}
               </button>
               <input
-                className="jsp-input text-sm font-medium py-0.5 flex-1 min-w-[10rem] max-w-xs"
+                className={`${CTRL} !text-sm font-medium flex-1 min-w-[10rem] max-w-xs`}
                 value={f.name}
                 placeholder="Name this filter (e.g. Too senior)"
                 onChange={(e) => patch(i, { name: e.target.value })}
@@ -310,12 +325,13 @@ export function KeywordFilters({
                       ) : null}
                       <div className="flex flex-wrap items-center gap-1">
                         <select
-                          className="jsp-input text-xs py-0.5 w-auto"
+                          className={`${CTRL} font-semibold ${FIELD_TONE[c.field]}`}
                           value={c.field}
                           onChange={(e) =>
                             patchCond(i, ci, { ...c, field: e.target.value as FilterField })
                           }
-                          title="Field these keywords are matched against"
+                          title="Which field these keywords are checked against — change it here"
+                          aria-label="Field"
                         >
                           {(Object.keys(FIELD_LABELS) as FilterField[]).map((k) => (
                             <option key={k} value={k}>
@@ -343,7 +359,7 @@ export function KeywordFilters({
                           </span>
                         ))}
                         <input
-                          className="jsp-input text-xs py-0.5 w-44"
+                          className={`${CTRL} w-44`}
                           placeholder={c.keywords.length ? "add keyword…" : "keyword, Enter (or paste a list)"}
                           value={drafts[dkey] ?? ""}
                           onChange={(e) => setDrafts((d) => ({ ...d, [dkey]: e.target.value }))}
@@ -388,7 +404,7 @@ export function KeywordFilters({
                     <label className="text-[11px] text-corp-muted flex items-center gap-1">
                       Match
                       <select
-                        className="jsp-input text-[11px] py-0 w-auto"
+                        className={CTRL}
                         value={f.match}
                         onChange={(e) => patch(i, { match: e.target.value as KeywordFilter["match"] })}
                       >
