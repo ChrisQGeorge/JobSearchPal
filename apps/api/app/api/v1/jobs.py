@@ -2866,8 +2866,15 @@ async def perform_fetch(
     url: str,
     *,
     on_event: "Optional[callable]" = None,
+    prefetched: Optional[tuple[dict, str]] = None,
 ) -> FetchedJobInfo:
     """Core URL-fetch + parse pipeline.
+
+    `prefetched=(fields, source_label)` supplies already-structured job
+    fields (e.g. a Bright Data LinkedIn record) — the page download and
+    every parse layer are skipped, but the skills lexicon, the
+    requirements-coverage gate, and organization resolution still run,
+    exactly as for a deterministic parse.
 
     Two-stage by design (the prior version let Claude loose with
     WebFetch + WebSearch and watched it issue 20+ tool calls per
@@ -2905,9 +2912,12 @@ async def perform_fetch(
         except Exception:  # pragma: no cover  (bus error must not kill fetch)
             pass
 
-    # Stage 1 — direct download.
-    _emit({"kind": "system", "text": f"Fetching {url}"})
-    page_text, raw_html, fail_reason = await _direct_fetch_page(url)
+    # Stage 1 — direct download (skipped for prefetched structured data).
+    if prefetched is not None:
+        page_text, raw_html, fail_reason = "", "", None
+    else:
+        _emit({"kind": "system", "text": f"Fetching {url}"})
+        page_text, raw_html, fail_reason = await _direct_fetch_page(url)
     today_iso = _date.today().isoformat()
 
     # Stage 1.5 — deterministic extraction: a generated per-domain
@@ -2917,21 +2927,29 @@ async def perform_fetch(
     # the exception path, not the norm.
     data: Optional[dict] = None
     parse_engine = "llm"
-    if raw_html:
-        from app.skills.extractors import deterministic_extract
+    if raw_html or prefetched is not None:
+        if prefetched is not None:
+            det = (dict(prefetched[0]), prefetched[1])
+        else:
+            from app.skills.extractors import deterministic_extract
 
-        try:
-            det = await deterministic_extract(url, raw_html)
-        except Exception as exc:  # pragma: no cover — never block the fetch
-            log.warning("Deterministic extraction error for %s: %s", url, exc)
-            det = None
+            try:
+                det = await deterministic_extract(url, raw_html)
+            except Exception as exc:  # pragma: no cover — never block the fetch
+                log.warning("Deterministic extraction error for %s: %s", url, exc)
+                det = None
         if det is not None:
             data, det_engine = det
-            parse_engine = "deterministic"
+            parse_engine = "prefetched" if prefetched is not None else "deterministic"
             _emit(
                 {
                     "kind": "system",
-                    "text": f"Parsed via {det_engine} — no model call needed.",
+                    "text": (
+                        f"Using structured data from {det_engine} — no page "
+                        "download or model call needed."
+                        if prefetched is not None
+                        else f"Parsed via {det_engine} — no model call needed."
+                    ),
                 }
             )
             if not data.get("required_skills"):

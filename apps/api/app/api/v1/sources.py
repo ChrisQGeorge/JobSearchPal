@@ -694,6 +694,13 @@ async def _promote_lead(
     # everything (TrackedJob creation, org-context extraction, skill
     # lists, JD analysis). lead_id in the payload tells the fetch
     # handler to back-link the new TrackedJob onto this lead row.
+    payload: dict = {"lead_id": lead.id}
+    raw = lead.raw_payload if isinstance(lead.raw_payload, dict) else {}
+    if raw.get("job_posting_id") and (raw.get("job_title") or raw.get("title")):
+        # Bright Data LinkedIn record: the stored payload is richer than
+        # what a fresh (often login-walled) page fetch + LLM parse would
+        # get, so the worker builds the job straight from it.
+        payload["prefetched"] = "brightdata_linkedin"
     db.add(
         JobFetchQueue(
             user_id=user.id,
@@ -701,7 +708,7 @@ async def _promote_lead(
             label=f"Lead → {lead.title[:80]}"[:512],
             url=lead.source_url,
             desired_status=target_status,
-            payload={"lead_id": lead.id},
+            payload=payload,
             state="queued",
         )
     )

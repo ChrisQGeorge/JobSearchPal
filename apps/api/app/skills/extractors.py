@@ -190,7 +190,7 @@ _EMPLOYMENT_MAP = {
     "PART_TIME": "part_time",
     "CONTRACTOR": "contract",
     "CONTRACT": "contract",
-    "TEMPORARY": "temporary",
+    "TEMPORARY": "contract",  # no "temporary" in the app's enum
     "INTERN": "internship",
     "INTERNSHIP": "internship",
 }

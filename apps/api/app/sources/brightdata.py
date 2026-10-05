@@ -212,6 +212,196 @@ async def _poll_snapshot(
             )
 
 
+# ---------- LinkedIn record → structured job fields ---------------------------
+#
+# Bright Data's LinkedIn records are already structured — title, company,
+# full formatted description, seniority, employment type, industry,
+# exact posted timestamp, sometimes a salary object. Promoting such a
+# lead maps the record straight onto FetchedJobInfo fields instead of
+# re-downloading the LinkedIn page (often login-walled) and LLM-parsing
+# it. See linkedin_record_to_job_fields + perform_fetch(prefetched=…).
+
+import re as _re
+from urllib.parse import urlsplit, urlunsplit
+
+_LI_EMPLOYMENT = {
+    "full-time": "full_time",
+    "part-time": "part_time",
+    "contract": "contract",
+    "temporary": "contract",
+    "internship": "internship",
+    "volunteer": None,
+    "other": None,
+}
+# LinkedIn's seniority ladder → the app's experience_level enum.
+# "Entry level" / "Associate" both land on junior; LinkedIn lumps
+# mid and senior ICs together as "Mid-Senior level" — title keywords
+# break the tie below.
+_LI_SENIORITY = {
+    "internship": "junior",
+    "entry level": "junior",
+    "associate": "junior",
+    "mid-senior level": "mid",
+    "director": "director",
+    "executive": "cxo",
+}
+_TITLE_LEVEL = [
+    (_re.compile(r"\b(principal|distinguished)\b", _re.I), "principal"),
+    (_re.compile(r"\bstaff\b", _re.I), "staff"),
+    (_re.compile(r"\b(vp|vice president)\b", _re.I), "vp"),
+    (_re.compile(r"\bhead of\b", _re.I), "director"),
+    # People-management titles only — "Product Manager" / "Account
+    # Manager" are IC roles and must not become experience_level=manager.
+    (_re.compile(r"\b(engineering|development|software|delivery|data science) manager\b", _re.I), "manager"),
+    (_re.compile(r"\b(senior|sr\.?|lead)\b", _re.I), "senior"),
+]
+_BUTTON_RE = _re.compile(r"<button\b.*?</button>", _re.I | _re.S)
+_STRONG_TRAILING_BR_RE = _re.compile(r"(?:\s*<br\s*/?>\s*)+</strong>", _re.I)
+_MONEY = r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?\s*[kK])"
+_SALARY_RANGE_RE = _re.compile(
+    r"\$\s?" + _MONEY + r"\s*(?:-|–|—|to)\s*\$?\s?" + _MONEY
+    + r"(?:\s*(?:per|/|an?)\s*(hour|hr|year|yr|annum|month))?",
+    _re.I,
+)
+_PERIOD_MULT = {"hour": 2080, "hr": 2080, "month": 12}
+
+
+def _money(tok: str) -> Optional[float]:
+    t = tok.replace(",", "").strip().lower()
+    try:
+        return float(t[:-1].strip()) * 1000 if t.endswith("k") else float(t)
+    except ValueError:
+        return None
+
+
+def _annualize(lo: Optional[float], hi: Optional[float], period: str) -> tuple:
+    mult = _PERIOD_MULT.get((period or "").lower().rstrip("s"), 1)
+    return (
+        lo * mult if lo is not None else None,
+        hi * mult if hi is not None else None,
+    )
+
+
+def _salary_from_record(rec: dict, text: str) -> tuple:
+    """(min, max, currency) — Bright Data's base_salary object when
+    present, else a "$85,000 to $110,000"-style range in the text.
+    Annualized; implausible values (< 1,000/yr) are discarded."""
+    bs = rec.get("base_salary")
+    lo = hi = None
+    cur = None
+    if isinstance(bs, dict):
+        lo = _money(str(bs.get("min_amount"))) if bs.get("min_amount") is not None else None
+        hi = _money(str(bs.get("max_amount"))) if bs.get("max_amount") is not None else None
+        c = str(bs.get("currency") or "").strip()
+        cur = "USD" if c in ("$", "USD", "") else c.upper()[:8]
+        lo, hi = _annualize(lo, hi, str(bs.get("payment_period") or ""))
+    if lo is None and hi is None:
+        m = _SALARY_RANGE_RE.search(text or "")
+        if m:
+            lo, hi = _annualize(_money(m.group(1)), _money(m.group(2)), m.group(3) or "")
+            cur = "USD"
+    if lo is not None and hi is not None and lo > hi:
+        lo, hi = hi, lo
+    if (hi or lo or 0) < 1000:
+        return None, None, None
+    return lo, hi, cur
+
+
+def _remote_from_record(rec: dict, location: str) -> Optional[str]:
+    """Explicit workplace fields and the location string only. Free-text
+    guessing from the description is deliberately NOT done: phrases
+    like "unless posted as a fully remote role" or "hybrid cloud"
+    mislabel jobs, and a wrong "remote" makes the Jev location score
+    ignore real geography. Unknown stays None."""
+    for key in ("job_workplace_type", "workplace_type", "remote"):
+        v = str(rec.get(key) or "").lower()
+        if "remote" in v:
+            return "remote"
+        if "hybrid" in v:
+            return "hybrid"
+        if "on-site" in v or "onsite" in v:
+            return "onsite"
+    if _re.search(r"\bremote\b", location or "", _re.I):
+        return "remote"
+    return None
+
+
+def _clean_url(u: Optional[str]) -> Optional[str]:
+    if not u:
+        return None
+    parts = urlsplit(u)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
+def linkedin_record_to_job_fields(rec: dict) -> Optional[dict]:
+    """Map one Bright Data LinkedIn job record to FetchedJobInfo field
+    names. Returns None when the record lacks a title."""
+    if not isinstance(rec, dict):
+        return None
+    title = str(rec.get("job_title") or rec.get("title") or "").strip()
+    if not title:
+        return None
+    html = str(rec.get("job_description_formatted") or "")
+    if html.strip():
+        html = _BUTTON_RE.sub("", html)
+        # LinkedIn writes headings as <strong>Heading<br><br></strong>;
+        # pull the breaks outside the bold so markdown gets a clean
+        # "**Heading**" line (which the coverage gate reads as a heading).
+        html = _STRONG_TRAILING_BR_RE.sub(r"</strong><br><br>", html)
+        description = html_to_md(html)
+    else:
+        description = _re.sub(
+            r"\s*Show more\s+Show less\s*$", "", str(rec.get("job_summary") or "")
+        ).strip()
+    location = str(rec.get("job_location") or rec.get("location") or "").strip()
+
+    emp = _LI_EMPLOYMENT.get(str(rec.get("job_employment_type") or "").strip().lower())
+    level = _LI_SENIORITY.get(str(rec.get("job_seniority_level") or "").strip().lower())
+    for pat, lvl in _TITLE_LEVEL:
+        if pat.search(title) and level in (None, "mid", "junior"):
+            # A title keyword is more specific than LinkedIn's coarse
+            # band — but never demote a Director/Executive band.
+            level = lvl
+            break
+
+    lo, hi, cur = _salary_from_record(rec, description)
+    posted = parse_iso(rec.get("job_posted_date"))
+
+    return {
+        "title": title[:255],
+        "organization_name": (str(rec.get("company_name") or "").strip() or None),
+        "location": location or None,
+        "remote_policy": _remote_from_record(rec, location),
+        "job_description": description or None,
+        "salary_min": lo,
+        "salary_max": hi,
+        "salary_currency": cur,
+        "source_platform": "linkedin",
+        "source_url": _clean_url(rec.get("url") or rec.get("job_url")),
+        "date_posted": posted.date().isoformat() if posted else None,
+        "employment_type": emp,
+        "experience_level": level,
+        "organization_industry": (str(rec.get("job_industries") or "").strip() or None),
+    }
+
+
+def linkedin_record_extras(rec: dict) -> list[str]:
+    """Human-readable facts worth keeping that have no TrackedJob column
+    (applicant count, Easy Apply, external apply link, company page)."""
+    out: list[str] = []
+    n = rec.get("job_num_applicants")
+    if isinstance(n, int) and n > 0:
+        out.append(f"{n} applicants on LinkedIn")
+    if rec.get("is_easy_apply"):
+        out.append("LinkedIn Easy Apply")
+    if rec.get("apply_link"):
+        out.append(f"Apply link: {rec['apply_link']}")
+    if rec.get("company_url"):
+        out.append(f"Company page: {_clean_url(rec['company_url'])}")
+    return out
+
+
+
 # ---------- Per-record normalizers --------------------------------------------
 
 
@@ -236,8 +426,14 @@ def _to_lead_linkedin(rec: dict[str, Any]) -> Optional[dict[str, Any]]:
         or rec.get("employer_name")
     )
     location = rec.get("job_location") or rec.get("location")
-    body_html = rec.get("job_summary") or rec.get("description") or rec.get("job_description") or ""
-    body_md = html_to_md(body_html) if body_html else None
+    structured = linkedin_record_to_job_fields(rec)
+    if structured and structured.get("job_description"):
+        # Formatted HTML → markdown keeps headings and bullets (the
+        # plain job_summary flattens the whole posting into one line).
+        body_md = structured["job_description"]
+    else:
+        body_html = rec.get("job_summary") or rec.get("description") or rec.get("job_description") or ""
+        body_md = html_to_md(body_html) if body_html else None
     workplace = (
         rec.get("workplace_type")
         or rec.get("job_workplace_type")

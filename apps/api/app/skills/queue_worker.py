@@ -688,10 +688,30 @@ async def _handle_fetch(item: JobFetchQueue) -> None:
         item_url = row.url
         label = row.label or row.url or f"Fetch #{row.id}"
         existing_job_id: Optional[int] = None
+        prefetched_fields: Optional[dict] = None
+        prefetched_extras: list[str] = []
         if isinstance(row.payload, dict):
             tj_id = row.payload.get("tracked_job_id")
             if isinstance(tj_id, int):
                 existing_job_id = tj_id
+            lid = row.payload.get("lead_id")
+            if row.payload.get("prefetched") == "brightdata_linkedin" and isinstance(lid, int):
+                from app.models.sources import JobLead
+                from app.sources.brightdata import (
+                    linkedin_record_extras,
+                    linkedin_record_to_job_fields,
+                )
+
+                raw = (
+                    await db.execute(
+                        select(JobLead.raw_payload).where(
+                            JobLead.id == lid, JobLead.user_id == row.user_id
+                        )
+                    )
+                ).scalar_one_or_none()
+                if isinstance(raw, dict):
+                    prefetched_fields = linkedin_record_to_job_fields(raw)
+                    prefetched_extras = linkedin_record_extras(raw)
         row_url = row.url
 
     def _on_event(ev: dict) -> None:
@@ -710,7 +730,15 @@ async def _handle_fetch(item: JobFetchQueue) -> None:
     # Phase 2: long Claude call. NO session held — perform_fetch now
     # manages its own session internally for the org-resolution write.
     try:
-        fetched = await perform_fetch(None, row_url, on_event=_on_event)
+        if prefetched_fields is not None:
+            fetched = await perform_fetch(
+                None,
+                prefetched_fields.get("source_url") or row_url,
+                on_event=_on_event,
+                prefetched=(prefetched_fields, "Bright Data"),
+            )
+        else:
+            fetched = await perform_fetch(None, row_url, on_event=_on_event)
     except ClaudeCodeError as exc:
         err = str(exc)
         async with SessionLocal() as db:
@@ -905,7 +933,12 @@ async def _handle_fetch(item: JobFetchQueue) -> None:
             event_type="note",
             event_date=datetime.now(tz=timezone.utc),
             details_md=(
-                f"Created from lead → fetched `{row.url}`."
+                (
+                    f"Created from Bright Data lead `{row.url}` (no page fetch)."
+                    + "".join(f"\n- {x}" for x in prefetched_extras)
+                )
+                if prefetched_fields is not None
+                else f"Created from lead → fetched `{row.url}`."
                 if lead_id is not None
                 else f"Created from fetch-queue URL `{row.url}`."
             ),
