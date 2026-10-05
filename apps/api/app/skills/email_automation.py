@@ -54,8 +54,12 @@ IMAP_TIMEOUT = 30
 INTENTS = (
     "rejection", "interview_invite", "take_home_assigned", "offer",
     "withdrew", "ghosted", "status_update",
+    # Pseudo-intent: the classifier wasn't sure what the email means.
+    # Only "notify" applies — an unclear email never changes a status.
+    "uncertain",
 )
 INTENT_LABELS = {
+    "uncertain": "Unclear — needs your call",
     "rejection": "Rejection",
     "interview_invite": "Interview / screening request",
     "take_home_assigned": "Assessment / take-home request",
@@ -76,6 +80,7 @@ DEFAULT_RULES: dict[str, dict[str, bool]] = {
     "withdrew": {"set_status": False, "notify": False},
     "ghosted": {"set_status": False, "notify": False},
     "status_update": {"set_status": False, "notify": False},
+    "uncertain": {"set_status": False, "notify": True},
 }
 
 DEFAULTS: dict[str, Any] = {
@@ -91,8 +96,20 @@ DEFAULTS: dict[str, Any] = {
     "notify_to": "",
     "min_confidence_status": 0.8,
     "min_confidence_notify": 0.5,
+    # Below this confidence an email is "unclear": no automatic status
+    # change or per-type alert — it's flagged for manual classification.
+    "uncertain_below": 0.6,
     "app_url": "",
 }
+
+
+def is_uncertain(cls: dict, cfg: dict) -> bool:
+    """The classifier couldn't say what this email means. Covers both a
+    low-confidence job intent and a low-confidence "unrelated" (the
+    pre-filter already saw job signals, so a shaky "unrelated" is worth
+    a human look rather than a silent dismissal)."""
+    conf = float(cls.get("confidence") or 0.0)
+    return conf < float(cfg.get("uncertain_below", DEFAULTS["uncertain_below"]))
 
 
 # ---- Settings store --------------------------------------------------------
@@ -124,6 +141,7 @@ def get_settings(user_id: int) -> dict:
         }
         for i in INTENTS
     }
+    out["rules"]["uncertain"]["set_status"] = False  # never meaningful
     out["state"] = raw.get("state") if isinstance(raw.get("state"), dict) else {}
     return out
 
@@ -449,6 +467,139 @@ async def run_forever() -> None:
         await asyncio.sleep(TICK_SECONDS)
 
 
+# ---- Classification ladder: Jev → LLM → human -------------------------------
+#
+# Rung 1 (here): TypeSafe Jev answers one yes/no question per email type.
+# Its answer is accepted only when one type clearly wins AND — for
+# anything about an application — the email maps to exactly one tracked
+# job by company/title (Jev can't search the tracker; the LLM can).
+# Otherwise rung 2, the LLM classifier, runs. If the LLM's own confidence
+# is below `uncertain_below`, rung 3 is you: the email is flagged
+# "unclear" and (optionally) you're emailed a link to classify it.
+
+JEV_ACCEPT_ABOVE = 0.8   # winning type's probability
+JEV_MAX_RUNNER_UP = 0.35  # no close second
+
+_INTENT_STATUS = {
+    "rejection": ("lost", "rejection"),
+    "interview_invite": ("interviewing", "interview_scheduled"),
+    "take_home_assigned": ("assessment", "assessment_assigned"),
+    "offer": ("offer", "offer_received"),
+    "withdrew": ("withdrawn", "note"),
+    "ghosted": ("ghosted", "note"),
+    "status_update": (None, "note"),
+    "unrelated": (None, None),
+}
+_ACTIVE = {"interested", "in_progress", "applied", "responded", "screening",
+           "interviewing", "assessment", "offer"}
+_STOP = {"and", "the", "for", "with", "of", "to", "a", "an", "in", "at", "senior", "sr", "jr", "ii", "iii"}
+
+
+def _alnum(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def pick_job(jobs: list[tuple[int, str, str, str]], sender: str, text: str) -> tuple[Optional[int], str]:
+    """Deterministic email → tracked-job match. `jobs` rows are
+    (id, title, org_name, status). Returns (job_id | None, reason)."""
+    _, addr = parseaddr(sender or "")
+    domain = _alnum(addr.split("@")[-1].rsplit(".", 1)[0]) if "@" in addr else ""
+    hay = f"{sender}\n{text}".lower()
+    cands = []
+    for jid, title, org, status in jobs:
+        o = (org or "").strip()
+        if len(o) < 3:
+            continue
+        hit = (len(_alnum(o)) >= 4 and _alnum(o) in domain) or re.search(
+            r"(?<![a-z0-9])" + re.escape(o.lower()) + r"(?![a-z0-9])", hay
+        )
+        if hit:
+            cands.append((jid, title, org, status))
+    if not cands:
+        return None, "no tracked company mentioned"
+    if len(cands) == 1:
+        return cands[0][0], f"only tracked job at {cands[0][2]}"
+
+    def title_hit(title: str) -> float:
+        words = [w for w in re.findall(r"[a-z0-9+#]+", title.lower()) if w not in _STOP and len(w) > 1]
+        return sum(1 for w in words if re.search(r"(?<![a-z0-9])" + re.escape(w) + r"(?![a-z0-9])", hay)) / max(len(words), 1)
+
+    scored = sorted(((title_hit(t), jid, t, o, s) for jid, t, o, s in cands), reverse=True)
+    if scored[0][0] >= 0.6 and (len(scored) == 1 or scored[1][0] < scored[0][0]):
+        return scored[0][1], f"title '{scored[0][2]}' at {scored[0][3]}"
+    active = [c for c in cands if c[3] in _ACTIVE]
+    if len(active) == 1:
+        return active[0][0], f"only active application at {active[0][2]}"
+    return None, f"{len(cands)} tracked jobs at that company — ambiguous"
+
+
+def decide_jev(probs: dict[str, float], match: tuple[Optional[int], str]) -> tuple[Optional[dict], str]:
+    """Turn Jev probabilities + the deterministic match into an accepted
+    classification, or (None, reason) to escalate to the LLM."""
+    ranked = sorted(((p, k) for k, p in probs.items() if not k.startswith("_")), reverse=True)
+    (best_p, best), (second_p, second) = ranked[0], ranked[1]
+    if best_p < JEV_ACCEPT_ABOVE:
+        return None, f"Jev unsure (best {best}: {best_p:.0%})"
+    if second_p > JEV_MAX_RUNNER_UP:
+        return None, f"Jev torn between {best} ({best_p:.0%}) and {second} ({second_p:.0%})"
+    job_id, why = match
+    if best != "unrelated" and job_id is None:
+        return None, f"Jev says {best} ({best_p:.0%}) but no unique tracked job ({why})"
+    status, event = _INTENT_STATUS[best]
+    if best == "interview_invite" and probs.get("_phone_screen", 0) > 0.5:
+        status = "screening"
+    return {
+        "intent": best,
+        "confidence": round(best_p, 3),
+        "matched_job_id": job_id if best != "unrelated" else None,
+        "matched_reason": why if best != "unrelated" else "",
+        "suggested_status": status,
+        "suggested_event_type": event,
+        "key_dates": [],
+        "summary": f"{INTENT_LABELS.get(best, best)} — classified by Jev ({best_p:.0%}).",
+    }, "accepted"
+
+
+async def jev_triage(db, row) -> tuple[Optional[dict], dict]:
+    """Rung 1. Returns (classification | None, audit). None means
+    escalate to the LLM (no key, API error, or not confident)."""
+    from sqlalchemy import select
+
+    from app.api.v1.api_credentials import get_user_secret
+    from app.models.jobs import Organization, TrackedJob
+    from app.skills.jev import JEV_PROVIDER, JevError, classify_email
+
+    key = await get_user_secret(db, row.user_id, JEV_PROVIDER)
+    if not key:
+        return None, {"jev": "not configured"}
+    try:
+        probs = await classify_email(key, email_state={
+            "email": {
+                "from": row.from_address or "",
+                "subject": row.subject or "",
+                "body": (row.body_md or "")[:8000],
+            },
+            "context": "An email received by a job seeker who tracks their job applications.",
+        })
+    except JevError as exc:
+        return None, {"jev": f"error: {exc}"[:300]}
+    jobs = (
+        await db.execute(
+            select(TrackedJob.id, TrackedJob.title, Organization.name, TrackedJob.status)
+            .join(Organization, Organization.id == TrackedJob.organization_id)
+            .where(TrackedJob.user_id == row.user_id, TrackedJob.deleted_at.is_(None))
+        )
+    ).all()
+    match = pick_job([tuple(j) for j in jobs], row.from_address or "",
+                     f"{row.subject or ''}\n{(row.body_md or '')[:8000]}")
+    cls, reason = decide_jev(probs, match)
+    return cls, {
+        "jev": reason,
+        "probabilities": {k: round(v, 3) for k, v in probs.items()},
+        "job_match": match[1],
+    }
+
+
 # ---- Automation ------------------------------------------------------------
 
 
@@ -467,8 +618,38 @@ async def run_automation(db, row) -> dict:
     cls = dict(row.classification or {})
     intent = cls.get("intent") or "unrelated"
     conf = float(cls.get("confidence") or 0.0)
-    rule = cfg["rules"].get(intent) or {"set_status": False, "notify": False}
     record: dict[str, Any] = {"intent": intent, "status_set": None, "notified": False, "notes": []}
+
+    if is_uncertain(cls, cfg):
+        # Unclear emails get exactly one action: an optional "please
+        # classify this" alert. No status change, no per-type alert.
+        record["uncertain"] = True
+        record["notes"].append(
+            f"unclear: classifier confidence {conf:.0%} is below "
+            f"{float(cfg['uncertain_below']):.0%} — waiting for you to classify it"
+        )
+        if cfg["rules"]["uncertain"]["notify"]:
+            to = (cfg.get("notify_to") or "").strip()
+            if not to:
+                record["notes"].append("not emailed: no personal address set")
+            else:
+                password = await get_user_secret(db, row.user_id, PROVIDER)
+                subject, body = _uncertain_notification(cfg, row, cls)
+                try:
+                    await asyncio.to_thread(send_email, cfg, password or "", to, subject, body)
+                    record["notified"] = True
+                except Exception as exc:
+                    record["notes"].append(f"email failed: {type(exc).__name__}: {exc}"[:300])
+        cls["automation"] = record
+        row.classification = cls
+        return record
+
+    if intent == "unrelated":
+        cls["automation"] = record
+        row.classification = cls
+        return record
+
+    rule = cfg["rules"].get(intent) or {"set_status": False, "notify": False}
 
     job = None
     if cls.get("matched_job_id"):
@@ -531,6 +712,33 @@ async def run_automation(db, row) -> dict:
     cls["automation"] = record
     row.classification = cls
     return record
+
+
+def _uncertain_notification(cfg, row, cls) -> tuple[str, str]:
+    base = (cfg.get("app_url") or "").rstrip("/")
+    guess = INTENT_LABELS.get(cls.get("intent"), cls.get("intent") or "unknown")
+    if cls.get("intent") == "unrelated":
+        guess = "Not job-related"
+    lines = [
+        "The classifier couldn't tell what this email means, so nothing was",
+        "changed automatically.",
+        "",
+        f"Best guess: {guess} ({float(cls.get('confidence') or 0):.0%} confident)",
+    ]
+    if cls.get("summary"):
+        lines.append(f"Summary: {cls['summary']}")
+    lines += [
+        "",
+        f"Classify it: {base}/inbox?email={row.id}" if base
+        else f"Classify it on the Email Inbox page (email #{row.id}).",
+        "",
+        "---- original email ----",
+        f"From: {row.from_address or '(unknown)'}",
+        f"Subject: {row.subject or '(no subject)'}",
+        "",
+        "\n".join((row.body_md or "").strip().splitlines()[:60]),
+    ]
+    return f"Needs review: {row.subject or '(no subject)'}", "\n".join(lines)
 
 
 def _notification(cfg, row, cls, job, org_name) -> tuple[str, str]:

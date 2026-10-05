@@ -23,12 +23,34 @@ type Classification = {
   suggested_event_type?: string | null;
   key_dates?: string[];
   summary?: string;
+  manually_classified?: boolean;
+  engine?: "jev" | "llm";
+  triage?: { jev?: string; job_match?: string };
   automation?: {
     status_set?: { job_id: number; from: string; to: string } | null;
     notified?: boolean;
+    uncertain?: boolean;
     notes?: string[];
   };
 };
+
+// Manual classification options + the status each implies (mirrors the
+// classifier prompt's rules).
+const INTENT_OPTIONS: { value: string; label: string; status: string }[] = [
+  { value: "rejection", label: "Rejection", status: "lost" },
+  { value: "interview_invite", label: "Interview / screening request", status: "interviewing" },
+  { value: "take_home_assigned", label: "Assessment / take-home", status: "assessment" },
+  { value: "offer", label: "Offer", status: "offer" },
+  { value: "withdrew", label: "Withdrawal confirmation", status: "withdrawn" },
+  { value: "ghosted", label: "Closed without interview", status: "ghosted" },
+  { value: "status_update", label: "Status update", status: "" },
+  { value: "unrelated", label: "Not job-related", status: "" },
+];
+
+const isUnclear = (e: ParsedEmail) =>
+  e.state === "new" &&
+  !!e.classification?.automation?.uncertain &&
+  !e.classification?.manually_classified;
 
 type ParsedEmail = {
   id: number;
@@ -70,7 +92,9 @@ export default function EmailInboxPage() {
   const [items, setItems] = useState<ParsedEmail[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
-  const [stateFilter, setStateFilter] = useState<"all" | ParsedEmail["state"]>("new");
+  const [stateFilter, setStateFilter] = useState<"all" | "unclear" | ParsedEmail["state"]>(
+    "new",
+  );
 
   // Paste form
   const [from, setFrom] = useState("");
@@ -89,11 +113,12 @@ export default function EmailInboxPage() {
     setErr(null);
     try {
       const params = new URLSearchParams();
-      if (stateFilter !== "all") params.set("state", stateFilter);
+      if (stateFilter === "unclear") params.set("state", "new");
+      else if (stateFilter !== "all") params.set("state", stateFilter);
       const rows = await api.get<ParsedEmail[]>(
         `/api/v1/email-ingest?${params.toString()}`,
       );
-      setItems(rows);
+      setItems(stateFilter === "unclear" ? rows.filter(isUnclear) : rows);
     } catch (e) {
       setErr(
         e instanceof ApiError
@@ -109,6 +134,15 @@ export default function EmailInboxPage() {
     refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stateFilter]);
+
+  // Deep link from an "unclear email" alert: /inbox?email=<id>.
+  useEffect(() => {
+    const id = Number(new URLSearchParams(window.location.search).get("email"));
+    if (id > 0) {
+      setStateFilter("all");
+      setSelectedId(id);
+    }
+  }, []);
 
   useEffect(() => {
     api
@@ -229,7 +263,7 @@ export default function EmailInboxPage() {
             Inbox
           </h3>
           <div className="flex gap-1.5">
-            {(["new", "queued", "applied", "dismissed", "errored", "all"] as const).map((s) => (
+            {(["new", "unclear", "queued", "applied", "dismissed", "errored", "all"] as const).map((s) => (
               <button
                 key={s}
                 type="button"
@@ -269,8 +303,13 @@ export default function EmailInboxPage() {
                   }`}
                   onClick={() => setSelectedId(it.id)}
                 >
-                  <div className="text-sm truncate">
-                    {it.subject || "(no subject)"}
+                  <div className="text-sm truncate flex items-center gap-1.5">
+                    {isUnclear(it) ? (
+                      <span className="text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded-full border border-corp-accent2/50 bg-corp-accent2/10 text-corp-accent2 shrink-0">
+                        Unclear
+                      </span>
+                    ) : null}
+                    <span className="truncate">{it.subject || "(no subject)"}</span>
                   </div>
                   <div className="text-[11px] text-corp-muted truncate">
                     {[
@@ -329,6 +368,7 @@ function ReviewPanel({
     cls.suggested_event_type ?? "note",
   );
   const [overrideNotes, setOverrideNotes] = useState<string>(cls.summary ?? "");
+  const [overrideIntent, setOverrideIntent] = useState<string>("");
   const [busy, setBusy] = useState<"none" | "apply" | "dismiss" | "reparse" | "delete">(
     "none",
   );
@@ -339,6 +379,7 @@ function ReviewPanel({
     setOverrideStatus(email.classification?.suggested_status ?? "");
     setOverrideEventType(email.classification?.suggested_event_type ?? "note");
     setOverrideNotes(email.classification?.summary ?? "");
+    setOverrideIntent("");
   }, [email.id, email.tracked_job_id, email.classification]);
 
   const matchedJob = useMemo(
@@ -358,6 +399,7 @@ function ReviewPanel({
         new_status: overrideStatus || null,
         event_type: overrideEventType || null,
         notes: overrideNotes || null,
+        intent: overrideIntent || null,
       });
       await onUpdated();
     } catch (e) {
@@ -446,6 +488,23 @@ function ReviewPanel({
             confidence {Math.round((cls.confidence ?? 0) * 100)}%
           </span>
         ) : null}
+        {cls.manually_classified ? (
+          <span className="text-[10px] text-corp-muted">· classified by you</span>
+        ) : cls.engine ? (
+          <span
+            className="text-[10px] text-corp-muted"
+            title={
+              cls.engine === "llm" && cls.triage?.jev
+                ? `Escalated from Jev: ${cls.triage.jev}`
+                : undefined
+            }
+          >
+            · by {cls.engine === "jev" ? "Jev" : "LLM"}
+            {cls.engine === "llm" && cls.triage?.jev && cls.triage.jev !== "not configured"
+              ? " (Jev escalated)"
+              : ""}
+          </span>
+        ) : null}
         <span className="text-[10px] text-corp-muted ml-auto">
           {STATE_LABELS[email.state]}
         </span>
@@ -487,6 +546,36 @@ function ReviewPanel({
       ) : null}
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div className="md:col-span-2">
+          <label className="jsp-label">
+            Email type {isUnclear(email) ? "(the classifier wasn't sure — your call)" : "(override)"}
+          </label>
+          <select
+            className="jsp-input"
+            value={overrideIntent}
+            onChange={(e) => {
+              const v = e.target.value;
+              setOverrideIntent(v);
+              const opt = INTENT_OPTIONS.find((o) => o.value === v);
+              if (opt) {
+                setOverrideStatus(opt.status);
+                if (opt.value === "rejection") setOverrideEventType("rejection");
+                else if (opt.value === "interview_invite") setOverrideEventType("interview_scheduled");
+                else if (opt.value === "take_home_assigned") setOverrideEventType("assessment_assigned");
+                else if (opt.value === "offer") setOverrideEventType("offer_received");
+              }
+            }}
+          >
+            <option value="">
+              Keep classifier&apos;s answer ({INTENT_OPTIONS.find((o) => o.value === cls.intent)?.label ?? cls.intent ?? "none"})
+            </option>
+            {INTENT_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </div>
         <div>
           <label className="jsp-label">Tracked job</label>
           <select

@@ -320,6 +320,85 @@ class JevError(RuntimeError):
     quota errors instead of burning retries."""
 
 
+async def _post(api_key: str, state: dict, questions: dict, timeout_seconds: int) -> dict:
+    """One System One round-trip; returns the `answers` map."""
+    import httpx
+
+    timeout = httpx.Timeout(connect=15.0, read=float(timeout_seconds), write=30.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            resp = await client.post(
+                _API_URL,
+                json={"state": state, "model": _MODEL, "questions": questions},
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+        except httpx.HTTPError as exc:
+            raise JevError(f"Jev API transport error: {exc}") from exc
+    if resp.status_code >= 400:
+        raise JevError(f"Jev API HTTP {resp.status_code}: {resp.text[:500]}")
+    try:
+        return resp.json()["answers"]
+    except (KeyError, ValueError) as exc:
+        raise JevError(f"Jev API returned an unexpected shape: {resp.text[:500]}") from exc
+
+
+# ---- Email triage ----------------------------------------------------------
+#
+# First rung of the email-classification ladder (Jev → LLM → human). Each
+# email type is one yes/no question, so Jev returns an independent,
+# calibrated probability per type; the caller accepts Jev's answer only
+# when one type clearly wins, and escalates to the LLM classifier
+# otherwise.
+
+EMAIL_INTENT_QUESTIONS: dict[str, str] = {
+    "rejection": "The employer is declining the candidate / not moving forward with their application.",
+    "interview_invite": "The employer wants to schedule a conversation with the candidate: a recruiter call, phone screen, or interview.",
+    "take_home_assigned": "The candidate is asked to complete something before talking to a person: an online assessment, coding test, take-home exercise, screening questionnaire, or one-way video interview.",
+    "offer": "The employer is extending a job offer to the candidate.",
+    "withdrew": "This confirms that the candidate withdrew their own application.",
+    "ghosted": "The employer closed the role or the candidate's application without any interview and without a direct rejection.",
+    "status_update": "A job-application status update that requires no decision: an application-received confirmation, 'still reviewing', or 'position on hold'.",
+    "unrelated": "This email is not about one of the candidate's job applications at all (marketing, job alerts, newsletters, personal mail).",
+}
+
+
+async def classify_email(
+    api_key: str, *, email_state: dict[str, Any], timeout_seconds: int = 45
+) -> dict[str, float]:
+    """Return {intent: probability} for every email type, plus
+    "_phone_screen": probability that an interview invite is only a
+    first recruiter / phone screen."""
+    questions: dict[str, Any] = {
+        key: {
+            "type": "noul",
+            "instructions": "Does this email belong in this category? " + text,
+            "criteria": {
+                "true": "Yes — this is the email's main purpose.",
+                "false": "No — the email is about something else.",
+            },
+        }
+        for key, text in EMAIL_INTENT_QUESTIONS.items()
+    }
+    questions["_phone_screen"] = {
+        "type": "noul",
+        "instructions": (
+            "If this email invites the candidate to talk, is it only a first "
+            "call with a recruiter / phone screen (rather than an interview "
+            "with the hiring team)?"
+        ),
+        "criteria": {"true": "First recruiter call or phone screen.",
+                     "false": "Team interview, or not an invitation at all."},
+    }
+    answers = await _post(api_key, email_state, questions, timeout_seconds)
+    try:
+        return {k: float(answers[k]["noul"]) for k in questions}
+    except (KeyError, TypeError, ValueError) as exc:
+        raise JevError(f"Jev email triage: unexpected answer shape: {answers!r}"[:500]) from exc
+
+
 async def score_job_fit(
     api_key: str,
     *,
@@ -332,27 +411,9 @@ async def score_job_fit(
      scores ({dimension: {score: 0-100 int, confidence: 0-1}}),
      recommendation ("go"/"maybe"/"no-go"), confidence (0-1, mean),
      apply_probability (0-1), engine ("jev")}."""
-    import httpx
-
     questions, levels, weights = _build_questions()
-    payload = {"state": job_state, "model": _MODEL, "questions": questions}
-    timeout = httpx.Timeout(connect=15.0, read=float(timeout_seconds), write=30.0, pool=10.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            resp = await client.post(
-                _API_URL,
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-            )
-        except httpx.HTTPError as exc:
-            raise JevError(f"Jev API transport error: {exc}") from exc
-    if resp.status_code >= 400:
-        raise JevError(
-            f"Jev API HTTP {resp.status_code}: {resp.text[:500]}"
-        )
+    answers = await _post(api_key, job_state, questions, timeout_seconds)
+
     def _to_pct(raw_score: float, n: int) -> int:
         # Score answers are probability-weighted across the ordered levels
         # (1..N, N = that dimension's criteria count). Rescale to 0-100,
@@ -362,7 +423,6 @@ async def score_job_fit(
         return int(round((clamped - 1.0) / (max(n, 2) - 1) * 100.0))
 
     try:
-        answers = resp.json()["answers"]
         scores: dict[str, dict[str, float | int]] = {}
         confidences: list[float] = []
         for key, _label in SCORE_DIMENSIONS:
@@ -376,7 +436,7 @@ async def score_job_fit(
         apply_p = float(answers["apply"]["noul"])
     except (KeyError, TypeError, ValueError) as exc:
         raise JevError(
-            f"Jev API returned an unexpected shape: {resp.text[:500]}"
+            f"Jev API returned an unexpected shape: {answers!r}"[:500]
         ) from exc
 
     # Weighted average — Settings → Jev scoring controls the weights

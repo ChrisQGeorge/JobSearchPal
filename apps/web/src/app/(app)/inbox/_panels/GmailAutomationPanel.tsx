@@ -19,6 +19,7 @@ type Automation = {
   notify_to: string;
   min_confidence_status: number;
   min_confidence_notify: number;
+  uncertain_below: number;
   rules: Record<string, Rule>;
   intent_labels: Record<string, string>;
   has_password: boolean;
@@ -85,6 +86,7 @@ export function GmailAutomationPanel({ onPolled }: { onPolled: () => void }) {
         notify_to: cfg.notify_to,
         min_confidence_status: cfg.min_confidence_status,
         min_confidence_notify: cfg.min_confidence_notify,
+        uncertain_below: cfg.uncertain_below,
         rules: cfg.rules,
         app_password: password || null,
       });
@@ -261,13 +263,22 @@ export function GmailAutomationPanel({ onPolled }: { onPolled: () => void }) {
                     <tr key={intent} className="border-t border-corp-border">
                       <td className="py-1.5 pr-3">{cfg.intent_labels[intent] ?? intent}</td>
                       <td className="py-1.5 pr-3">
-                        <input
-                          type="checkbox"
-                          className="accent-corp-accent h-4 w-4"
-                          checked={r.set_status}
-                          onChange={(e) => setRule(intent, { set_status: e.target.checked })}
-                          aria-label={`Update status for ${intent}`}
-                        />
+                        {intent === "uncertain" ? (
+                          <span
+                            className="text-corp-muted"
+                            title="Unclear emails never change a status — you classify them."
+                          >
+                            —
+                          </span>
+                        ) : (
+                          <input
+                            type="checkbox"
+                            className="accent-corp-accent h-4 w-4"
+                            checked={r.set_status}
+                            onChange={(e) => setRule(intent, { set_status: e.target.checked })}
+                            aria-label={`Update status for ${intent}`}
+                          />
+                        )}
                       </td>
                       <td className="py-1.5">
                         <input
@@ -308,6 +319,21 @@ export function GmailAutomationPanel({ onPolled }: { onPolled: () => void }) {
               />
               %. Jobs marked won or withdrawn are never changed. Everything still lands in the
               inbox below for review.
+            </p>
+            <p className="text-[11px] text-corp-muted mt-1">
+              Treat an email as <strong>unclear</strong> when the classifier is under{" "}
+              <input
+                type="number"
+                min={0}
+                max={100}
+                className="jsp-input inline-block w-14 text-xs py-0 px-1"
+                value={Math.round(cfg.uncertain_below * 100)}
+                onChange={(e) =>
+                  set("uncertain_below", Math.min(1, Math.max(0, Number(e.target.value) / 100)))
+                }
+              />
+              % sure — nothing happens automatically, it&apos;s flagged in the inbox for you to
+              classify, and (if &quot;Email me&quot; is ticked) you get a link to it.
             </p>
           </div>
 

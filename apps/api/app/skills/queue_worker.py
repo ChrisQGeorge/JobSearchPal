@@ -1981,10 +1981,11 @@ async def _handle_email_classify(item: JobFetchQueue) -> None:
         build_classify_prompt,
         classify_env,
         store_classification,
+        store_classification_data,
     )
     from app.models.emails import ParsedEmail
     from app.skills import queue_bus
-    from app.skills.email_automation import run_automation
+    from app.skills.email_automation import jev_triage
     from app.skills.runner import ClaudeCodeError
 
     async with SessionLocal() as db:
@@ -2009,6 +2010,19 @@ async def _handle_email_classify(item: JobFetchQueue) -> None:
         label = row.label or "Email"
         user_id = row.user_id
 
+        # Rung 1 — Jev. A confident answer with an unambiguous job match
+        # settles it with no LLM call.
+        jev_cls, triage = await jev_triage(db, email_row)
+        if jev_cls is not None:
+            cls = await store_classification_data(
+                db, email_row, jev_cls, engine="jev", triage=triage
+            )
+            await _finish_email(db, row, email_row, cls, auto, pid)
+            return
+
+    # Rung 2 — LLM (Jev unsure, unconfigured, or the job match was
+    # ambiguous). Rung 3 — the user — is decided in run_automation from
+    # the LLM's confidence.
     try:
         final_text = await queue_bus.run_claude_to_bus(
             prompt=prompt,
@@ -2049,25 +2063,32 @@ async def _handle_email_classify(item: JobFetchQueue) -> None:
         ).scalar_one_or_none()
         if row is None or email_row is None:
             return
-        cls = await store_classification(db, email_row, final_text)
-        actions = None
-        if auto and cls.get("intent") != "unrelated":
-            try:
-                actions = await run_automation(db, email_row)
-            except Exception as exc:  # pragma: no cover — never lose the classification
-                log.exception("Email automation failed for parsed email %s", pid)
-                c = dict(email_row.classification or {})
-                c["automation"] = {"notes": [f"automation error: {exc}"[:300]]}
-                email_row.classification = c
-        if cls.get("intent") == "unrelated" and auto:
-            # The pre-filter let it through but it isn't job mail —
-            # keep the inbox clean.
-            email_row.state = "dismissed"
-        row.state = "done"
-        row.error_message = None
-        row.result = {"parsed_email_id": pid, "intent": cls.get("intent"),
-                      "automation": actions}
-        await db.commit()
+        cls = await store_classification(db, email_row, final_text, triage=triage)
+        await _finish_email(db, row, email_row, cls, auto, pid)
+
+
+async def _finish_email(db, row, email_row, cls: dict, auto: bool, pid) -> None:
+    """Automation + bookkeeping shared by the Jev and LLM rungs."""
+    from app.skills.email_automation import run_automation
+
+    actions = None
+    if auto:
+        try:
+            actions = await run_automation(db, email_row)
+        except Exception as exc:  # pragma: no cover — never lose the classification
+            log.exception("Email automation failed for parsed email %s", pid)
+            c = dict(email_row.classification or {})
+            c["automation"] = {"notes": [f"automation error: {exc}"[:300]]}
+            email_row.classification = c
+    if auto and cls.get("intent") == "unrelated" and not (actions or {}).get("uncertain"):
+        # Confidently not job mail (the pre-filter was too generous)
+        # — keep the inbox clean. Unclear ones stay for review.
+        email_row.state = "dismissed"
+    row.state = "done"
+    row.error_message = None
+    row.result = {"parsed_email_id": pid, "intent": cls.get("intent"),
+                  "engine": cls.get("engine"), "automation": actions}
+    await db.commit()
 
 
 _HANDLERS = {

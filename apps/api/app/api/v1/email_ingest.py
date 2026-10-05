@@ -166,6 +166,9 @@ class EmailApplyIn(BaseModel):
     new_status: Optional[str] = None
     event_type: Optional[str] = None
     notes: Optional[str] = None
+    # Manual classification — overrides the classifier's intent on the
+    # stored row (used for "unclear" emails).
+    intent: Optional[str] = None
 
 
 class EmailApplyOut(BaseModel):
@@ -193,22 +196,25 @@ async def _owned(db: AsyncSession, parsed_id: int, user_id: int) -> ParsedEmail:
     return row
 
 
+VALID_INTENTS = {
+    "rejection",
+    "interview_invite",
+    "take_home_assigned",
+    "offer",
+    "withdrew",
+    "status_update",
+    "ghosted",
+    "unrelated",
+}
+
+
 def _normalize_classification(raw: object) -> dict:
     """Trim Claude's free-form response to a known shape — anything
     out-of-allowlist gets dropped so the UI can trust what it renders."""
     if not isinstance(raw, dict):
         return {"intent": "unrelated", "confidence": 0.0}
     intent = str(raw.get("intent") or "unrelated").strip().lower()
-    if intent not in {
-        "rejection",
-        "interview_invite",
-        "take_home_assigned",
-        "offer",
-        "withdrew",
-        "status_update",
-        "ghosted",
-        "unrelated",
-    }:
+    if intent not in VALID_INTENTS:
         intent = "unrelated"
     out: dict[str, Any] = {
         "intent": intent,
@@ -265,11 +271,34 @@ def classify_env(user_id: int) -> dict:
 
 
 async def store_classification(
-    db: AsyncSession, row: ParsedEmail, final_text: str
+    db: AsyncSession,
+    row: ParsedEmail,
+    final_text: str,
+    *,
+    triage: Optional[dict] = None,
 ) -> dict:
-    """Normalize the classifier output onto `row`, verifying the matched
-    job belongs to the row's user (the model could name any id)."""
-    cls = _normalize_classification(_extract_json_object(final_text) or {})
+    """LLM rung: parse the classifier's text output and store it."""
+    return await store_classification_data(
+        db, row, _extract_json_object(final_text) or {}, engine="llm", triage=triage
+    )
+
+
+async def store_classification_data(
+    db: AsyncSession,
+    row: ParsedEmail,
+    raw: dict,
+    *,
+    engine: str,
+    triage: Optional[dict] = None,
+) -> dict:
+    """Normalize a classification onto `row`, verifying the matched job
+    belongs to the row's user (a model could name any id). `engine` is
+    which rung of the Jev → LLM → human ladder decided; `triage` is the
+    Jev audit (probabilities, why it escalated)."""
+    cls = _normalize_classification(raw)
+    cls["engine"] = engine
+    if triage:
+        cls["triage"] = triage
     row.tracked_job_id = None
     if cls.get("matched_job_id"):
         owns = (
@@ -375,6 +404,7 @@ class AutomationIn(BaseModel):
     notify_to: Optional[str] = Field(default=None, max_length=320)
     min_confidence_status: Optional[float] = Field(default=None, ge=0, le=1)
     min_confidence_notify: Optional[float] = Field(default=None, ge=0, le=1)
+    uncertain_below: Optional[float] = Field(default=None, ge=0, le=1)
     rules: Optional[dict[str, AutomationRuleIn]] = None
 
 
@@ -552,6 +582,17 @@ async def parse_email(
     db.add(row)
     await db.flush()
 
+    # Jev first; the LLM only runs when Jev is unsure or the job match
+    # is ambiguous.
+    from app.skills.email_automation import jev_triage
+
+    jev_cls, triage = await jev_triage(db, row)
+    if jev_cls is not None:
+        await store_classification_data(db, row, jev_cls, engine="jev", triage=triage)
+        await db.commit()
+        await db.refresh(row)
+        return row
+
     try:
         final_text = await run_claude_to_bus(
             prompt=build_classify_prompt(row),
@@ -580,7 +621,7 @@ async def parse_email(
             )
         raise HTTPException(status_code=502, detail=f"Email parse failed: {exc}")
 
-    await store_classification(db, row, final_text)
+    await store_classification(db, row, final_text, triage=triage)
     await db.commit()
     await db.refresh(row)
     return row
@@ -632,6 +673,15 @@ async def apply_email(
     the activity feed reflects why the row moved."""
     row = await _owned(db, parsed_id, user.id)
     cls = row.classification or {}
+    if payload.intent:
+        intent = payload.intent.strip().lower()
+        if intent not in VALID_INTENTS:
+            raise HTTPException(
+                status_code=422, detail=f"intent must be one of {sorted(VALID_INTENTS)}"
+            )
+        cls = {**cls, "intent": intent, "manually_classified": True,
+               "classifier_intent": cls.get("classifier_intent", cls.get("intent"))}
+        row.classification = cls
     job_id = payload.tracked_job_id or row.tracked_job_id or cls.get("matched_job_id")
     new_status = (payload.new_status or cls.get("suggested_status") or "").strip() or None
     event_type = (payload.event_type or cls.get("suggested_event_type") or "note").strip()
