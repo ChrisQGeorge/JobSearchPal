@@ -448,7 +448,7 @@ async def update_source(
             # Editing mid-run must not drop a parked (already paid-for)
             # snapshot — the editor doesn't round-trip these keys.
             old = src.filters if isinstance(src.filters, dict) else {}
-            for k in ("pending_snapshot_id", "pending_since"):
+            for k in ("pending_snapshot_id", "pending_since", "run", "last_run"):
                 if old.get(k):
                     new_filters[k] = old[k]
             src.filters = new_filters

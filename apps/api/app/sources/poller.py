@@ -129,6 +129,9 @@ async def poll_source(
     finishes collecting it within the next tick."""
     from app.sources.brightdata import SnapshotPending
 
+    if source.kind == "brightdata_keyword":
+        return await _poll_keyword(db, source)
+
     try:
         ctx = await _build_ctx(db, source)
         if quick:
@@ -264,6 +267,21 @@ async def poll_source(
         f.pop("pending_since", None)
         source.filters = f
 
+    cap = max(1, int(source.max_leads_per_poll or 100))
+    inserted, err = await _insert_leads(db, source, raw_leads, cap)
+    if err is not None:
+        return 0, err
+    source.last_polled_at = _now()
+    source.last_lead_count = inserted
+    source.last_error = None
+    return inserted, None
+
+
+async def _insert_leads(
+    db: AsyncSession, source: JobSource, raw_leads: list[dict[str, Any]], cap: int
+) -> tuple[int, Optional[str]]:
+    """Dedupe + filter + insert up to `cap` new JobLead rows. Returns
+    (inserted, error) — error only on a concurrent-insert race."""
     now = _now()
     expires = now + timedelta(hours=max(1, source.lead_ttl_hours))
 
@@ -283,7 +301,6 @@ async def poll_source(
         ).scalars().all()
     )
 
-    cap = max(1, int(source.max_leads_per_poll or 100))
     inserted = 0
     for raw in raw_leads:
         if inserted >= cap:
@@ -337,11 +354,158 @@ async def poll_source(
                 source.slug_or_url,
             )
             return 0, str(exc)
-
-    source.last_polled_at = now
-    source.last_lead_count = inserted
-    source.last_error = None
     return inserted, None
+
+
+# ---- Bright Data keyword discovery: one run per row, imported as each lands --
+
+ACTIVE_TICK_SECONDS = 15
+
+
+def _run_of(source: JobSource) -> Optional[dict]:
+    f = source.filters if isinstance(source.filters, dict) else {}
+    run = f.get("run")
+    return run if isinstance(run, dict) else None
+
+
+def _set_filters(source: JobSource, **changes) -> None:
+    f = dict(source.filters or {})
+    for k, v in changes.items():
+        if v is None:
+            f.pop(k, None)
+        else:
+            f[k] = v
+    source.filters = f  # reassign so SQLAlchemy sees the JSON change
+
+
+async def _poll_keyword(db: AsyncSession, source: JobSource) -> tuple[int, Optional[str]]:
+    """Advance a saved keyword query by one step. No active run → trigger
+    one Bright Data snapshot per row. Active run → check each snapshot's
+    status and import the ones that are ready. Never blocks waiting on
+    Bright Data; the poller ticks every 15s while a run is active, so
+    leads appear search by search and the source row shows progress
+    (filters["run"]). Returns (leads inserted this step, error)."""
+    from app.sources import brightdata as bd
+    from app.sources.brightdata import SnapshotPending
+
+    ctx = await _build_ctx(db, source)
+    api_key = ctx.get("api_key")
+    if not api_key:
+        msg = "Bright Data API key required. Add one on Settings → API Keys (Bright Data)."
+        source.last_polled_at = _now()
+        source.last_error = msg
+        return 0, msg
+    cap = max(1, int(source.max_leads_per_poll or 100))
+    run = _run_of(source)
+    f = source.filters if isinstance(source.filters, dict) else {}
+
+    if run is None and f.get("pending_snapshot_id"):
+        # Run started by the previous single-snapshot implementation —
+        # adopt it instead of paying for a new one.
+        run = {
+            "started_at": f.get("pending_since") or _now().isoformat(timespec="seconds"),
+            "inserted": 0,
+            "snapshots": [{"id": f["pending_snapshot_id"], "label": "all searches",
+                           "status": "running", "leads": 0, "error": None}],
+        }
+        _set_filters(source, pending_snapshot_id=None, pending_since=None)
+
+    if run is None:
+        rows = bd.keyword_run_rows(source.filters)
+        if not rows:
+            msg = "No keyword rows saved on this source — add rows or upload the input CSV."
+            source.last_polled_at = _now()
+            source.last_error = msg
+            return 0, msg
+        snaps = []
+        for row in rows:
+            entry = {"id": None, "label": bd.keyword_row_label(row),
+                     "status": "starting", "leads": 0, "error": None}
+            try:
+                entry["id"] = await bd.trigger_keyword_row(
+                    api_key, row, dataset_id=ctx.get("dataset_id"), limit=cap
+                )
+            except Exception as exc:  # noqa: BLE001 — one bad row mustn't sink the rest
+                entry["status"] = "failed"
+                entry["error"] = str(exc)[:300]
+            snaps.append(entry)
+        run = {"started_at": _now().isoformat(timespec="seconds"),
+               "inserted": 0, "snapshots": snaps}
+        log.info("source %s keyword run: triggered %d searches", source.id, len(snaps))
+
+    inserted_now = 0
+    try:
+        started = datetime.fromisoformat(run["started_at"])
+    except (KeyError, ValueError):
+        started = _now()
+    timed_out = _now() - started > PENDING_GIVE_UP
+
+    for s in run["snapshots"]:
+        if s["status"] in ("imported", "failed") or not s.get("id"):
+            continue
+        if timed_out:
+            s["status"] = "failed"
+            s["error"] = f"not ready after {int(PENDING_GIVE_UP.total_seconds() // 3600)}h"
+            continue
+        try:
+            status = await bd.snapshot_status(api_key, s["id"])
+        except Exception as exc:  # noqa: BLE001 — transient; retry next tick
+            s["error"] = f"progress check failed: {exc}"[:300]
+            continue
+        if status in ("failed", "canceled"):
+            s["status"] = "failed"
+            s["error"] = f"Bright Data reported the run {status}"
+            continue
+        if status != "ready":
+            s["status"] = status
+            continue
+        try:
+            leads = await bd.download_keyword_snapshot(api_key, s["id"])
+        except SnapshotPending:
+            s["status"] = "ready"  # packaging; download next tick
+            continue
+        except Exception as exc:  # noqa: BLE001
+            s["status"] = "failed"
+            s["error"] = f"download failed: {exc}"[:300]
+            continue
+        room = cap - int(run.get("inserted") or 0)
+        n = 0
+        if room > 0:
+            n, err = await _insert_leads(db, source, leads, room)
+            if err is not None:
+                return inserted_now, None  # race with another poll — retry next tick
+        s["status"] = "imported"
+        s["leads"] = n
+        s["found"] = len(leads)
+        s["error"] = None if room > 0 else "skipped — run reached the Top # cap"
+        run["inserted"] = int(run.get("inserted") or 0) + n
+        inserted_now += n
+
+    done = all(s["status"] in ("imported", "failed") for s in run["snapshots"])
+    if not done:
+        _set_filters(source, run=run)
+        source.last_error = None
+        return inserted_now, None
+
+    failed = [s for s in run["snapshots"] if s["status"] == "failed"]
+    _set_filters(source, run=None, last_run={
+        "finished_at": _now().isoformat(timespec="seconds"),
+        "started_at": run["started_at"],
+        "searches": len(run["snapshots"]),
+        "failed": len(failed),
+        "leads": run["inserted"],
+    })
+    source.last_polled_at = _now()
+    source.last_lead_count = run["inserted"]
+    if failed and len(failed) == len(run["snapshots"]):
+        source.last_error = f"All {len(failed)} searches failed — first error: {failed[0]['error']}"[:1000]
+        return inserted_now, source.last_error
+    # Partial failures are shown on the source row, not raised.
+    source.last_error = (
+        f"{len(failed)} of {len(run['snapshots'])} searches failed — "
+        + "; ".join(f"{s['label']}: {s['error']}" for s in failed[:3])
+    )[:1000] if failed else None
+    return inserted_now, None
 
 
 async def _expire_old_leads(db: AsyncSession) -> int:
@@ -375,7 +539,9 @@ async def _due_sources(db: AsyncSession) -> list[JobSource]:
         # tick regardless of schedule — and even when the source is
         # disabled, since a manual "Import now" started it and the run
         # is already paid for.
-        if isinstance(s.filters, dict) and s.filters.get("pending_snapshot_id"):
+        if isinstance(s.filters, dict) and (
+            s.filters.get("pending_snapshot_id") or isinstance(s.filters.get("run"), dict)
+        ):
             due.append(s)
             continue
         if not s.enabled:
@@ -392,7 +558,10 @@ async def _due_sources(db: AsyncSession) -> list[JobSource]:
     return due
 
 
-async def _tick() -> None:
+async def _tick() -> bool:
+    """One poller pass. Returns True when a Bright Data keyword run is
+    still in flight, so the caller ticks faster until it finishes."""
+    active = False
     async with SessionLocal() as db:
         try:
             expired = await _expire_old_leads(db)
@@ -401,6 +570,11 @@ async def _tick() -> None:
             due = await _due_sources(db)
             for source in due:
                 count, err = await poll_source(db, source)
+                if _run_of(source) is not None:
+                    active = True
+                    # Commit per source so each search's leads show up
+                    # in the inbox as soon as they're imported.
+                    await db.commit()
                 if err is not None:
                     log.info(
                         "source %s/%s poll error: %s",
@@ -419,17 +593,19 @@ async def _tick() -> None:
         except Exception:
             log.exception("Source poll tick failed")
             await db.rollback()
+    return active
 
 
 async def run_forever() -> None:
     """Long-running worker. Started in app.main lifespan."""
     log.info("Source poller starting (tick=%ds)", POLL_TICK_SECONDS)
     while True:
+        active = False
         try:
-            await _tick()
+            active = await _tick()
         except Exception:
             log.exception("Source poller tick crashed; continuing")
-        await asyncio.sleep(POLL_TICK_SECONDS)
+        await asyncio.sleep(ACTIVE_TICK_SECONDS if active else POLL_TICK_SECONDS)
 
 
 __all__ = ["run_forever", "poll_source"]

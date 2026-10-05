@@ -50,6 +50,7 @@ async def _brightdata_linkedin_adapter(
         filters=ctx.get("filters"),
         dataset_id=ctx.get("dataset_id"),
         limit=ctx.get("max_leads_per_poll"),
+        wait_seconds=ctx.get("snapshot_wait_seconds"),
     )
 
 
@@ -62,22 +63,13 @@ async def _brightdata_glassdoor_adapter(
         filters=ctx.get("filters"),
         dataset_id=ctx.get("dataset_id"),
         limit=ctx.get("max_leads_per_poll"),
-    )
-
-
-async def _brightdata_keyword_adapter(
-    slug_or_url: str, ctx: dict[str, Any]
-) -> list[RawLead]:
-    return await brightdata.fetch_linkedin_keyword(
-        slug_or_url,
-        api_key=ctx.get("api_key"),
-        filters=ctx.get("filters"),
-        dataset_id=ctx.get("dataset_id"),
-        limit=ctx.get("max_leads_per_poll"),
         wait_seconds=ctx.get("snapshot_wait_seconds"),
     )
 
 
+# brightdata_keyword has no adapter: it runs as one Bright Data snapshot
+# per query row, orchestrated across ticks by sources.poller._poll_keyword
+# so leads import progressively as each row's run finishes.
 ADAPTERS: dict[str, Adapter] = {
     "greenhouse": _wrap_simple(greenhouse.fetch),
     "lever": _wrap_simple(lever.fetch),
@@ -87,7 +79,6 @@ ADAPTERS: dict[str, Adapter] = {
     "yc": _wrap_simple(yc.fetch),
     "brightdata_linkedin": _brightdata_linkedin_adapter,
     "brightdata_glassdoor": _brightdata_glassdoor_adapter,
-    "brightdata_keyword": _brightdata_keyword_adapter,
 }
 
 KIND_LABELS: dict[str, str] = {

@@ -79,8 +79,122 @@ const BD_KEYWORD_KIND = "brightdata_keyword";
 
 // A Bright Data run was triggered and is still being collected by the
 // background poller — normal for keyword discovery, not an error.
+type RunSnapshot = {
+  id: string | null;
+  label: string;
+  status: string; // starting | running | ready | imported | failed
+  leads: number;
+  found?: number;
+  error: string | null;
+};
+type KeywordRun = { started_at: string; inserted: number; snapshots: RunSnapshot[] };
+type LastRun = {
+  started_at: string;
+  finished_at: string;
+  searches: number;
+  failed: number;
+  leads: number;
+};
+
+const runOf = (s: Source): KeywordRun | null => {
+  const r = s.filters?.run;
+  return r && typeof r === "object" ? (r as KeywordRun) : null;
+};
 const isCollecting = (s: Source) =>
-  typeof s.filters?.pending_snapshot_id === "string" && !!s.filters.pending_snapshot_id;
+  !!runOf(s) ||
+  (typeof s.filters?.pending_snapshot_id === "string" && !!s.filters.pending_snapshot_id);
+
+const minsSince = (iso: string) =>
+  Math.max(1, Math.round((Date.now() - new Date(iso).getTime()) / 60000));
+
+function RunProgress({ source }: { source: Source }) {
+  const [open, setOpen] = useState(false);
+  const run = runOf(source);
+  if (!run) {
+    // Single-snapshot run (older LinkedIn / Glassdoor source kinds).
+    const since = source.filters?.pending_since;
+    return (
+      <span className="text-[11px] text-corp-accent inline-flex items-center gap-1.5">
+        <Spinner />
+        Collecting from Bright Data
+        {typeof since === "string" ? ` · ${minsSince(since)} min` : ""}
+      </span>
+    );
+  }
+  const total = run.snapshots.length;
+  const done = run.snapshots.filter((x) => x.status === "imported" || x.status === "failed").length;
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  return (
+    <div className="basis-full order-last">
+      <button
+        type="button"
+        className="w-full text-left"
+        onClick={() => setOpen((o) => !o)}
+        title="Each saved search runs as its own Bright Data job; results import as each one finishes."
+      >
+        <div className="flex items-center gap-2 text-[11px] text-corp-accent">
+          <Spinner />
+          <span>
+            Searching LinkedIn via Bright Data — {done} of {total} searches done ·{" "}
+            {run.inserted} lead{run.inserted === 1 ? "" : "s"} imported · {minsSince(run.started_at)} min
+          </span>
+          <span className="ml-auto text-corp-muted">{open ? "hide" : "details"}</span>
+        </div>
+        <div className="mt-1 h-1.5 rounded bg-corp-surface2 overflow-hidden">
+          <div
+            className="h-full bg-corp-accent transition-all duration-700"
+            style={{ width: `${Math.max(pct, 4)}%` }}
+          />
+        </div>
+      </button>
+      {open ? (
+        <ul className="mt-2 space-y-0.5 text-[11px]">
+          {run.snapshots.map((x, i) => (
+            <li key={x.id ?? i} className="flex items-center gap-2">
+              <span className="w-4 text-center">
+                {x.status === "imported" ? (
+                  <span className="text-corp-ok">✓</span>
+                ) : x.status === "failed" ? (
+                  <span className="text-corp-danger">✕</span>
+                ) : (
+                  <Spinner />
+                )}
+              </span>
+              <span className="truncate">{x.label}</span>
+              <span className="ml-auto text-corp-muted whitespace-nowrap">
+                {x.status === "imported"
+                  ? `${x.leads} new${x.found != null && x.found !== x.leads ? ` of ${x.found}` : ""}`
+                  : x.status === "failed"
+                    ? x.error ?? "failed"
+                    : x.status === "ready"
+                      ? "downloading…"
+                      : x.status === "starting"
+                        ? "queued at Bright Data"
+                        : "searching…"}
+              </span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
+function LastRunNote({ source }: { source: Source }) {
+  const lr = source.filters?.last_run as LastRun | undefined;
+  if (!lr || typeof lr !== "object" || isCollecting(source)) return null;
+  const mins = Math.max(
+    1,
+    Math.round((new Date(lr.finished_at).getTime() - new Date(lr.started_at).getTime()) / 60000),
+  );
+  return (
+    <span className="text-[11px] text-corp-muted" title={`Finished ${new Date(lr.finished_at).toLocaleString()}`}>
+      last import: {lr.searches} search{lr.searches === 1 ? "" : "es"} · {lr.leads} new lead
+      {lr.leads === 1 ? "" : "s"} · {mins} min
+      {lr.failed ? ` · ${lr.failed} failed` : ""}
+    </span>
+  );
+}
 
 function Spinner() {
   return (
@@ -316,20 +430,29 @@ export default function LeadsPage() {
     loadAll();
   }, []);
 
-  // While a Bright Data run is still collecting, re-check every 15s
-  // (quietly — no loading flash) and pull the new leads once it lands.
+  // While a Bright Data run is collecting, re-check every 10s (quietly —
+  // no loading flash). Leads import search by search, so the inbox is
+  // refreshed whenever the imported count moves.
   const pendingIds = sources.filter(isCollecting).map((s) => s.id).join(",");
   useEffect(() => {
     if (!pendingIds) return;
+    let lastTotal = -1;
     const t = setInterval(async () => {
       try {
         const s = await api.get<Source[]>("/api/v1/job-sources");
         setSources(s);
-        if (!s.some(isCollecting)) void loadLeads();
+        const total = s.reduce(
+          (n, src) => n + (src.total_lead_count ?? 0),
+          0,
+        );
+        if (total !== lastTotal || !s.some(isCollecting)) {
+          lastTotal = total;
+          void loadLeads();
+        }
       } catch {
         /* next tick retries */
       }
-    }, 15000);
+    }, 10000);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingIds]);
@@ -573,16 +696,7 @@ export default function LeadsPage() {
                   </span>
                 ) : null}
                 {isCollecting(s) ? (
-                  <span
-                    className="text-[11px] text-corp-accent inline-flex items-center gap-1.5"
-                    title={`Bright Data is still gathering results (snapshot ${String(s.filters?.pending_snapshot_id)}). Large searches can take several minutes; the app checks every minute and imports them automatically.`}
-                  >
-                    <Spinner />
-                    Collecting from Bright Data
-                    {typeof s.filters?.pending_since === "string"
-                      ? ` · ${Math.max(1, Math.round((Date.now() - new Date(s.filters.pending_since as string).getTime()) / 60000))} min`
-                      : ""}
-                  </span>
+                  <RunProgress source={s} />
                 ) : s.last_error ? (
                   <span
                     className="text-[11px] text-corp-danger truncate max-w-xs"
@@ -591,6 +705,7 @@ export default function LeadsPage() {
                     error: {s.last_error}
                   </span>
                 ) : null}
+                <LastRunNote source={s} />
                 <span className="text-[11px] text-corp-muted">
                   {s.last_polled_at
                     ? `polled ${new Date(s.last_polled_at).toLocaleString()}`
