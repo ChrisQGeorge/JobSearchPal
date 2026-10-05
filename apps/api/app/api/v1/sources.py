@@ -277,12 +277,17 @@ class LeadPageOut(BaseModel):
     filter_counts: dict[str, int] = {}
 
 
+class LeadFilterCondition(BaseModel):
+    field: str = "title"
+    keywords: list[str] = []
+
+
 class LeadKeywordFilter(BaseModel):
     id: Optional[str] = None
-    name: str = Field(default="Filter", max_length=60)
-    field: str = "title"
+    name: str = Field(default="Untitled filter", max_length=60)
     mode: str = "off"
-    keywords: list[str] = []
+    match: str = "all"
+    conditions: list[LeadFilterCondition] = []
 
 
 class LeadFiltersIn(BaseModel):
@@ -682,13 +687,13 @@ def _keyword_filter_conds(user_id: int) -> list:
     """Active saved keyword filters → SQL: every include filter must
     match, no exclude filter may match. Each filter checks only its own
     field."""
-    from app.skills.lead_filters import get_filters, keyword_condition
+    from app.skills.lead_filters import filter_condition, get_filters
 
     out = []
     for flt in get_filters(user_id):
         if flt["mode"] == "off":
             continue
-        cond = keyword_condition(getattr(JobLead, flt["field"]), flt["keywords"])
+        cond = filter_condition(JobLead, flt)
         if cond is None:
             continue
         out.append(cond if flt["mode"] == "include" else ~cond)
@@ -731,11 +736,11 @@ async def list_leads_page(
 
     filter_counts: dict[str, int] = {}
     if use_filters:
-        from app.skills.lead_filters import get_filters, keyword_condition
+        from app.skills.lead_filters import filter_condition, get_filters
 
         base_conds = _lead_where(user.id, base)
         for flt in get_filters(user.id):
-            cond = keyword_condition(getattr(JobLead, flt["field"]), flt["keywords"])
+            cond = filter_condition(JobLead, flt)
             if cond is None:
                 filter_counts[flt["id"]] = 0
                 continue

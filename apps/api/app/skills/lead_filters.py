@@ -1,7 +1,13 @@
 """Saved keyword filters for the leads inbox.
 
-Each filter targets ONE field (title / organization / location /
-description) with a list of keywords (any one matches), and has a mode:
+A filter is a named group of CONDITIONS. Each condition targets one
+field (title / organization / location / description) with any number
+of keywords (any one keyword satisfies the condition). The filter's
+`match` decides how its conditions combine:
+  all — every condition must hold (title has "AI" AND company is
+        Anthropic or OpenAI)
+  any — at least one condition holds
+and its mode decides what happens to matching leads:
   off      — saved but not applied
   include  — show only leads that match
   exclude  — hide leads that match
@@ -27,8 +33,10 @@ _PATH = Path("/root/.claude/jsp-lead-filters.json")
 _LOCK = threading.Lock()
 FIELDS = ("title", "organization_name", "location", "description_md")
 MODES = ("off", "include", "exclude")
+MATCHES = ("all", "any")
 MAX_FILTERS = 50
-MAX_KEYWORDS = 200
+MAX_KEYWORDS = 500
+MAX_CONDITIONS = 10
 
 
 def _load() -> dict:
@@ -39,24 +47,38 @@ def _load() -> dict:
         return {}
 
 
-def _clean(f: Any) -> Optional[dict]:
-    if not isinstance(f, dict):
-        return None
-    field = f.get("field") if f.get("field") in FIELDS else "title"
-    mode = f.get("mode") if f.get("mode") in MODES else "off"
+def _clean_keywords(raw: Any) -> list[str]:
     seen: set[str] = set()
-    keywords: list[str] = []
-    for k in f.get("keywords") or []:
+    out: list[str] = []
+    for k in raw or []:
         k = re.sub(r"\s+", " ", str(k)).strip()[:80]
         if k and k.lower() not in seen:
             seen.add(k.lower())
-            keywords.append(k)
+            out.append(k)
+    return out[:MAX_KEYWORDS]
+
+
+def _clean(f: Any) -> Optional[dict]:
+    if not isinstance(f, dict):
+        return None
+    raw_conds = f.get("conditions")
+    if not isinstance(raw_conds, list):
+        # Pre-conditions shape: one field + keywords on the filter itself.
+        raw_conds = [{"field": f.get("field"), "keywords": f.get("keywords")}]
+    conditions = [
+        {
+            "field": c.get("field") if c.get("field") in FIELDS else "title",
+            "keywords": _clean_keywords(c.get("keywords")),
+        }
+        for c in raw_conds
+        if isinstance(c, dict)
+    ][:MAX_CONDITIONS] or [{"field": "title", "keywords": []}]
     return {
         "id": str(f.get("id") or secrets.token_hex(4))[:16],
-        "name": (str(f.get("name") or "").strip() or "Filter")[:60],
-        "field": field,
-        "mode": mode,
-        "keywords": keywords[:MAX_KEYWORDS],
+        "name": (str(f.get("name") or "").strip() or "Untitled filter")[:60],
+        "mode": f.get("mode") if f.get("mode") in MODES else "off",
+        "match": f.get("match") if f.get("match") in MATCHES else "all",
+        "conditions": conditions,
     }
 
 
@@ -103,3 +125,22 @@ def keyword_condition(column, keywords: list[str]):
     if pat is None:
         return None
     return func.coalesce(column, "").regexp_match(pat, flags="i")
+
+
+def filter_condition(model, flt: dict):
+    """The whole filter as one SQLAlchemy boolean (conditions combined
+    with AND for match="all", OR for "any"). Conditions with no
+    keywords are ignored; a filter with none yields None (not applied)."""
+    from sqlalchemy import and_, or_
+
+    parts = [
+        c for c in (
+            keyword_condition(getattr(model, cond["field"]), cond["keywords"])
+            for cond in flt["conditions"]
+        ) if c is not None
+    ]
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    return and_(*parts) if flt["match"] == "all" else or_(*parts)
