@@ -3011,7 +3011,20 @@ async def perform_fetch(
                     and len(desc_text.strip()) >= 300
                     and bool(cov.get("candidate_lines"))
                 )
-                if low_cov or unknown or no_skills:
+                if prefetched is not None and (low_cov or unknown or no_skills):
+                    # Bulk structured imports (Bright Data leads) skip the
+                    # per-job model call: hundreds of promotions would
+                    # mean hundreds of LLM runs (each a Claude subprocess
+                    # in the API container). Skills come from the lexicon;
+                    # Jev scores from the full description regardless.
+                    _emit({
+                        "kind": "system",
+                        "text": (
+                            "Requirements coverage below threshold — "
+                            "skipping the model escalation for this bulk import."
+                        ),
+                    })
+                elif low_cov or unknown or no_skills:
                     esc_lines = (
                         cov["uncovered_lines"]
                         if low_cov

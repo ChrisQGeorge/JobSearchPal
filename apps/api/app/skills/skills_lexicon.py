@@ -29,10 +29,10 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-# In-process cache: (built_at_monotonic, [(compiled_pattern, display_name)]).
-# The lexicon changes slowly (new skills trickle in per parse), so a short
-# TTL keeps fetches from re-querying two tables every time.
-_CACHE: Optional[tuple[float, list[tuple[re.Pattern, str]]]] = None
+# In-process cache: (built_at_monotonic, _Lexicon). The lexicon changes
+# slowly (new skills trickle in per parse), so a short TTL keeps fetches
+# from re-querying two tables every time.
+_CACHE: Optional[tuple[float, "_Lexicon"]] = None
 _CACHE_TTL_SECONDS = 300
 
 # Terms that are technically in catalogs but match half of English.
@@ -233,6 +233,7 @@ def learn_heading_markers(
 
 
 def _compile_term(term: str) -> Optional[re.Pattern]:
+    """Regex for terms the token matcher can't represent (".NET", "R&D")."""
     t = term.strip()
     if len(t) < 2 or len(t) > 64:
         return None
@@ -251,7 +252,90 @@ def _compile_term(term: str) -> Optional[re.Pattern]:
         return None
 
 
-async def _build_lexicon() -> list[tuple[re.Pattern, str]]:
+# --- Token matcher -----------------------------------------------------------
+#
+# One regex per lexicon term (thousands) scanned across every description
+# was CPU-bound on the event loop — a bulk "Add to tracker" of Bright Data
+# leads ran it back to back in every queue slot and starved the API. The
+# lexicon is now a dict of normalized word sequences: tokenize the text
+# once and look up every 1..N-word window — O(tokens), not O(terms × text).
+#
+# Two token streams give the old whole-word semantics:
+#   compound tokens keep internal . / ' - joins: "node.js", "ci/cd", "c++"
+#   atomic tokens split those: "c++/java" -> "c++", "java"
+# so "Java" still matches inside "C++/Java" and "Sr" never matches
+# "Srinivas". Terms that don't survive tokenization unchanged (".NET",
+# "R&D") fall back to a regex — there are few of them.
+
+_COMPOUND_TOKEN = re.compile(r"[a-z0-9+#]+(?:[./'\-][a-z0-9+#]+)*")
+_ATOMIC_TOKEN = re.compile(r"[a-z0-9+#]+")
+_MAX_TERM_WORDS = 6
+
+
+class _Lexicon:
+    def __init__(self) -> None:
+        self.terms: dict[str, str] = {}   # "machine learning" -> "Machine Learning"
+        self.odd: list[tuple[re.Pattern, str]] = []
+        self.max_n = 1
+
+    def add(self, display: str) -> None:
+        t = display.strip()
+        low = re.sub(r"\s+", " ", t.lower())
+        if len(t) < 2 or len(t) > 64 or low in _STOPWORDS:
+            return
+        toks = _COMPOUND_TOKEN.findall(low)
+        key = " ".join(toks)
+        if toks and key == low and len(toks) <= _MAX_TERM_WORDS:
+            self.terms.setdefault(key, t)
+            self.max_n = max(self.max_n, len(toks))
+        else:
+            pat = _compile_term(t)
+            if pat is not None:
+                self.odd.append((pat, t))
+
+    def __len__(self) -> int:
+        return len(self.terms) + len(self.odd)
+
+    def _streams(self, low: str):
+        for rx in (_COMPOUND_TOKEN, _ATOMIC_TOKEN):
+            yield [(m.group(0), m.start()) for m in rx.finditer(low)]
+
+    def find(self, text: str) -> dict[str, int]:
+        """{display term: first character offset} for every term present."""
+        low = text.lower()
+        hits: dict[str, int] = {}
+        for toks in self._streams(low):
+            words = [w for w, _ in toks]
+            for i in range(len(words)):
+                for n in range(1, min(self.max_n, len(words) - i) + 1):
+                    disp = self.terms.get(" ".join(words[i:i + n]))
+                    if disp is not None and (disp not in hits or toks[i][1] < hits[disp]):
+                        hits[disp] = toks[i][1]
+        for pat, disp in self.odd:
+            m = pat.search(text)
+            if m and (disp not in hits or m.start() < hits[disp]):
+                hits[disp] = m.start()
+        return hits
+
+    def any_hit(self, text: str) -> bool:
+        low = text.lower()
+        for toks in self._streams(low):
+            words = [w for w, _ in toks]
+            for i in range(len(words)):
+                for n in range(1, min(self.max_n, len(words) - i) + 1):
+                    if " ".join(words[i:i + n]) in self.terms:
+                        return True
+        return any(pat.search(text) for pat, _ in self.odd)
+
+
+def make_lexicon(terms) -> _Lexicon:
+    lex = _Lexicon()
+    for t in terms:
+        lex.add(str(t))
+    return lex
+
+
+async def _build_lexicon() -> _Lexicon:
     from sqlalchemy import select
 
     from app.core.database import SessionLocal
@@ -288,16 +372,15 @@ async def _build_lexicon() -> list[tuple[re.Pattern, str]]:
                     for s in lst:
                         _add(s)
 
-    out: list[tuple[re.Pattern, str]] = []
-    for norm, display in display_by_norm.items():
-        pat = _compile_term(display)
-        if pat is not None:
-            out.append((pat, display))
-    log.debug("Skills lexicon built: %d terms", len(out))
+    out = make_lexicon(display_by_norm.values())
+    log.debug(
+        "Skills lexicon built: %d token terms, %d regex terms",
+        len(out.terms), len(out.odd),
+    )
     return out
 
 
-async def get_lexicon() -> list[tuple[re.Pattern, str]]:
+async def get_lexicon() -> _Lexicon:
     global _CACHE
     now = time.monotonic()
     if _CACHE is not None and now - _CACHE[0] < _CACHE_TTL_SECONDS:
@@ -449,9 +532,7 @@ async def assess_requirements_coverage(text: str) -> dict:
         if ctx != "req" and not _cue(content):
             continue
         total += 1
-        hit = _NONSKILL_REQ_RE.search(content) is not None or any(
-            pat.search(content) for pat, _ in lexicon
-        )
+        hit = _NONSKILL_REQ_RE.search(content) is not None or lexicon.any_hit(content)
         if hit:
             covered += 1
         elif len(uncovered) < 10:
@@ -486,14 +567,11 @@ async def extract_skills_from_text(
 
     required: list[str] = []
     nice: list[str] = []
-    for pat, display in lexicon:
-        hit = pat.search(text)
-        if hit is None:
-            continue
-        if nice_start is not None and hit.start() >= nice_start:
+    # In order of first appearance in the posting.
+    for display, pos in sorted(lexicon.find(text).items(), key=lambda kv: kv[1]):
+        if nice_start is not None and pos >= nice_start:
             if len(nice) < 20:
                 nice.append(display)
-        else:
-            if len(required) < 30:
-                required.append(display)
+        elif len(required) < 30:
+            required.append(display)
     return required, nice

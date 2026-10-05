@@ -944,23 +944,60 @@ async def lead_bulk_action(
         await db.commit()
         return LeadActionOut(dismissed=result.rowcount or 0)
 
+    # Lean select: ids + url + a DB-side "is this a Bright Data LinkedIn
+    # record" flag — never the description or the multi-KB raw payload.
     rows = (
         await db.execute(
-            select(JobLead)
-            .options(defer(JobLead.description_md))
+            select(
+                JobLead.id,
+                JobLead.title,
+                JobLead.source_url,
+                func.json_extract(JobLead.raw_payload, "$.job_posting_id")
+                .isnot(None)
+                .label("is_bd_linkedin"),
+            )
             .where(*conds, JobLead.state != "promoted")
             .order_by(JobLead.first_seen_at.desc(), JobLead.id.desc())
             .limit(MAX_PROMOTE_PER_REQUEST + 1)
         )
-    ).scalars().all()
+    ).all()
     more = len(rows) > MAX_PROMOTE_PER_REQUEST
     rows = rows[:MAX_PROMOTE_PER_REQUEST]
     found_ids = {r.id for r in rows}
     failed = [i for i in payload.ids if i not in found_ids] if payload.ids else []
-    promoted = 0
-    for lead in rows:
-        await _promote_lead(db, lead, user)
-        promoted += 1
+
+    with_url = [r for r in rows if r.source_url]
+    db.add_all([
+        JobFetchQueue(
+            user_id=user.id,
+            kind="fetch",
+            label=f"Lead → {r.title[:80]}"[:512],
+            url=r.source_url,
+            desired_status=PROMOTED_STATUS,
+            payload=(
+                {"lead_id": r.id, "prefetched": "brightdata_linkedin"}
+                if r.is_bd_linkedin else {"lead_id": r.id}
+            ),
+            state="queued",
+        )
+        for r in with_url
+    ])
+    if with_url:
+        await db.execute(
+            update(JobLead)
+            .where(JobLead.id.in_([r.id for r in with_url]))
+            .values(state="promoted")
+            .execution_options(synchronize_session=False)
+        )
+    # Rare: no URL to fetch — build the tracked job from the stored body
+    # (needs the full row, so these go through the per-lead path).
+    no_url_ids = [r.id for r in rows if not r.source_url]
+    if no_url_ids:
+        for lead in (
+            await db.execute(select(JobLead).where(JobLead.id.in_(no_url_ids)))
+        ).scalars().all():
+            await _promote_lead(db, lead, user)
+    promoted = len(rows)
     await db.commit()
     return LeadActionOut(
         promoted=promoted,
