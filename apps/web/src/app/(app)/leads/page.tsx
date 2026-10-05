@@ -76,6 +76,20 @@ type BdInputRow = {
 };
 
 const BD_KEYWORD_KIND = "brightdata_keyword";
+
+// A Bright Data run was triggered and is still being collected by the
+// background poller — normal for keyword discovery, not an error.
+const isCollecting = (s: Source) =>
+  typeof s.filters?.pending_snapshot_id === "string" && !!s.filters.pending_snapshot_id;
+
+function Spinner() {
+  return (
+    <svg className="animate-spin h-3 w-3 shrink-0" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" className="opacity-25" />
+      <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+    </svg>
+  );
+}
 const BD_TIME_RANGES = ["Past 24 hours", "Past week", "Past month", "Any time"];
 // LinkedIn's own filter labels — Bright Data passes them through.
 const BD_COLUMNS: {
@@ -301,6 +315,24 @@ export default function LeadsPage() {
   useEffect(() => {
     loadAll();
   }, []);
+
+  // While a Bright Data run is still collecting, re-check every 15s
+  // (quietly — no loading flash) and pull the new leads once it lands.
+  const pendingIds = sources.filter(isCollecting).map((s) => s.id).join(",");
+  useEffect(() => {
+    if (!pendingIds) return;
+    const t = setInterval(async () => {
+      try {
+        const s = await api.get<Source[]>("/api/v1/job-sources");
+        setSources(s);
+        if (!s.some(isCollecting)) void loadLeads();
+      } catch {
+        /* next tick retries */
+      }
+    }, 15000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingIds]);
 
   useEffect(() => {
     loadLeads();
@@ -540,7 +572,18 @@ export default function LeadsPage() {
                     {s.new_lead_count} new
                   </span>
                 ) : null}
-                {s.last_error ? (
+                {isCollecting(s) ? (
+                  <span
+                    className="text-[11px] text-corp-accent inline-flex items-center gap-1.5"
+                    title={`Bright Data is still gathering results (snapshot ${String(s.filters?.pending_snapshot_id)}). Large searches can take several minutes; the app checks every minute and imports them automatically.`}
+                  >
+                    <Spinner />
+                    Collecting from Bright Data
+                    {typeof s.filters?.pending_since === "string"
+                      ? ` · ${Math.max(1, Math.round((Date.now() - new Date(s.filters.pending_since as string).getTime()) / 60000))} min`
+                      : ""}
+                  </span>
+                ) : s.last_error ? (
                   <span
                     className="text-[11px] text-corp-danger truncate max-w-xs"
                     title={s.last_error}
@@ -560,9 +603,11 @@ export default function LeadsPage() {
                   type="button"
                   className="jsp-btn-ghost text-xs"
                   onClick={() => pollNow(s.id)}
-                  disabled={polling === s.id}
+                  disabled={polling === s.id || isCollecting(s)}
                   title={
-                    s.kind === BD_KEYWORD_KIND
+                    isCollecting(s)
+                      ? "A run is already being collected — results import automatically when it finishes."
+                      : s.kind === BD_KEYWORD_KIND
                       ? `Run the saved keyword query now (${
                           (s.filters?.time_range_override as string) ||
                           "each row's own time range"
@@ -572,7 +617,9 @@ export default function LeadsPage() {
                 >
                   {polling === s.id
                     ? "…"
-                    : s.kind === BD_KEYWORD_KIND
+                    : isCollecting(s)
+                      ? "Collecting…"
+                      : s.kind === BD_KEYWORD_KIND
                       ? "Import now"
                       : "Poll now"}
                 </button>

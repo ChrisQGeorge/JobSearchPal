@@ -32,6 +32,9 @@ log = logging.getLogger(__name__)
 
 # Wake every minute. Per-source schedule is enforced inside the tick.
 POLL_TICK_SECONDS = 60
+# Large Bright Data discovery runs can take tens of minutes; past this a
+# parked snapshot is abandoned with an error instead of polled forever.
+PENDING_GIVE_UP = timedelta(hours=3)
 
 
 def _now() -> datetime:
@@ -138,12 +141,29 @@ async def poll_source(
         # last_polled_at is deliberately NOT bumped — the source stays
         # "due", so the next poller tick (60s) picks collection back up.
         f = dict(source.filters or {})
+        if f.get("pending_snapshot_id") != sp.snapshot_id:
+            f["pending_since"] = _now().isoformat(timespec="seconds")
         f["pending_snapshot_id"] = sp.snapshot_id
+        try:
+            started = datetime.fromisoformat(f["pending_since"])
+        except (KeyError, ValueError):
+            started = _now()
+        if _now() - started > PENDING_GIVE_UP:
+            f.pop("pending_snapshot_id", None)
+            f.pop("pending_since", None)
+            source.filters = f
+            source.last_polled_at = _now()
+            msg = (
+                f"Bright Data snapshot {sp.snapshot_id} still wasn't ready after "
+                f"{int(PENDING_GIVE_UP.total_seconds() // 3600)}h — gave up. Check "
+                "the run in the Bright Data dashboard, or try a smaller query."
+            )
+            source.last_error = msg
+            return 0, msg
         source.filters = f
-        source.last_error = (
-            f"Bright Data is still collecting (snapshot {sp.snapshot_id}) "
-            "— resuming automatically."
-        )[:1000]
+        # Not an error — the UI shows a "collecting" spinner off
+        # pending_snapshot_id instead.
+        source.last_error = None
         log.info(
             "source %s/%s snapshot pending: %s",
             source.kind, source.slug_or_url, sp.snapshot_id,
@@ -158,6 +178,7 @@ async def poll_source(
         ):
             f = dict(source.filters)
             f.pop("pending_snapshot_id", None)
+            f.pop("pending_since", None)
             source.filters = f
         # Format a more actionable message for the most common failure
         # modes — httpx 4xx, transport errors, bot-gate interstitials.
@@ -240,6 +261,7 @@ async def poll_source(
     ):
         f = dict(source.filters)
         f.pop("pending_snapshot_id", None)
+        f.pop("pending_since", None)
         source.filters = f
 
     now = _now()
@@ -344,14 +366,20 @@ async def _due_sources(db: AsyncSession) -> list[JobSource]:
     now = _now()
     rows = (
         await db.execute(
-            select(JobSource).where(
-                JobSource.enabled.is_(True),
-                JobSource.deleted_at.is_(None),
-            )
+            select(JobSource).where(JobSource.deleted_at.is_(None))
         )
     ).scalars().all()
     due: list[JobSource] = []
     for s in rows:
+        # A parked Bright Data snapshot is collected on the very next
+        # tick regardless of schedule — and even when the source is
+        # disabled, since a manual "Import now" started it and the run
+        # is already paid for.
+        if isinstance(s.filters, dict) and s.filters.get("pending_snapshot_id"):
+            due.append(s)
+            continue
+        if not s.enabled:
+            continue
         if s.last_polled_at is None:
             due.append(s)
             continue

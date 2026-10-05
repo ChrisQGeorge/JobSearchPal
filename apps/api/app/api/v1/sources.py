@@ -444,7 +444,14 @@ async def update_source(
     data = payload.model_dump(exclude_unset=True)
     if "filters" in data:
         if src.kind == "brightdata_keyword":
-            src.filters = _prepare_keyword_filters(data["filters"])
+            new_filters = _prepare_keyword_filters(data["filters"])
+            # Editing mid-run must not drop a parked (already paid-for)
+            # snapshot — the editor doesn't round-trip these keys.
+            old = src.filters if isinstance(src.filters, dict) else {}
+            for k in ("pending_snapshot_id", "pending_since"):
+                if old.get(k):
+                    new_filters[k] = old[k]
+            src.filters = new_filters
         elif data["filters"] is None:
             src.filters = None
         else:
