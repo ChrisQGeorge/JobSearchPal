@@ -9,6 +9,80 @@
 // edit and applied to paging and "select all matching".
 
 import { useState } from "react";
+import { api } from "@/lib/api";
+
+type TestResult = { field: FilterField; database: boolean | null; python: boolean | null }[];
+
+// "Try a title against this filter" — evaluated by the database's regex
+// engine (what the inbox uses) and the import-time matcher.
+function FilterTester({ filter }: { filter: KeywordFilter }) {
+  const [text, setText] = useState("");
+  const [res, setRes] = useState<TestResult | null>(null);
+  const [busy, setBusy] = useState(false);
+  async function run() {
+    if (!text.trim()) return;
+    setBusy(true);
+    try {
+      const out = await api.post<{ conditions: TestResult }>("/api/v1/job-leads/filters/test", {
+        filter,
+        text,
+      });
+      setRes(out.conditions);
+    } catch {
+      setRes(null);
+    } finally {
+      setBusy(false);
+    }
+  }
+  const active = res?.filter((r) => r.database !== null) ?? [];
+  const overall =
+    active.length === 0
+      ? null
+      : filter.match === "all"
+        ? active.every((r) => r.database)
+        : active.some((r) => r.database);
+  return (
+    <div className="pl-6 flex flex-wrap items-center gap-1.5 text-[11px]">
+      <input
+        className="jsp-input text-xs py-0.5 flex-1 min-w-[12rem] max-w-md"
+        placeholder="Test: paste a job title / company…"
+        value={text}
+        onChange={(e) => {
+          setText(e.target.value);
+          setRes(null);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            void run();
+          }
+        }}
+      />
+      <button type="button" className="jsp-btn-ghost text-[11px] py-0.5" onClick={() => void run()} disabled={busy}>
+        {busy ? "…" : "Test"}
+      </button>
+      {res ? (
+        <>
+          <span className={overall ? "text-corp-ok" : "text-corp-muted"}>
+            {overall === null ? "no keywords" : overall ? "✓ filter matches" : "✗ no match"}
+          </span>
+          {res.length > 1
+            ? res.map((r, i) => (
+                <span key={i} className="text-corp-muted">
+                  · {FIELD_LABELS[r.field]} {r.database === null ? "—" : r.database ? "✓" : "✗"}
+                </span>
+              ))
+            : null}
+          {res.some((r) => r.database !== null && r.database !== r.python) ? (
+            <span className="text-corp-danger" title="The database and the import-time matcher disagree — please report this text.">
+              (engines disagree)
+            </span>
+          ) : null}
+        </>
+      ) : null}
+    </div>
+  );
+}
 
 export type FilterField = "title" | "organization_name" | "location" | "description_md";
 export type FilterCondition = { field: FilterField; keywords: string[] };
@@ -324,6 +398,7 @@ export function KeywordFilters({
                     </label>
                   ) : null}
                 </div>
+                <FilterTester filter={f} />
               </>
             ) : null}
           </div>

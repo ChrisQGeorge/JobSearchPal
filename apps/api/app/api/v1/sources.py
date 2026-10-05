@@ -708,6 +708,40 @@ async def get_lead_filters(user: User = Depends(get_current_user)) -> dict:
     return {"filters": get_filters(user.id)}
 
 
+class LeadFilterTestIn(BaseModel):
+    filter: LeadKeywordFilter
+    text: str = Field(max_length=5000)
+
+
+@leads_router.post("/filters/test")
+async def test_lead_filter(
+    payload: LeadFilterTestIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Evaluate a filter's conditions against sample text using the
+    DATABASE's regex engine — the same one the inbox uses — and the
+    import-time Python matcher, so any disagreement is visible. The text
+    is tested against every condition regardless of its field."""
+    from sqlalchemy import literal
+
+    from app.skills.lead_filters import _clean, compile_matcher, keyword_pattern
+
+    flt = _clean(payload.filter.model_dump())
+    out = []
+    for cond in flt["conditions"]:
+        pat = keyword_pattern(cond["keywords"])
+        if pat is None:
+            out.append({"field": cond["field"], "database": None, "python": None})
+            continue
+        db_hit = (
+            await db.execute(select(literal(payload.text).regexp_match(pat, flags="i")))
+        ).scalar_one()
+        py_hit = compile_matcher({**flt, "conditions": [cond]})({cond["field"]: payload.text})
+        out.append({"field": cond["field"], "database": bool(db_hit), "python": py_hit})
+    return {"conditions": out}
+
+
 @leads_router.put("/filters")
 async def put_lead_filters(
     payload: LeadFiltersIn, user: User = Depends(get_current_user)

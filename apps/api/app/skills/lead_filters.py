@@ -106,7 +106,11 @@ def keyword_pattern(keywords: list[str]) -> Optional[str]:
     """One whole-word alternation for all keywords. Boundaries are
     "no letter/digit on either side" rather than \\b, so keywords with
     punctuation (C++, .NET, Sr.) still match; spaces inside a keyword
-    match any whitespace run."""
+    match any whitespace run.
+
+    Written WITHOUT lookaround assertions — (^|non-alnum) … (non-alnum|$)
+    — so it means the same thing in Python's re and in MySQL's ICU
+    engine; lookbehind is where regex engines disagree most."""
     parts = []
     for k in keywords:
         k = k.strip()
@@ -116,7 +120,7 @@ def keyword_pattern(keywords: list[str]) -> Optional[str]:
         parts.append(esc)
     if not parts:
         return None
-    return r"(?<![A-Za-z0-9])(" + "|".join(parts) + r")(?![A-Za-z0-9])"
+    return r"(^|[^A-Za-z0-9])(" + "|".join(parts) + r")([^A-Za-z0-9]|$)"
 
 
 def keyword_condition(column, keywords: list[str]):
