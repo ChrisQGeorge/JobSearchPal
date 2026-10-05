@@ -156,6 +156,15 @@ async def get_user_secret(
         plain = decrypt_secret(row.encrypted_secret)
     except Exception:
         return None
-    row.last_used_at = datetime.now(tz=timezone.utc)
-    await db.commit()
+    # Touch last_used_at at most once a minute. Bulk work (hundreds of
+    # Jev score tasks) otherwise issued an UPDATE + commit on the same
+    # row for every call — and the commit also flushed whatever the
+    # CALLER had pending in its session, a surprising side effect.
+    now = datetime.now(tz=timezone.utc)
+    last = row.last_used_at
+    if last is not None and last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    if last is None or (now - last).total_seconds() > 60:
+        row.last_used_at = now
+        await db.commit()
     return plain

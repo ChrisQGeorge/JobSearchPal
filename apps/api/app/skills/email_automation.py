@@ -362,7 +362,7 @@ async def poll_user(user_id: int) -> dict:
     from sqlalchemy import select
 
     from app.api.v1.api_credentials import get_user_secret
-    from app.core.database import SessionLocal
+    from app.core.database import BgSessionLocal as SessionLocal
     from app.models.emails import ParsedEmail
     from app.models.jobs import JobFetchQueue, Organization, TrackedJob
 
@@ -572,6 +572,8 @@ async def jev_triage(db, row) -> tuple[Optional[dict], dict]:
     key = await get_user_secret(db, row.user_id, JEV_PROVIDER)
     if not key:
         return None, {"jev": "not configured"}
+    # Release the pooled connection while waiting on Jev.
+    await db.commit()
     try:
         probs = await classify_email(key, email_state={
             "email": {

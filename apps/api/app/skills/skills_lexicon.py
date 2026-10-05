@@ -338,7 +338,7 @@ def make_lexicon(terms) -> _Lexicon:
 async def _build_lexicon() -> _Lexicon:
     from sqlalchemy import select
 
-    from app.core.database import SessionLocal
+    from app.core.database import BgSessionLocal as SessionLocal
     from app.models.history import Skill
     from app.models.jobs import TrackedJob
 

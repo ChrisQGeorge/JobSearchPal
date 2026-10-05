@@ -34,7 +34,7 @@ from datetime import datetime, time as _dt_time, timedelta, timezone
 from sqlalchemy import and_, delete as sa_delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import SessionLocal
+from app.core.database import BgSessionLocal as SessionLocal  # background pool
 from app.models.jobs import JobFetchQueue, TrackedJob
 
 log = logging.getLogger(__name__)
@@ -1073,6 +1073,9 @@ async def _handle_score(item: JobFetchQueue) -> None:
         )
 
         label = row.label or f"Score: {job.title}"
+        # Release the pooled connection for the up-to-180s model call
+        # (nothing pending; loaded objects stay usable).
+        await db.commit()
         try:
             # item_id = f"queue:{row.id}" is the canonical convention for any
             # bus event sourced from a DB task row. `_fetch_queue_to_row`
@@ -2180,16 +2183,23 @@ async def run_forever() -> None:
                 log.exception("Queue worker: periodic prune failed")
 
         # Wait for an open slot if we're at capacity. Re-read the limit
-        # every cycle so changes from the UI apply immediately.
-        if len(running) >= _ws.get_max_parallel():
-            # Block on whichever task finishes first — no busy poll.
+        # every cycle so changes from the UI apply immediately. The
+        # effective limit shrinks (down to 1) while the event loop is
+        # laggy or page requests are in flight — background work slows
+        # down so browsing never does.
+        from app.core.responsiveness import background_capacity, yield_to_requests
+
+        if len(running) >= background_capacity(_ws.get_max_parallel()):
+            # Block on whichever task finishes first, re-checking capacity
+            # every second (it rises again once browsing goes quiet).
             done, _pending = await asyncio.wait(
-                running, return_when=asyncio.FIRST_COMPLETED
+                running, timeout=1.0, return_when=asyncio.FIRST_COMPLETED
             )
             for t in done:
                 running.discard(t)
             continue
 
+        await yield_to_requests()
         try:
             async with SessionLocal() as db:
                 item = await _claim_next(db)

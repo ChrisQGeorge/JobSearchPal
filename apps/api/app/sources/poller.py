@@ -24,7 +24,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import SessionLocal
+from app.core.database import BgSessionLocal as SessionLocal  # background pool
 from app.models.sources import JobLead, JobSource
 from app.sources import ADAPTERS
 

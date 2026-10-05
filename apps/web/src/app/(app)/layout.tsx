@@ -1,3 +1,4 @@
+import { ApiErrorBanner } from "@/components/ApiErrorBanner";
 import { CommandPalette } from "@/components/CommandPalette";
 import { CompanionDock } from "@/components/CompanionDock";
 import { HealthGate } from "@/components/HealthGate";
@@ -22,6 +23,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
         </main>
         <CompanionDock />
         <CommandPalette />
+        <ApiErrorBanner />
       </div>
     </HealthGate>
   );

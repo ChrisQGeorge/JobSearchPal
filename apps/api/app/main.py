@@ -40,16 +40,20 @@ log = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     # Launch the background JobFetchQueue worker. Single task, single
     # container — if we ever scale out we'll need real coordination.
+    from app.core.responsiveness import monitor_loop
+
+    monitor_task = asyncio.create_task(monitor_loop(), name="loop-monitor")
     task = asyncio.create_task(run_queue_worker(), name="job-fetch-queue")
     poller_task = asyncio.create_task(run_source_poller(), name="source-poller")
     gmail_task = asyncio.create_task(run_gmail_poller(), name="gmail-poller")
     log.info("Started job-fetch-queue, source-poller and gmail-poller workers")
+    tasks = (monitor_task, task, poller_task, gmail_task)
     try:
         yield
     finally:
-        for t in (task, poller_task, gmail_task):
+        for t in tasks:
             t.cancel()
-        for t in (task, poller_task, gmail_task):
+        for t in tasks:
             try:
                 await t
             except (asyncio.CancelledError, Exception):
@@ -113,6 +117,24 @@ else:
         # cross-origin fetches (PDF export).
         expose_headers=["Content-Disposition"],
     )
+
+
+from app.core import errors as _errors  # noqa: E402
+from app.core.responsiveness import InflightCounter  # noqa: E402
+
+# Order: added last = outermost. RequestContext wraps everything so even
+# CORS / counter errors carry a request id.
+app.add_middleware(InflightCounter)
+_errors.install(app)
+
+
+@app.get("/health/deep", tags=["health"])
+async def deep_health() -> dict:
+    """Diagnostics for "the app feels stuck": event-loop lag + stall
+    history (with the blocking stack), DB pool usage for web vs
+    background, DB ping, queue backlog by kind/state, worker parallelism
+    (setting vs. what the throttle allows right now), memory."""
+    return await _errors.deep_health()
 
 
 @app.get("/health", tags=["health"])

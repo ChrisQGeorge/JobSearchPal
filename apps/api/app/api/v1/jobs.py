@@ -2148,6 +2148,12 @@ async def run_jev_score(
         "candidate_profile": candidate_profile,
         "candidate_preferences": candidate_preferences,
     }
+    # End the read transaction BEFORE the HTTP call so this session's
+    # pooled DB connection is returned while we wait on Jev (up to 60s).
+    # With many parallel score tasks, holding it exhausted the pool and
+    # every API request failed. expire_on_commit=False keeps the loaded
+    # objects usable; callers have no pending writes at this point.
+    await db.commit()
     return await score_job_fit(api_key, job_state=job_state)
 
 
@@ -3285,7 +3291,7 @@ async def perform_fetch(
         # fetch and exhausted the 100-slot pool when a few users hit
         # /fetch-from-url + the queue worker at once. With the session
         # local to this block, the connection is in-and-out in a single ms.
-        from app.core.database import SessionLocal as _SL
+        from app.core.database import BgSessionLocal as _SL
 
         async with _SL() as _org_db:
             org = (

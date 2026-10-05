@@ -98,6 +98,50 @@ SessionLocal = async_sessionmaker(
     autoflush=False,
 )
 
+# Background work (queue worker, source poller, Gmail poller, import
+# pipeline) gets its OWN, smaller pool. However many tasks run, they
+# queue on this pool and can never take the connections that page loads
+# and API requests use — browsing stays responsive by construction.
+bg_engine = create_async_engine(
+    settings.async_database_url,
+    pool_pre_ping=True,
+    pool_recycle=1800,
+    pool_size=8,
+    max_overflow=4,
+    # Background callers can wait for a connection; nothing user-facing
+    # is blocked on them.
+    pool_timeout=120,
+    pool_use_lifo=True,
+    connect_args={"connect_timeout": 10},
+    echo=False,
+)
+bg_engine.sync_engine.dialect.do_ping = types.MethodType(
+    _aiomysql_do_ping, bg_engine.sync_engine.dialect
+)
+
+BgSessionLocal = async_sessionmaker(
+    bind=bg_engine,
+    expire_on_commit=False,
+    autoflush=False,
+)
+
+
+def pool_status() -> dict:
+    """Checked-out / idle counts for both pools (for /health/deep)."""
+    out = {}
+    for name, eng in (("web", engine), ("background", bg_engine)):
+        p = eng.sync_engine.pool
+        try:
+            out[name] = {
+                "size": p.size(),
+                "checked_out": p.checkedout(),
+                "idle": p.checkedin(),
+                "overflow": p.overflow(),
+            }
+        except Exception:  # pragma: no cover — pool impl without stats
+            out[name] = {"status": p.status()}
+    return out
+
 
 async def get_db() -> AsyncIterator[AsyncSession]:
     async with SessionLocal() as session:

@@ -20,14 +20,35 @@ export function apiUrl(path: string): string {
   return path.startsWith("http") ? path : `${resolveBaseUrl()}${path}`;
 }
 
+/** Structured error block every API error response carries (see
+ * apps/api/app/core/errors.py). */
+export type ApiErrorInfo = {
+  code: string;
+  message: string;
+  hint?: string | null;
+  request_id?: string | null;
+  path?: string | null;
+};
+
 export class ApiError extends Error {
   status: number;
   detail?: unknown;
-  constructor(status: number, message: string, detail?: unknown) {
+  info: ApiErrorInfo;
+  constructor(status: number, message: string, detail?: unknown, info?: ApiErrorInfo) {
     super(message);
     this.status = status;
     this.detail = detail;
+    this.info = info ?? { code: `HTTP_${status}`, message };
   }
+}
+
+/** Fired on window for server-side failures (5xx / unreachable) so the
+ * app-wide error banner can show what went wrong. */
+export const API_ERROR_EVENT = "jsp:api-error";
+
+function emitApiError(status: number, info: ApiErrorInfo) {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new CustomEvent(API_ERROR_EVENT, { detail: { status, ...info } }));
 }
 
 async function request<T>(
@@ -35,24 +56,65 @@ async function request<T>(
   options: RequestInit = {},
 ): Promise<T> {
   const url = path.startsWith("http") ? path : `${resolveBaseUrl()}${path}`;
+  const method = (options.method || "GET").toUpperCase();
   const headers = new Headers(options.headers);
   if (options.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  const res = await fetch(url, {
-    ...options,
-    headers,
-    credentials: "include",
-    cache: "no-store",
-  });
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      ...options,
+      headers,
+      credentials: "include",
+      cache: "no-store",
+    });
+  } catch (e) {
+    const info: ApiErrorInfo = {
+      code: "NETWORK_ERROR",
+      message: `Couldn't reach the server (${e instanceof Error ? e.message : "network error"}).`,
+      hint: "Check that the server is up and your connection to it works.",
+      path: `${method} ${path}`,
+    };
+    emitApiError(0, info);
+    throw new ApiError(0, info.message, undefined, info);
+  }
   if (!res.ok) {
     let detail: unknown = undefined;
     try {
       detail = await res.json();
     } catch {
-      /* ignore */
+      /* non-JSON body */
     }
-    throw new ApiError(res.status, `HTTP ${res.status}`, detail);
+    const block =
+      detail && typeof detail === "object" && "error" in detail
+        ? ((detail as { error: ApiErrorInfo }).error as ApiErrorInfo)
+        : null;
+    let info: ApiErrorInfo;
+    if (block?.code) {
+      info = { ...block, path: block.path ?? `${method} ${path}` };
+    } else if (res.status >= 500) {
+      // No structured body: the request never got an answer from the API
+      // process — the web server's proxy produced this status itself.
+      info = {
+        code: "API_UNREACHABLE",
+        message: `The API server didn't answer (proxy returned ${res.status}).`,
+        hint:
+          "The API is down, restarting, or too busy to respond. Open /health/deep " +
+          "for diagnostics, or check `docker logs jsp-api`.",
+        request_id: res.headers.get("x-request-id"),
+        path: `${method} ${path}`,
+      };
+    } else {
+      const d = (detail as { detail?: unknown } | undefined)?.detail;
+      info = {
+        code: `HTTP_${res.status}`,
+        message: typeof d === "string" ? d : `HTTP ${res.status}`,
+        path: `${method} ${path}`,
+      };
+    }
+    if (res.status >= 500) emitApiError(res.status, info);
+    throw new ApiError(res.status, `${info.code}: ${info.message}`, detail, info);
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
