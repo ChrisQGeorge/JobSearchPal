@@ -54,15 +54,31 @@ DEFAULT_DATASET_GLASSDOOR = "gd_l7j0bx501ockwldaqf"
 
 # Input-row shape for keyword discovery — matches the CSV header
 # Bright Data's dashboard exports for the LinkedIn jobs dataset:
-#   location,keyword,country,time_range,company,location_radius
+#   location,keyword,country,time_range,job_type,experience_level,remote,
+#   company,location_radius   (the three middle columns are optional)
 KEYWORD_DISCOVERY_FIELDS = (
     "location",
     "keyword",
     "country",
     "time_range",
+    "job_type",
+    "experience_level",
+    "remote",
     "company",
     "location_radius",
 )
+# LinkedIn's own filter labels (Bright Data passes them through; the
+# docs confirm the `remote` set). Matching is case-insensitive and
+# values are canonicalized; anything else is sent as typed.
+KEYWORD_ENUMS: dict[str, tuple[str, ...]] = {
+    "remote": ("Remote", "Hybrid", "On-site"),
+    "job_type": ("Full-time", "Part-time", "Contract", "Temporary",
+                 "Internship", "Volunteer", "Other"),
+    "experience_level": ("Internship", "Entry level", "Associate",
+                         "Mid-Senior level", "Director", "Executive"),
+    "time_range": ("Past 24 hours", "Past week", "Past month", "Any time"),
+}
+_REMOTE_POLICY = {"remote": "remote", "hybrid": "hybrid", "on-site": "onsite", "onsite": "onsite"}
 KEYWORD_TIME_RANGES = ("Past 24 hours", "Past week", "Past month", "Any time")
 MAX_KEYWORD_INPUT_ROWS = 50
 
@@ -90,6 +106,11 @@ def clean_keyword_inputs(rows: Any) -> list[dict[str, str]]:
             k: str(r.get(k) if r.get(k) is not None else "").strip()[:200]
             for k in KEYWORD_DISCOVERY_FIELDS
         }
+        for k, allowed in KEYWORD_ENUMS.items():
+            canon = {a.lower().replace(" ", "").replace("-", ""): a for a in allowed}
+            v = row[k].lower().replace(" ", "").replace("-", "")
+            if v in canon:
+                row[k] = canon[v]
         if not row["keyword"]:
             continue
         out.append(row)
@@ -321,6 +342,16 @@ def _remote_from_record(rec: dict, location: str) -> Optional[str]:
             return "hybrid"
         if "on-site" in v or "onsite" in v:
             return "onsite"
+    # A query filtered by LinkedIn's own workplace filter (the `remote`
+    # input column) only returns matching jobs, and each record echoes
+    # the input row that found it.
+    di = rec.get("discovery_input")
+    if not isinstance(di, dict):
+        di = (rec.get("input") or {}).get("discovery_input") if isinstance(rec.get("input"), dict) else None
+    if isinstance(di, dict):
+        tag = _REMOTE_POLICY.get(str(di.get("remote") or "").strip().lower())
+        if tag:
+            return tag
     if _re.search(r"\bremote\b", location or "", _re.I):
         return "remote"
     return None
@@ -434,23 +465,7 @@ def _to_lead_linkedin(rec: dict[str, Any]) -> Optional[dict[str, Any]]:
     else:
         body_html = rec.get("job_summary") or rec.get("description") or rec.get("job_description") or ""
         body_md = html_to_md(body_html) if body_html else None
-    workplace = (
-        rec.get("workplace_type")
-        or rec.get("job_workplace_type")
-        or rec.get("remote")
-    )
-    if isinstance(workplace, str):
-        wl = workplace.lower()
-        if "remote" in wl:
-            remote = "remote"
-        elif "hybrid" in wl:
-            remote = "hybrid"
-        elif "on-site" in wl or "onsite" in wl or "on site" in wl:
-            remote = "onsite"
-        else:
-            remote = None
-    else:
-        remote = None
+    remote = _remote_from_record(rec, str(location or ""))
     return {
         "external_id": str(job_id)[:255],
         "title": str(title).strip()[:500],

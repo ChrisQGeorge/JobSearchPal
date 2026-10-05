@@ -68,20 +68,52 @@ type BdInputRow = {
   keyword: string;
   country: string;
   time_range: string;
+  job_type: string;
+  experience_level: string;
+  remote: string;
   company: string;
   location_radius: string;
 };
 
 const BD_KEYWORD_KIND = "brightdata_keyword";
-const BD_COLUMNS: { key: keyof BdInputRow; label: string; hint: string }[] = [
+const BD_TIME_RANGES = ["Past 24 hours", "Past week", "Past month", "Any time"];
+// LinkedIn's own filter labels — Bright Data passes them through.
+const BD_COLUMNS: {
+  key: keyof BdInputRow;
+  label: string;
+  hint: string;
+  options?: string[];
+}[] = [
   { key: "keyword", label: "Keyword *", hint: 'e.g. "python developer" (quotes = exact phrase)' },
   { key: "location", label: "Location", hint: "e.g. New York" },
   { key: "country", label: "Country", hint: "2-letter code, e.g. US / FR" },
-  { key: "time_range", label: "Time range", hint: "used only when the run range is 'each row's own'" },
+  {
+    key: "remote",
+    label: "Workplace",
+    hint: "LinkedIn's workplace filter — Remote returns only remote jobs",
+    options: ["Remote", "Hybrid", "On-site"],
+  },
+  {
+    key: "job_type",
+    label: "Job type",
+    hint: "LinkedIn's job-type filter",
+    options: ["Full-time", "Part-time", "Contract", "Temporary", "Internship", "Volunteer", "Other"],
+  },
+  {
+    key: "experience_level",
+    label: "Experience",
+    hint: "LinkedIn's experience-level filter",
+    options: ["Internship", "Entry level", "Associate", "Mid-Senior level", "Director", "Executive"],
+  },
+  {
+    key: "time_range",
+    label: "Time range",
+    hint: "used only when the run range is 'each row's own'",
+    options: BD_TIME_RANGES,
+  },
   { key: "company", label: "Company", hint: "optional company filter" },
   { key: "location_radius", label: "Radius", hint: "optional search radius" },
 ];
-const BD_TIME_RANGES = ["Past 24 hours", "Past week", "Past month", "Any time"];
 
 function emptyBdRow(): BdInputRow {
   return {
@@ -89,6 +121,9 @@ function emptyBdRow(): BdInputRow {
     keyword: "",
     country: "",
     time_range: "",
+    job_type: "",
+    experience_level: "",
+    remote: "",
     company: "",
     location_radius: "",
   };
@@ -140,6 +175,9 @@ function formFromSource(s: Source): SourceForm {
     keyword: String(r.keyword ?? ""),
     country: String(r.country ?? ""),
     time_range: String(r.time_range ?? ""),
+    job_type: String(r.job_type ?? ""),
+    experience_level: String(r.experience_level ?? ""),
+    remote: String(r.remote ?? ""),
     company: String(r.company ?? ""),
     location_radius: String(r.location_radius ?? ""),
   }));
@@ -944,17 +982,22 @@ function SourceEditor({
                   <tr key={i}>
                     {BD_COLUMNS.map((c) => (
                       <td key={c.key} className="pr-2 pb-1.5">
-                        {c.key === "time_range" ? (
+                        {c.options ? (
                           <select
-                            className="jsp-input text-xs py-1"
-                            value={row.time_range}
+                            className="jsp-input text-xs py-1 min-w-[7rem]"
+                            value={row[c.key]}
                             onChange={(e) =>
-                              setBdRow(i, { time_range: e.target.value })
+                              setBdRow(i, { [c.key]: e.target.value })
                             }
                             disabled={saving}
+                            title={c.hint}
                           >
-                            <option value="">—</option>
-                            {BD_TIME_RANGES.map((t) => (
+                            <option value="">Any</option>
+                            {/* Keep an unrecognized CSV value selectable rather than dropping it. */}
+                            {row[c.key] && !c.options.includes(row[c.key]) ? (
+                              <option value={row[c.key]}>{row[c.key]}</option>
+                            ) : null}
+                            {c.options.map((t) => (
                               <option key={t} value={t}>
                                 {t}
                               </option>
@@ -1023,7 +1066,7 @@ function SourceEditor({
             </label>
             <span
               className="text-[10px] text-corp-muted"
-              title="Header: location,keyword,country,time_range,company,location_radius"
+              title="Header: location,keyword,country,time_range,job_type,experience_level,remote,company,location_radius (job_type / experience_level / remote optional)"
             >
               same CSV format as the Bright Data dashboard export
             </span>
