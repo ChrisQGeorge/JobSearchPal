@@ -4,18 +4,19 @@ status update / unrelated), matches it to one of the user's tracked
 jobs by org name + role title, and proposes a status change + an
 ApplicationEvent.
 
-The user always confirms before anything mutates a TrackedJob — this
-endpoint never auto-applies, only suggests."""
+Pasted emails are suggestions only — the user confirms before anything
+mutates a TrackedJob. Gmail-imported emails (app/skills/email_automation.py)
+can additionally trigger the user's opt-in per-intent automation rules
+(auto status change, notification email)."""
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.models.emails import ParsedEmail
-from app.models.jobs import ApplicationEvent, Organization, TrackedJob
+from app.models.jobs import ApplicationEvent, TrackedJob
 from app.models.user import User
 from app.scoring import apply_fit_score_to_job, compute_fit_score
 from app.skills.queue_bus import run_claude_to_bus
@@ -84,6 +85,12 @@ Hard rules:
 - "rejection" → suggested_status "lost"; suggested_event_type "rejection".
 - "offer" → suggested_status "offer"; suggested_event_type "offer_received".
 - "take_home_assigned" → suggested_status "assessment"; suggested_event_type "assessment_assigned".
+  Use this for ANY request to complete something before talking to a
+  person: online assessments, coding tests (HackerRank, Codility, …),
+  screening questionnaires, one-way video interviews.
+- Requests to schedule a call with a recruiter or hiring manager are
+  "interview_invite" (suggested_status "screening" for a first recruiter
+  call).
 - "ghosted" reserved for explicit "we've decided to pass on this candidate after
   no interview" — rare; usually use "rejection" instead.
 
@@ -235,6 +242,257 @@ def _normalize_classification(raw: object) -> dict:
     return out
 
 
+def build_classify_prompt(row: ParsedEmail) -> str:
+    return render_prompt("email_classify", dict(
+        from_address=row.from_address or "(unknown)",
+        subject=row.subject or "(no subject)",
+        received_at=row.received_at.isoformat() if row.received_at else "(unknown)",
+        body=(row.body_md or "")[:18000],  # long emails are usually quoted threads
+        api_base="http://localhost:8000",
+        allowed_statuses=", ".join(sorted(ALLOWED_SUGGESTED_STATUSES)),
+    )).text
+
+
+def classify_env(user_id: int) -> dict:
+    from app.core.security import create_access_token
+
+    return {
+        "JSP_API_BASE_URL": "http://localhost:8000",
+        "JSP_API_TOKEN": create_access_token(
+            subject=str(user_id), extra={"purpose": "email_ingest"}
+        ),
+    }
+
+
+async def store_classification(
+    db: AsyncSession, row: ParsedEmail, final_text: str
+) -> dict:
+    """Normalize the classifier output onto `row`, verifying the matched
+    job belongs to the row's user (the model could name any id)."""
+    cls = _normalize_classification(_extract_json_object(final_text) or {})
+    row.tracked_job_id = None
+    if cls.get("matched_job_id"):
+        owns = (
+            await db.execute(
+                select(TrackedJob.id).where(
+                    TrackedJob.id == cls["matched_job_id"],
+                    TrackedJob.user_id == row.user_id,
+                    TrackedJob.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if owns:
+            row.tracked_job_id = cls["matched_job_id"]
+        else:
+            cls["matched_job_id"] = None
+    row.classification = cls
+    row.error_message = None
+    row.state = "new"
+    return cls
+
+
+async def apply_to_job(
+    db: AsyncSession,
+    row: ParsedEmail,
+    job: TrackedJob,
+    *,
+    new_status: Optional[str],
+    event_type: str,
+    notes: str,
+    user: Optional[User] = None,
+) -> ApplicationEvent:
+    """Move `job` to `new_status` (if given) and log the email as an
+    ApplicationEvent. Shared by manual confirmation and automation."""
+    if new_status and new_status != job.status:
+        job.status = new_status
+        if new_status == "applied" and job.date_applied is None:
+            from datetime import date as _date
+
+            job.date_applied = _date.today()
+        if (
+            new_status in {"won", "lost", "withdrawn", "ghosted", "archived", "not_interested"}
+            and job.date_closed is None
+        ):
+            from datetime import date as _date
+
+            job.date_closed = _date.today()
+
+    # Always emit an event — even if the status didn't change, the
+    # email is itself an interaction worth logging.
+    event_md_parts = []
+    if notes:
+        event_md_parts.append(notes)
+    event_md_parts.append("---")
+    event_md_parts.append(
+        f"**From:** {row.from_address or '(unknown)'}  \n"
+        f"**Subject:** {row.subject or '(no subject)'}"
+    )
+    if row.body_md:
+        keep: list[str] = []
+        # Trim quoted thread tails with the standard `> ` prefix.
+        for line in row.body_md.strip().splitlines()[:80]:
+            if line.startswith(">"):
+                continue
+            keep.append(line)
+            if len(keep) >= 30:
+                break
+        if keep:
+            event_md_parts.append("\n".join(keep))
+    event = ApplicationEvent(
+        tracked_job_id=job.id,
+        event_type=event_type[:64] or "note",
+        event_date=datetime.now(tz=timezone.utc),
+        details_md="\n\n".join(event_md_parts),
+    )
+    db.add(event)
+    await db.flush()
+
+    row.state = "applied"
+    row.tracked_job_id = job.id
+    row.applied_event_id = event.id
+
+    if user is not None:
+        result = await compute_fit_score(db, user, job)
+        apply_fit_score_to_job(job, result)
+    return event
+
+
+# -- Gmail automation settings -------------------------------------------------
+
+
+class AutomationRuleIn(BaseModel):
+    set_status: bool = False
+    notify: bool = False
+
+
+class AutomationIn(BaseModel):
+    enabled: Optional[bool] = None
+    username: Optional[str] = Field(default=None, max_length=320)
+    app_password: Optional[str] = Field(default=None, max_length=128)
+    folder: Optional[str] = Field(default=None, max_length=200)
+    poll_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
+    lookback_days: Optional[int] = Field(default=None, ge=1, le=60)
+    notify_to: Optional[str] = Field(default=None, max_length=320)
+    min_confidence_status: Optional[float] = Field(default=None, ge=0, le=1)
+    min_confidence_notify: Optional[float] = Field(default=None, ge=0, le=1)
+    rules: Optional[dict[str, AutomationRuleIn]] = None
+
+
+async def _automation_view(db: AsyncSession, user_id: int) -> dict:
+    from app.skills import email_automation as ea
+    from app.api.v1.api_credentials import get_user_secret
+
+    cfg = ea.get_settings(user_id)
+    cfg["has_password"] = bool(await get_user_secret(db, user_id, ea.PROVIDER))
+    cfg["intent_labels"] = ea.INTENT_LABELS
+    return cfg
+
+
+@router.get("/automation")
+async def get_automation(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    return await _automation_view(db, user.id)
+
+
+@router.put("/automation")
+async def put_automation(
+    payload: AutomationIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    from app.models.user import ApiCredential
+    from app.core.security import encrypt_secret
+    from app.skills import email_automation as ea
+
+    patch = payload.model_dump(exclude_none=True, exclude={"app_password", "rules"})
+    if "username" in patch:
+        patch["username"] = patch["username"].strip()
+    if payload.rules is not None:
+        patch["rules"] = {k: v.model_dump() for k, v in payload.rules.items()}
+    # Links in notification emails point back at whatever origin the
+    # user saved settings from (their HTTPS hostname).
+    origin = request.headers.get("origin")
+    if origin:
+        patch["app_url"] = origin.rstrip("/")
+    ea.save_settings(user.id, patch)
+
+    if payload.app_password:
+        # Google shows app passwords as "abcd efgh ijkl mnop"; spaces
+        # aren't part of the password.
+        secret = re.sub(r"\s+", "", payload.app_password)
+        existing = (
+            await db.execute(
+                select(ApiCredential).where(
+                    ApiCredential.user_id == user.id,
+                    ApiCredential.provider == ea.PROVIDER,
+                    ApiCredential.label == "default",
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            db.add(ApiCredential(
+                user_id=user.id, provider=ea.PROVIDER, label="default",
+                encrypted_secret=encrypt_secret(secret),
+            ))
+        else:
+            existing.encrypted_secret = encrypt_secret(secret)
+            existing.deleted_at = None
+        await db.commit()
+    return await _automation_view(db, user.id)
+
+
+@router.post("/automation/test")
+async def test_automation(
+    send_test_email: bool = Query(default=True),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Check the IMAP login/folder and (optionally) send a test
+    notification to the personal address over SMTP."""
+    import asyncio
+
+    from app.api.v1.api_credentials import get_user_secret
+    from app.skills import email_automation as ea
+
+    cfg = ea.get_settings(user.id)
+    password = await get_user_secret(db, user.id, ea.PROVIDER)
+    if not cfg["username"] or not password:
+        raise HTTPException(status_code=422, detail="Save your Gmail address and app password first.")
+    out: dict[str, Any] = {}
+    try:
+        out["imap"] = {"ok": True, "detail": await asyncio.to_thread(ea.test_imap, cfg, password)}
+    except Exception as exc:
+        out["imap"] = {"ok": False, "detail": f"{type(exc).__name__}: {exc}"[:400]}
+    if send_test_email:
+        to = (cfg.get("notify_to") or "").strip()
+        if not to:
+            out["smtp"] = {"ok": False, "detail": "No personal address set."}
+        else:
+            try:
+                await asyncio.to_thread(
+                    ea.send_email, cfg, password, to, "Test notification",
+                    "This is a test from Job Search Pal's Gmail automation. "
+                    "Interview and assessment requests will arrive like this.",
+                )
+                out["smtp"] = {"ok": True, "detail": f"Test email sent to {to}."}
+            except Exception as exc:
+                out["smtp"] = {"ok": False, "detail": f"{type(exc).__name__}: {exc}"[:400]}
+    return out
+
+
+@router.post("/automation/poll-now")
+async def poll_now(user: User = Depends(get_current_user)) -> dict:
+    from app.skills import email_automation as ea
+
+    cfg = ea.get_settings(user.id)
+    if not cfg["username"]:
+        raise HTTPException(status_code=422, detail="Save your Gmail address first.")
+    return await ea.poll_user(user.id)
+
+
 # -- Endpoints ---------------------------------------------------------------
 
 
@@ -264,8 +522,6 @@ async def parse_email(
 ) -> ParsedEmail:
     """Persist the email + run the classifier. Returns the row with
     classification populated. Caller will then POST /apply to confirm."""
-    from app.core.security import create_access_token
-
     body = payload.body.strip()
     if not body:
         raise HTTPException(status_code=422, detail="body is empty.")
@@ -296,34 +552,14 @@ async def parse_email(
     db.add(row)
     await db.flush()
 
-    api_token = create_access_token(
-        subject=str(user.id), extra={"purpose": "email_ingest"}
-    )
-
-    prompt = render_prompt("email_classify", dict(
-        from_address=payload.from_address or "(unknown)",
-        subject=payload.subject or "(no subject)",
-        received_at=(
-            payload.received_at.isoformat()
-            if payload.received_at
-            else "(unknown)"
-        ),
-        body=body[:18000],  # hard cap; very long emails are usually quoted threads
-        api_base="http://localhost:8000",
-        allowed_statuses=", ".join(sorted(ALLOWED_SUGGESTED_STATUSES)),
-    )).text
-
     try:
         final_text = await run_claude_to_bus(
-            prompt=prompt,
+            prompt=build_classify_prompt(row),
             source="email_ingest",
             item_id=f"email:{row.id}",
             label=(payload.subject or "Email parse")[:80],
             allowed_tools=["Bash"],
-            extra_env={
-                "JSP_API_BASE_URL": "http://localhost:8000",
-                "JSP_API_TOKEN": api_token,
-            },
+            extra_env=classify_env(user.id),
             timeout_seconds=120,
             action="email_ingest",
         )
@@ -344,28 +580,7 @@ async def parse_email(
             )
         raise HTTPException(status_code=502, detail=f"Email parse failed: {exc}")
 
-    data = _extract_json_object(final_text) or {}
-    cls = _normalize_classification(data)
-    row.classification = cls
-    if cls.get("matched_job_id"):
-        # Verify it actually belongs to this user — Claude could
-        # hallucinate an id from another user's row.
-        owns = (
-            await db.execute(
-                select(TrackedJob.id).where(
-                    TrackedJob.id == cls["matched_job_id"],
-                    TrackedJob.user_id == user.id,
-                    TrackedJob.deleted_at.is_(None),
-                )
-            )
-        ).scalar_one_or_none()
-        if owns:
-            row.tracked_job_id = cls["matched_job_id"]
-        else:
-            row.tracked_job_id = None
-            cls["matched_job_id"] = None
-            row.classification = cls
-
+    await store_classification(db, row, final_text)
     await db.commit()
     await db.refresh(row)
     return row
@@ -380,34 +595,17 @@ async def reparse_email(
     """Re-run the classifier on an existing row. Useful after fixing
     the body, after Claude was rate-limited the first time, or after
     adding the matching tracked job to the catalog."""
-    from app.core.security import create_access_token
-
     row = await _owned(db, parsed_id, user.id)
-    body = (row.body_md or "").strip()
-    if not body:
+    if not (row.body_md or "").strip():
         raise HTTPException(status_code=422, detail="No body stored to reparse.")
-    api_token = create_access_token(
-        subject=str(user.id), extra={"purpose": "email_ingest"}
-    )
-    prompt = render_prompt("email_classify", dict(
-        from_address=row.from_address or "(unknown)",
-        subject=row.subject or "(no subject)",
-        received_at=row.received_at.isoformat() if row.received_at else "(unknown)",
-        body=body[:18000],
-        api_base="http://localhost:8000",
-        allowed_statuses=", ".join(sorted(ALLOWED_SUGGESTED_STATUSES)),
-    )).text
     try:
         final_text = await run_claude_to_bus(
-            prompt=prompt,
+            prompt=build_classify_prompt(row),
             source="email_ingest",
             item_id=f"email:{row.id}",
             label=(row.subject or "Email reparse")[:80],
             allowed_tools=["Bash"],
-            extra_env={
-                "JSP_API_BASE_URL": "http://localhost:8000",
-                "JSP_API_TOKEN": api_token,
-            },
+            extra_env=classify_env(user.id),
             timeout_seconds=120,
             action="email_ingest",
         )
@@ -416,23 +614,7 @@ async def reparse_email(
         row.error_message = str(exc)[:1000]
         await db.commit()
         raise HTTPException(status_code=502, detail=f"Email reparse failed: {exc}")
-    data = _extract_json_object(final_text) or {}
-    cls = _normalize_classification(data)
-    row.classification = cls
-    row.error_message = None
-    if cls.get("matched_job_id"):
-        owns = (
-            await db.execute(
-                select(TrackedJob.id).where(
-                    TrackedJob.id == cls["matched_job_id"],
-                    TrackedJob.user_id == user.id,
-                    TrackedJob.deleted_at.is_(None),
-                )
-            )
-        ).scalar_one_or_none()
-        if owns:
-            row.tracked_job_id = cls["matched_job_id"]
-    row.state = "new"
+    await store_classification(db, row, final_text)
     await db.commit()
     await db.refresh(row)
     return row
@@ -485,61 +667,10 @@ async def apply_email(
     if job is None:
         raise HTTPException(status_code=404, detail="Tracked job not found.")
 
-    prior_status = job.status
-    if new_status and new_status != prior_status:
-        job.status = new_status
-        if new_status == "applied" and job.date_applied is None:
-            from datetime import date as _date
-
-            job.date_applied = _date.today()
-        if (
-            new_status in {"won", "lost", "withdrawn", "ghosted", "archived", "not_interested"}
-            and job.date_closed is None
-        ):
-            from datetime import date as _date
-
-            job.date_closed = _date.today()
-
-    # Always emit an event — even if the status didn't change, the
-    # email is itself an interaction worth logging.
-    event_md_parts = []
-    if notes:
-        event_md_parts.append(notes)
-    event_md_parts.append("---")
-    event_md_parts.append(
-        f"**From:** {row.from_address or '(unknown)'}  \n"
-        f"**Subject:** {row.subject or '(no subject)'}"
+    event = await apply_to_job(
+        db, row, job,
+        new_status=new_status, event_type=event_type, notes=notes, user=user,
     )
-    if row.body_md:
-        snippet = row.body_md.strip().splitlines()
-        # Trim quoted thread tails with the standard `> ` prefix.
-        keep: list[str] = []
-        for line in snippet[:80]:
-            if line.startswith(">"):
-                continue
-            keep.append(line)
-            if len(keep) >= 30:
-                break
-        if keep:
-            event_md_parts.append("\n".join(keep))
-    event = ApplicationEvent(
-        tracked_job_id=job.id,
-        event_type=event_type[:64] or "note",
-        event_date=datetime.now(tz=timezone.utc),
-        details_md="\n\n".join(event_md_parts),
-    )
-    db.add(event)
-    await db.flush()
-
-    row.state = "applied"
-    row.tracked_job_id = job.id
-    row.applied_event_id = event.id
-
-    # Recompute fit score in case the new status changed something the
-    # scorer cares about (currently it doesn't, but keeps the row fresh).
-    result = await compute_fit_score(db, user, job)
-    apply_fit_score_to_job(job, result)
-
     await db.commit()
     await db.refresh(row)
     return EmailApplyOut(

@@ -10,6 +10,7 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { PageShell } from "@/components/PageShell";
+import { GmailAutomationPanel } from "./_panels/GmailAutomationPanel";
 import { api, ApiError } from "@/lib/api";
 import { type JobStatus, type TrackedJobSummary } from "@/lib/types";
 
@@ -22,6 +23,11 @@ type Classification = {
   suggested_event_type?: string | null;
   key_dates?: string[];
   summary?: string;
+  automation?: {
+    status_set?: { job_id: number; from: string; to: string } | null;
+    notified?: boolean;
+    notes?: string[];
+  };
 };
 
 type ParsedEmail = {
@@ -32,7 +38,7 @@ type ParsedEmail = {
   body_md: string | null;
   classification: Classification | null;
   tracked_job_id: number | null;
-  state: "new" | "applied" | "dismissed" | "errored";
+  state: "queued" | "new" | "applied" | "dismissed" | "errored";
   error_message: string | null;
   created_at: string;
   updated_at: string;
@@ -53,6 +59,7 @@ const ALLOWED_STATUSES: JobStatus[] = [
 ];
 
 const STATE_LABELS: Record<ParsedEmail["state"], string> = {
+  queued: "Classifying…",
   new: "Awaiting review",
   applied: "Applied",
   dismissed: "Dismissed",
@@ -147,8 +154,9 @@ export default function EmailInboxPage() {
   return (
     <PageShell
       title="Email Inbox"
-      subtitle="Paste a job-related email and the Companion will tell you which tracked job it touches and what status to move it to. You always confirm before anything mutates."
+      subtitle="Connect Gmail to import job emails automatically, or paste one. The Companion matches each email to a tracked job and suggests a status change — your Gmail rules can apply it or email you."
     >
+      <GmailAutomationPanel onPolled={() => void refresh()} />
       {err ? (
         <div className="jsp-card p-4 text-sm text-corp-danger mb-3">{err}</div>
       ) : null}
@@ -221,7 +229,7 @@ export default function EmailInboxPage() {
             Inbox
           </h3>
           <div className="flex gap-1.5">
-            {(["new", "applied", "dismissed", "errored", "all"] as const).map((s) => (
+            {(["new", "queued", "applied", "dismissed", "errored", "all"] as const).map((s) => (
               <button
                 key={s}
                 type="button"
@@ -447,6 +455,30 @@ function ReviewPanel({
       ) : null}
       {cls.summary ? (
         <p className="text-sm">{cls.summary}</p>
+      ) : null}
+      {cls.automation &&
+      (cls.automation.status_set ||
+        cls.automation.notified ||
+        (cls.automation.notes ?? []).length > 0) ? (
+        <div className="text-[11px] rounded border border-corp-accent/40 bg-corp-accent/10 p-2 space-y-0.5">
+          <div className="uppercase tracking-wider text-[10px] text-corp-accent">
+            Gmail automation
+          </div>
+          {cls.automation.status_set ? (
+            <div>
+              Status changed automatically: {cls.automation.status_set.from} →{" "}
+              {cls.automation.status_set.to}
+            </div>
+          ) : null}
+          {cls.automation.notified ? (
+            <div>Notification emailed to your personal address.</div>
+          ) : null}
+          {(cls.automation.notes ?? []).map((n, i) => (
+            <div key={i} className="text-corp-muted">
+              {n}
+            </div>
+          ))}
+        </div>
       ) : null}
       {cls.matched_reason ? (
         <p className="text-[11px] text-corp-muted italic">

@@ -29,6 +29,7 @@ from app.api.v1 import autofill as autofill_router
 from app.api.v1 import resume_ingest as resume_ingest_router
 from app.api.v1 import sources as sources_router
 from app.core.config import settings
+from app.skills.email_automation import run_forever as run_gmail_poller
 from app.skills.queue_worker import run_forever as run_queue_worker
 from app.sources.poller import run_forever as run_source_poller
 
@@ -41,13 +42,14 @@ async def lifespan(app: FastAPI):
     # container — if we ever scale out we'll need real coordination.
     task = asyncio.create_task(run_queue_worker(), name="job-fetch-queue")
     poller_task = asyncio.create_task(run_source_poller(), name="source-poller")
-    log.info("Started job-fetch-queue + source-poller background workers")
+    gmail_task = asyncio.create_task(run_gmail_poller(), name="gmail-poller")
+    log.info("Started job-fetch-queue, source-poller and gmail-poller workers")
     try:
         yield
     finally:
-        for t in (task, poller_task):
+        for t in (task, poller_task, gmail_task):
             t.cancel()
-        for t in (task, poller_task):
+        for t in (task, poller_task, gmail_task):
             try:
                 await t
             except (asyncio.CancelledError, Exception):

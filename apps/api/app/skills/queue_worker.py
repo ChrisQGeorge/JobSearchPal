@@ -1973,6 +1973,103 @@ async def _handle_extractor_gen(item: JobFetchQueue) -> None:
 
 
 # kind → handler. Extensible: add new kinds here.
+async def _handle_email_classify(item: JobFetchQueue) -> None:
+    """Classify a Gmail-imported ParsedEmail, then (payload.auto) apply
+    the user's automation rules — auto status change and/or a
+    notification email. The model call runs with no DB session held."""
+    from app.api.v1.email_ingest import (
+        build_classify_prompt,
+        classify_env,
+        store_classification,
+    )
+    from app.models.emails import ParsedEmail
+    from app.skills import queue_bus
+    from app.skills.email_automation import run_automation
+    from app.skills.runner import ClaudeCodeError
+
+    async with SessionLocal() as db:
+        row = (
+            await db.execute(select(JobFetchQueue).where(JobFetchQueue.id == item.id))
+        ).scalar_one_or_none()
+        if row is None:
+            return
+        pid = (row.payload or {}).get("parsed_email_id")
+        auto = bool((row.payload or {}).get("auto"))
+        email_row = (
+            await db.execute(
+                select(ParsedEmail).where(
+                    ParsedEmail.id == pid, ParsedEmail.user_id == row.user_id
+                )
+            )
+        ).scalar_one_or_none()
+        if email_row is None:
+            await _fail(db, row, "parsed email not found", permanent=True)
+            return
+        prompt = build_classify_prompt(email_row)
+        label = row.label or "Email"
+        user_id = row.user_id
+
+    try:
+        final_text = await queue_bus.run_claude_to_bus(
+            prompt=prompt,
+            source="email_ingest",
+            item_id=f"queue:{item.id}",
+            label=label,
+            allowed_tools=["Bash"],
+            extra_env=classify_env(user_id),
+            timeout_seconds=120,
+            action="email_ingest",
+        )
+    except ClaudeCodeError as exc:
+        err = str(exc)
+        async with SessionLocal() as db:
+            row = (
+                await db.execute(select(JobFetchQueue).where(JobFetchQueue.id == item.id))
+            ).scalar_one_or_none()
+            if row is None:
+                return
+            if _is_rate_limited(err):
+                await _handle_rate_limit(db, row, err)
+                return
+            email_row = (
+                await db.execute(select(ParsedEmail).where(ParsedEmail.id == pid))
+            ).scalar_one_or_none()
+            if email_row is not None:
+                email_row.state = "errored"
+                email_row.error_message = err[:1000]
+            await _fail(db, row, err, permanent=True)
+        return
+
+    async with SessionLocal() as db:
+        row = (
+            await db.execute(select(JobFetchQueue).where(JobFetchQueue.id == item.id))
+        ).scalar_one_or_none()
+        email_row = (
+            await db.execute(select(ParsedEmail).where(ParsedEmail.id == pid))
+        ).scalar_one_or_none()
+        if row is None or email_row is None:
+            return
+        cls = await store_classification(db, email_row, final_text)
+        actions = None
+        if auto and cls.get("intent") != "unrelated":
+            try:
+                actions = await run_automation(db, email_row)
+            except Exception as exc:  # pragma: no cover — never lose the classification
+                log.exception("Email automation failed for parsed email %s", pid)
+                c = dict(email_row.classification or {})
+                c["automation"] = {"notes": [f"automation error: {exc}"[:300]]}
+                email_row.classification = c
+        if cls.get("intent") == "unrelated" and auto:
+            # The pre-filter let it through but it isn't job mail —
+            # keep the inbox clean.
+            email_row.state = "dismissed"
+        row.state = "done"
+        row.error_message = None
+        row.result = {"parsed_email_id": pid, "intent": cls.get("intent"),
+                      "automation": actions}
+        await db.commit()
+
+
 _HANDLERS = {
     "fetch": _handle_fetch,
     "score": _handle_score,
@@ -1982,6 +2079,7 @@ _HANDLERS = {
     "prep": _handle_prep,
     "strategy": _handle_strategy,
     "extractor_gen": _handle_extractor_gen,
+    "email_classify": _handle_email_classify,
 }
 
 
