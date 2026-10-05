@@ -2098,8 +2098,18 @@ async def run_jev_score(
             if prefs.salary_acceptable_min is not None else None,
             "salary_unacceptable_below": float(prefs.salary_unacceptable_below)
             if prefs.salary_unacceptable_below is not None else None,
-            "remote_policies_acceptable": prefs.remote_policies_acceptable or [],
+            "remote_policy_preferred": prefs.remote_policy_preferred,
+            # A preferred policy is by definition acceptable — fold it in
+            # so a user who only set "preferred" doesn't send Jev an
+            # empty acceptable list.
+            "remote_policies_acceptable": sorted(
+                set(prefs.remote_policies_acceptable or [])
+                | ({prefs.remote_policy_preferred} if prefs.remote_policy_preferred else set())
+            ),
             "remote_policies_unacceptable": prefs.remote_policies_unacceptable or [],
+            "experience_level_preferred": prefs.experience_level_preferred,
+            "employment_types_preferred": prefs.employment_types_preferred or [],
+            "travel_percent_preferred": prefs.travel_percent_preferred,
             "willing_to_relocate": prefs.willing_to_relocate,
             "preferred_locations": prefs.preferred_locations or [],
             "benefits_required": prefs.benefits_required or [],

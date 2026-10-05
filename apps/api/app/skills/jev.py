@@ -415,12 +415,13 @@ async def score_job_fit(
     answers = await _post(api_key, job_state, questions, timeout_seconds)
 
     def _to_pct(raw_score: float, n: int) -> int:
-        # Score answers are probability-weighted across the ordered levels
-        # (1..N, N = that dimension's criteria count). Rescale to 0-100,
-        # clamped defensively — a value outside the level range would
-        # otherwise produce a nonsense percentage.
-        clamped = min(max(raw_score, 1.0), float(n))
-        return int(round((clamped - 1.0) / (max(n, 2) - 1) * 100.0))
+        # Jev's score is the probability-weighted level INDEX, 0..N-1 —
+        # legend and probabilities are keyed "0".."N-1" (docs example: 95%
+        # on level 1 + 5% on level 2 → score 1.05). Rescale to 0-100,
+        # clamped defensively.
+        top = float(max(n, 2) - 1)
+        clamped = min(max(raw_score, 0.0), top)
+        return int(round(clamped / top * 100.0))
 
     try:
         scores: dict[str, dict[str, float | int]] = {}
