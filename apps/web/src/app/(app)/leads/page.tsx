@@ -10,7 +10,7 @@
 // they inflate active-application counts.
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { PageShell } from "@/components/PageShell";
 import { api, apiUrl, ApiError } from "@/lib/api";
 
@@ -59,6 +59,7 @@ type Lead = {
   state: string;
   tracked_job_id: number | null;
   relevance_score: number | null;
+  has_description?: boolean | null;
 };
 
 // One input row of a Bright Data keyword-discovery query — the same
@@ -382,8 +383,19 @@ export default function LeadsPage() {
   const [search, setSearch] = useState("");
   const [remoteOnly, setRemoteOnly] = useState(false);
   const [selected, setSelected] = useState<Set<number>>(new Set());
+  // Gmail-style "select all N matching" — acts on every lead matching
+  // the current filters server-side, not just the loaded page.
+  const [allMatching, setAllMatching] = useState(false);
   const [actionRunning, setActionRunning] = useState(false);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
+  const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState(100);
+  const [totalLeads, setTotalLeads] = useState(0);
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(search.trim()), 300);
+    return () => clearTimeout(t);
+  }, [search]);
 
   async function loadAll() {
     setLoading(true);
@@ -406,17 +418,35 @@ export default function LeadsPage() {
     }
   }
 
-  async function loadLeads() {
+  function leadFilters() {
+    return {
+      state: stateFilter,
+      source_id: sourceFilter === "all" ? null : sourceFilter,
+      q: debouncedSearch || null,
+      remote_only: remoteOnly,
+    };
+  }
+
+  async function loadLeads(pageArg: number = page) {
     try {
       const params = new URLSearchParams();
       params.set("state", stateFilter);
       if (sourceFilter !== "all") params.set("source_id", String(sourceFilter));
-      if (search.trim()) params.set("q", search.trim());
+      if (debouncedSearch) params.set("q", debouncedSearch);
       if (remoteOnly) params.set("remote_only", "true");
-      const rows = await api.get<Lead[]>(
-        `/api/v1/job-leads?${params.toString()}`,
+      params.set("offset", String(pageArg * pageSize));
+      params.set("limit", String(pageSize));
+      const out = await api.get<{ total: number; items: Lead[] }>(
+        `/api/v1/job-leads/page?${params.toString()}`,
       );
-      setLeads(rows);
+      // Page emptied by an action (e.g. dismissed the last page) — step back.
+      if (out.items.length === 0 && out.total > 0 && pageArg > 0) {
+        const last = Math.max(0, Math.ceil(out.total / pageSize) - 1);
+        setPage(last);
+        return;
+      }
+      setLeads(out.items);
+      setTotalLeads(out.total);
     } catch (e) {
       setErr(
         e instanceof ApiError
@@ -457,11 +487,19 @@ export default function LeadsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingIds]);
 
+  // Filters changed → back to page 1 with a fresh selection.
   useEffect(() => {
-    loadLeads();
     setSelected(new Set());
+    setAllMatching(false);
+    if (page !== 0) setPage(0);
+    else void loadLeads(0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stateFilter, sourceFilter, remoteOnly]);
+  }, [stateFilter, sourceFilter, remoteOnly, debouncedSearch, pageSize]);
+
+  useEffect(() => {
+    void loadLeads(page);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page]);
 
   async function saveSource(form: SourceForm) {
     setSavingSource(true);
@@ -546,8 +584,9 @@ export default function LeadsPage() {
   }
 
   function toggleAllVisibleLeads() {
+    setAllMatching(false);
     setSelected((prev) => {
-      const visibleIds = filteredLeads.map((l) => l.id);
+      const visibleIds = leads.map((l) => l.id);
       const allSelected = visibleIds.every((id) => prev.has(id));
       const next = new Set(prev);
       if (allSelected) {
@@ -559,38 +598,44 @@ export default function LeadsPage() {
     });
   }
 
-  const filteredLeads = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    if (!q) return leads;
-    return leads.filter((l) => {
-      if (l.title.toLowerCase().includes(q)) return true;
-      if ((l.organization_name ?? "").toLowerCase().includes(q)) return true;
-      if ((l.location ?? "").toLowerCase().includes(q)) return true;
-      return false;
-    });
-  }, [leads, search]);
+  const pageAllSelected = leads.length > 0 && leads.every((l) => selected.has(l.id));
+  const selectionCount = allMatching ? totalLeads : selected.size;
 
   async function bulkAction(action: "review" | "dismissed") {
-    if (selected.size === 0) return;
+    if (selectionCount === 0) return;
+    if (
+      allMatching &&
+      action === "review" &&
+      !window.confirm(
+        `Add all ${totalLeads.toLocaleString()} matching leads to the tracker? Each one is ` +
+          "imported and scored (one Jev call each). Up to 500 are added per click.",
+      )
+    )
+      return;
     setActionRunning(true);
     setActionMsg(null);
     setErr(null);
     try {
-      const out = await api.post<{ promoted: number; dismissed: number }>(
+      const out = await api.post<{ promoted: number; dismissed: number; remaining?: number }>(
         "/api/v1/job-leads/action",
-        { ids: [...selected], action },
+        allMatching
+          ? { all_matching: leadFilters(), action }
+          : { ids: [...selected], action },
       );
       const pieces: string[] = [];
       if (out.promoted > 0)
         pieces.push(
           `${out.promoted} added to tracker as to_review (queued for fetch + scoring)`,
         );
-      if (out.dismissed > 0) pieces.push(`${out.dismissed} dismissed`);
+      if (out.dismissed > 0) pieces.push(`${out.dismissed.toLocaleString()} dismissed`);
+      if (out.remaining)
+        pieces.push("more matching leads remain — click Add to tracker again for the next 500");
       setActionMsg(pieces.join(" · ") || `Action ${action} applied`);
       setSelected(new Set());
+      setAllMatching(false);
       await loadLeads();
       // Refresh source counts too — promoted leads change the new_lead_count.
-      await loadAll();
+      void loadAll();
     } catch (e) {
       setErr(
         e instanceof ApiError
@@ -826,10 +871,12 @@ export default function LeadsPage() {
           </button>
         </div>
 
-        {selected.size > 0 ? (
+        {selectionCount > 0 ? (
           <div className="flex flex-wrap gap-2 items-center mb-3 p-2 bg-corp-accent/10 border border-corp-accent/30 rounded">
             <span className="text-xs text-corp-muted">
-              {selected.size} selected
+              {allMatching
+                ? `All ${totalLeads.toLocaleString()} matching leads selected`
+                : `${selected.size} selected`}
             </span>
             <button
               type="button"
@@ -851,7 +898,10 @@ export default function LeadsPage() {
             <button
               type="button"
               className="jsp-btn-ghost text-xs ml-auto"
-              onClick={() => setSelected(new Set())}
+              onClick={() => {
+                setSelected(new Set());
+                setAllMatching(false);
+              }}
             >
               Clear
             </button>
@@ -865,45 +915,103 @@ export default function LeadsPage() {
           <div className="text-[11px] text-corp-muted mb-2">{actionMsg}</div>
         ) : null}
 
-        {filteredLeads.length === 0 ? (
+        {pageAllSelected && !allMatching && totalLeads > leads.length ? (
+          <div className="text-xs mb-3 text-center">
+            All {leads.length} leads on this page are selected.{" "}
+            <button
+              type="button"
+              className="text-corp-accent hover:underline"
+              onClick={() => setAllMatching(true)}
+            >
+              Select all {totalLeads.toLocaleString()} matching leads
+            </button>
+          </div>
+        ) : null}
+
+        {leads.length === 0 ? (
           <p className="text-sm text-corp-muted">
-            {stateFilter === "new"
-              ? "Inbox zero. Either no sources are polling yet, or you're caught up."
-              : "No leads in this filter."}
+            {debouncedSearch
+              ? `No leads match "${debouncedSearch}".`
+              : stateFilter === "new"
+                ? "Inbox zero. Either no sources are polling yet, or you're caught up."
+                : "No leads in this filter."}
           </p>
         ) : (
-          <ul className="divide-y divide-corp-border">
-            <li className="flex items-center gap-3 py-2 text-[10px] uppercase tracking-wider text-corp-muted">
-              <input
-                type="checkbox"
-                className="accent-corp-accent"
-                aria-label="Select all visible leads"
-                checked={
-                  filteredLeads.length > 0 &&
-                  filteredLeads.every((l) => selected.has(l.id))
-                }
-                ref={(el) => {
-                  if (el) {
-                    const count = filteredLeads.filter((l) =>
-                      selected.has(l.id),
-                    ).length;
-                    el.indeterminate =
-                      count > 0 && count < filteredLeads.length;
-                  }
-                }}
-                onChange={toggleAllVisibleLeads}
-              />
-              <span className="flex-1">{filteredLeads.length} leads</span>
-            </li>
-            {filteredLeads.map((l) => (
-              <LeadRow
-                key={l.id}
-                lead={l}
-                selected={selected.has(l.id)}
-                onToggle={() => toggleLeadSelection(l.id)}
-              />
-            ))}
-          </ul>
+          <>
+            <ul className="divide-y divide-corp-border">
+              <li className="flex items-center gap-3 py-2 text-[10px] uppercase tracking-wider text-corp-muted">
+                <input
+                  type="checkbox"
+                  className="accent-corp-accent"
+                  aria-label="Select all leads on this page"
+                  checked={allMatching || pageAllSelected}
+                  ref={(el) => {
+                    if (el) {
+                      const count = leads.filter((l) => selected.has(l.id)).length;
+                      el.indeterminate = !allMatching && count > 0 && count < leads.length;
+                    }
+                  }}
+                  onChange={toggleAllVisibleLeads}
+                />
+                <span className="flex-1">
+                  {totalLeads.toLocaleString()} lead{totalLeads === 1 ? "" : "s"}
+                </span>
+              </li>
+              {leads.map((l) => (
+                <LeadRow
+                  key={l.id}
+                  lead={l}
+                  selected={allMatching || selected.has(l.id)}
+                  onToggle={() => {
+                    if (allMatching) {
+                      // Leaving "all matching" mode: keep this page, minus this row.
+                      setAllMatching(false);
+                      setSelected(new Set(leads.map((x) => x.id).filter((id) => id !== l.id)));
+                    } else {
+                      toggleLeadSelection(l.id);
+                    }
+                  }}
+                />
+              ))}
+            </ul>
+            <div className="flex flex-wrap items-center gap-2 mt-3 text-xs text-corp-muted">
+              <span>
+                {(page * pageSize + 1).toLocaleString()}–
+                {Math.min((page + 1) * pageSize, totalLeads).toLocaleString()} of{" "}
+                {totalLeads.toLocaleString()}
+              </span>
+              <button
+                type="button"
+                className="jsp-btn-ghost text-xs"
+                onClick={() => setPage((p) => Math.max(0, p - 1))}
+                disabled={page === 0}
+              >
+                ← Prev
+              </button>
+              <button
+                type="button"
+                className="jsp-btn-ghost text-xs"
+                onClick={() => setPage((p) => p + 1)}
+                disabled={(page + 1) * pageSize >= totalLeads}
+              >
+                Next →
+              </button>
+              <label className="ml-auto flex items-center gap-1">
+                Per page
+                <select
+                  className="jsp-input text-xs py-0.5 w-20"
+                  value={pageSize}
+                  onChange={(e) => setPageSize(Number(e.target.value))}
+                >
+                  {[50, 100, 250, 500].map((n) => (
+                    <option key={n} value={n}>
+                      {n}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          </>
         )}
       </section>
     </PageShell>
@@ -920,6 +1028,26 @@ function LeadRow({
   onToggle: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
+  // The paged list omits descriptions; fetch on first expand.
+  const [body, setBody] = useState<string | null>(lead.description_md ?? null);
+  const [bodyLoading, setBodyLoading] = useState(false);
+  async function toggle() {
+    const next = !expanded;
+    setExpanded(next);
+    if (next && body === null && lead.has_description !== false) {
+      setBodyLoading(true);
+      try {
+        const out = await api.get<{ description_md: string | null }>(
+          `/api/v1/job-leads/${lead.id}/description`,
+        );
+        setBody(out.description_md ?? "");
+      } catch {
+        setBody("(couldn't load the description)");
+      } finally {
+        setBodyLoading(false);
+      }
+    }
+  }
   const subline = [
     lead.organization_name,
     lead.location,
@@ -971,15 +1099,20 @@ function LeadRow({
         <button
           type="button"
           className="jsp-btn-ghost text-xs shrink-0"
-          onClick={() => setExpanded((v) => !v)}
+          onClick={() => void toggle()}
+          disabled={lead.has_description === false && !body}
+          title={lead.has_description === false && !body ? "No description stored" : undefined}
         >
           {expanded ? "Hide" : "Preview"}
         </button>
       </div>
-      {expanded && lead.description_md ? (
+      {expanded ? (
         <pre className="text-[11px] whitespace-pre-wrap text-corp-muted font-sans pl-7 max-h-72 overflow-y-auto">
-          {lead.description_md.slice(0, 4000)}
-          {lead.description_md.length > 4000 ? "…" : ""}
+          {bodyLoading
+            ? "Loading…"
+            : body
+              ? `${body.slice(0, 4000)}${body.length > 4000 ? "…" : ""}`
+              : "(no description)"}
         </pre>
       ) : null}
     </li>

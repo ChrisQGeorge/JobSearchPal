@@ -22,7 +22,8 @@ from fastapi import (
     status,
 )
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.orm import defer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -240,19 +241,48 @@ class LeadOut(BaseModel):
     state: str
     tracked_job_id: Optional[int] = None
     relevance_score: Optional[int] = None
+    # Paged inbox omits description_md (it's most of the payload) and
+    # sets this instead; the preview fetches the body on demand.
+    has_description: Optional[bool] = None
+
+
+class LeadFilterIn(BaseModel):
+    """Same filters as the inbox list — used to act on EVERY matching
+    lead, not just the loaded page."""
+
+    state: str = "new"
+    source_id: Optional[int] = None
+    q: Optional[str] = None
+    remote_only: bool = False
 
 
 class LeadActionIn(BaseModel):
-    """Bulk action over selected lead IDs."""
+    """Bulk action over selected lead IDs, or over every lead matching
+    `all_matching` (the inbox's "select all N matching")."""
 
-    ids: list[int] = Field(min_length=1)
-    action: str = Field(description="One of: interested, watching, dismissed.")
+    ids: list[int] = Field(default_factory=list)
+    all_matching: Optional[LeadFilterIn] = None
+    action: str = Field(description="One of: review, dismissed.")
+
+
+class LeadPageOut(BaseModel):
+    total: int
+    offset: int
+    limit: int
+    items: list[LeadOut]
 
 
 class LeadActionOut(BaseModel):
     promoted: int = 0       # leads that became tracked_jobs rows
     dismissed: int = 0
     failed_ids: list[int] = []
+    # >0 when an "add all matching" hit MAX_PROMOTE_PER_REQUEST — more
+    # matching leads remain; the user can click again.
+    remaining: int = 0
+
+
+# Each promotion queues a fetch + scoring (a Jev call); bound one click.
+MAX_PROMOTE_PER_REQUEST = 500
 
 
 # ----- Sources --------------------------------------------------------------
@@ -611,6 +641,87 @@ async def poll_now(
 # ----- Leads ----------------------------------------------------------------
 
 
+def _lead_where(user_id: int, f: LeadFilterIn) -> list:
+    conds = [JobLead.user_id == user_id]
+    if f.state and f.state != "all":
+        conds.append(JobLead.state == f.state)
+    if f.source_id is not None:
+        conds.append(JobLead.source_id == f.source_id)
+    if f.remote_only:
+        conds.append(JobLead.remote_policy == "remote")
+    if f.q and f.q.strip():
+        like = f"%{f.q.strip()}%"
+        conds.append(
+            JobLead.title.ilike(like)
+            | JobLead.organization_name.ilike(like)
+            | JobLead.location.ilike(like)
+        )
+    return conds
+
+
+@leads_router.get("/page", response_model=LeadPageOut)
+async def list_leads_page(
+    state: str = Query(default="new"),
+    source_id: Optional[int] = Query(default=None),
+    q: Optional[str] = Query(default=None),
+    remote_only: bool = Query(default=False),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> LeadPageOut:
+    """Paged inbox with a total. Selects list columns only — never the
+    description body or the raw upstream payload, which are what made a
+    page of Bright Data leads several MB."""
+    conds = _lead_where(user.id, LeadFilterIn(
+        state=state, source_id=source_id, q=q, remote_only=remote_only
+    ))
+    total = (
+        await db.execute(select(func.count(JobLead.id)).where(*conds))
+    ).scalar_one()
+    rows = (
+        await db.execute(
+            select(
+                JobLead.id, JobLead.source_id, JobLead.title,
+                JobLead.organization_name, JobLead.location,
+                JobLead.remote_policy, JobLead.source_url, JobLead.posted_at,
+                JobLead.first_seen_at, JobLead.expires_at, JobLead.state,
+                JobLead.tracked_job_id, JobLead.relevance_score,
+                (func.coalesce(func.length(JobLead.description_md), 0) > 0).label("has_description"),
+                JobSource.kind.label("source_kind"),
+                JobSource.label.label("source_label"),
+            )
+            .join(JobSource, JobSource.id == JobLead.source_id)
+            .where(*conds)
+            .order_by(JobLead.first_seen_at.desc(), JobLead.id.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+    ).mappings().all()
+    return LeadPageOut(
+        total=total, offset=offset, limit=limit,
+        items=[LeadOut(**dict(r)) for r in rows],
+    )
+
+
+@leads_router.get("/{lead_id:int}/description")
+async def lead_description(
+    lead_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    desc = (
+        await db.execute(
+            select(JobLead.description_md).where(
+                JobLead.id == lead_id, JobLead.user_id == user.id
+            )
+        )
+    ).first()
+    if desc is None:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return {"description_md": desc[0]}
+
+
 @leads_router.get("", response_model=list[LeadOut])
 async def list_leads(
     state: str = Query(default="new"),
@@ -625,6 +736,7 @@ async def list_leads(
     `state=all` to skip the state filter."""
     stmt = (
         select(JobLead, JobSource.kind, JobSource.label)
+        .options(defer(JobLead.raw_payload))
         .join(JobSource, JobSource.id == JobLead.source_id)
         .where(JobLead.user_id == user.id)
         .order_by(
@@ -731,43 +843,56 @@ async def lead_bulk_action(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> LeadActionOut:
-    """Bulk triage. `action` ∈ {interested, watching, dismissed}.
-    interested / watching auto-create a tracked_jobs row at that
-    status, queue a score task, and flip the lead to `promoted`."""
+    """Bulk triage over `ids` or over every lead matching `all_matching`.
+    "dismissed" is one UPDATE statement however many leads it touches.
+    "review" promotes each lead (fetch task → tracked job at to_review →
+    scoring), capped per request so one click can't flood the queue."""
     action = payload.action.strip().lower()
     if action not in LEAD_TRIAGE_STATES:
         raise HTTPException(
             status_code=422,
             detail=f"Unknown action '{action}'. Allowed: {sorted(LEAD_TRIAGE_STATES)}",
         )
+    if not payload.ids and payload.all_matching is None:
+        raise HTTPException(status_code=422, detail="Give ids or all_matching.")
+    if payload.all_matching is not None:
+        conds = _lead_where(user.id, payload.all_matching)
+    else:
+        conds = [JobLead.user_id == user.id, JobLead.id.in_(payload.ids)]
+
+    if action == "dismissed":
+        # Promoted leads keep their state — they're tracked jobs now.
+        result = await db.execute(
+            update(JobLead)
+            .where(*conds, JobLead.state != "promoted")
+            .values(state="dismissed")
+            .execution_options(synchronize_session=False)
+        )
+        await db.commit()
+        return LeadActionOut(dismissed=result.rowcount or 0)
+
     rows = (
         await db.execute(
-            select(JobLead).where(
-                JobLead.id.in_(payload.ids),
-                JobLead.user_id == user.id,
-            )
+            select(JobLead)
+            .options(defer(JobLead.description_md))
+            .where(*conds, JobLead.state != "promoted")
+            .order_by(JobLead.first_seen_at.desc(), JobLead.id.desc())
+            .limit(MAX_PROMOTE_PER_REQUEST + 1)
         )
     ).scalars().all()
+    more = len(rows) > MAX_PROMOTE_PER_REQUEST
+    rows = rows[:MAX_PROMOTE_PER_REQUEST]
     found_ids = {r.id for r in rows}
-    failed = [i for i in payload.ids if i not in found_ids]
+    failed = [i for i in payload.ids if i not in found_ids] if payload.ids else []
     promoted = 0
-    dismissed = 0
     for lead in rows:
-        if action == "dismissed":
-            lead.state = "dismissed"
-            dismissed += 1
-            continue
-        # action == "review" — promote to tracked_jobs at to_review.
-        if lead.state == "promoted" and lead.tracked_job_id:
-            # Already promoted — nothing to do, treat as success.
-            continue
         await _promote_lead(db, lead, user)
         promoted += 1
     await db.commit()
     return LeadActionOut(
         promoted=promoted,
-        dismissed=dismissed,
         failed_ids=failed,
+        remaining=1 if more else 0,
     )
 
 
