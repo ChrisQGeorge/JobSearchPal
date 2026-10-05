@@ -87,15 +87,22 @@ type RunSnapshot = {
   status: string; // starting | running | ready | imported | failed
   leads: number;
   found?: number;
+  auto_dismissed?: number;
   error: string | null;
 };
-type KeywordRun = { started_at: string; inserted: number; snapshots: RunSnapshot[] };
+type KeywordRun = {
+  started_at: string;
+  inserted: number;
+  auto_dismissed?: number;
+  snapshots: RunSnapshot[];
+};
 type LastRun = {
   started_at: string;
   finished_at: string;
   searches: number;
   failed: number;
   leads: number;
+  auto_dismissed?: number;
 };
 
 const runOf = (s: Source): KeywordRun | null => {
@@ -138,7 +145,9 @@ function RunProgress({ source }: { source: Source }) {
           <Spinner />
           <span>
             Searching LinkedIn via Bright Data — {done} of {total} searches done ·{" "}
-            {run.inserted} lead{run.inserted === 1 ? "" : "s"} imported · {minsSince(run.started_at)} min
+            {run.inserted} lead{run.inserted === 1 ? "" : "s"} imported
+            {run.auto_dismissed ? ` · ${run.auto_dismissed} auto-dismissed` : ""} ·{" "}
+            {minsSince(run.started_at)} min
           </span>
           <span className="ml-auto text-corp-muted">{open ? "hide" : "details"}</span>
         </div>
@@ -165,7 +174,9 @@ function RunProgress({ source }: { source: Source }) {
               <span className="truncate">{x.label}</span>
               <span className="ml-auto text-corp-muted whitespace-nowrap">
                 {x.status === "imported"
-                  ? `${x.leads} new${x.found != null && x.found !== x.leads ? ` of ${x.found}` : ""}`
+                  ? `${x.leads} new${x.auto_dismissed ? ` · ${x.auto_dismissed} auto-dismissed` : ""}${
+                      x.found != null && x.found !== x.leads ? ` of ${x.found} found` : ""
+                    }`
                   : x.status === "failed"
                     ? x.error ?? "failed"
                     : x.status === "ready"
@@ -184,6 +195,13 @@ function RunProgress({ source }: { source: Source }) {
 
 function LastRunNote({ source }: { source: Source }) {
   const lr = source.filters?.last_run as LastRun | undefined;
+  const lastAuto = source.filters?.last_auto_dismissed;
+  if ((!lr || typeof lr !== "object") && typeof lastAuto === "number" && lastAuto > 0) {
+    // Non–Bright Data sources only record the last poll's tally.
+    return (
+      <span className="text-[11px] text-corp-muted">last poll: {lastAuto} auto-dismissed</span>
+    );
+  }
   if (!lr || typeof lr !== "object" || isCollecting(source)) return null;
   const mins = Math.max(
     1,
@@ -192,7 +210,8 @@ function LastRunNote({ source }: { source: Source }) {
   return (
     <span className="text-[11px] text-corp-muted" title={`Finished ${new Date(lr.finished_at).toLocaleString()}`}>
       last import: {lr.searches} search{lr.searches === 1 ? "" : "es"} · {lr.leads} new lead
-      {lr.leads === 1 ? "" : "s"} · {mins} min
+      {lr.leads === 1 ? "" : "s"}
+      {lr.auto_dismissed ? ` · ${lr.auto_dismissed} auto-dismissed` : ""} · {mins} min
       {lr.failed ? ` · ${lr.failed} failed` : ""}
     </span>
   );

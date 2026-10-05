@@ -268,20 +268,33 @@ async def poll_source(
         source.filters = f
 
     cap = max(1, int(source.max_leads_per_poll or 100))
-    inserted, err = await _insert_leads(db, source, raw_leads, cap)
+    inserted, err, auto_dismissed = await _insert_leads(db, source, raw_leads, cap)
     if err is not None:
         return 0, err
     source.last_polled_at = _now()
     source.last_lead_count = inserted
     source.last_error = None
+    _set_filters(source, last_auto_dismissed=auto_dismissed or None)
     return inserted, None
 
 
 async def _insert_leads(
     db: AsyncSession, source: JobSource, raw_leads: list[dict[str, Any]], cap: int
-) -> tuple[int, Optional[str]]:
+) -> tuple[int, Optional[str], int]:
     """Dedupe + filter + insert up to `cap` new JobLead rows. Returns
-    (inserted, error) — error only on a concurrent-insert race."""
+    (inserted, error, auto_dismissed) — error only on a concurrent-insert
+    race. Leads matching one of the user's auto-dismiss keyword filters
+    are stored already dismissed (so dedupe keeps them from coming back)
+    and don't count toward `cap`."""
+    from app.skills.lead_filters import auto_dismiss_filters, compile_matcher
+
+    try:
+        # Compiled once per batch; each lead is then a few regex checks.
+        auto_filters = [compile_matcher(f) for f in auto_dismiss_filters(source.user_id)]
+    except Exception:  # pragma: no cover — a bad store must not block imports
+        log.exception("Could not load auto-dismiss filters")
+        auto_filters = []
+    auto_dismissed = 0
     now = _now()
     expires = now + timedelta(hours=max(1, source.lead_ttl_hours))
 
@@ -317,6 +330,9 @@ async def _insert_leads(
         if ext_id in existing_ext:
             continue
         existing_ext.add(ext_id)
+        dismiss = bool(auto_filters) and any(
+            m({**raw, "title": title}) for m in auto_filters
+        )
         db.add(
             JobLead(
                 user_id=source.user_id,
@@ -331,15 +347,18 @@ async def _insert_leads(
                 posted_at=raw.get("posted_at"),
                 first_seen_at=now,
                 expires_at=expires,
-                state="new",
+                state="dismissed" if dismiss else "new",
                 raw_payload=raw.get("raw"),
             )
         )
-        inserted += 1
+        if dismiss:
+            auto_dismissed += 1
+        else:
+            inserted += 1
 
     # Flush once so any unrelated FK / type errors surface here while we
     # still have a clean session (and the caller's commit can proceed).
-    if inserted:
+    if inserted or auto_dismissed:
         try:
             await db.flush()
         except IntegrityError as exc:
@@ -353,8 +372,8 @@ async def _insert_leads(
                 source.kind,
                 source.slug_or_url,
             )
-            return 0, str(exc)
-    return inserted, None
+            return 0, str(exc), 0
+    return inserted, None, auto_dismissed
 
 
 # ---- Bright Data keyword discovery: one run per row, imported as each lands --
@@ -469,14 +488,16 @@ async def _poll_keyword(db: AsyncSession, source: JobSource) -> tuple[int, Optio
             s["error"] = f"download failed: {exc}"[:300]
             continue
         room = cap - int(run.get("inserted") or 0)
-        n = 0
+        n = auto = 0
         if room > 0:
-            n, err = await _insert_leads(db, source, leads, room)
+            n, err, auto = await _insert_leads(db, source, leads, room)
             if err is not None:
                 return inserted_now, None  # race with another poll — retry next tick
         s["status"] = "imported"
         s["leads"] = n
+        s["auto_dismissed"] = auto
         s["found"] = len(leads)
+        run["auto_dismissed"] = int(run.get("auto_dismissed") or 0) + auto
         s["error"] = None if room > 0 else "skipped — run reached the Top # cap"
         run["inserted"] = int(run.get("inserted") or 0) + n
         inserted_now += n
@@ -494,6 +515,7 @@ async def _poll_keyword(db: AsyncSession, source: JobSource) -> tuple[int, Optio
         "searches": len(run["snapshots"]),
         "failed": len(failed),
         "leads": run["inserted"],
+        "auto_dismissed": int(run.get("auto_dismissed") or 0),
     })
     source.last_polled_at = _now()
     source.last_lead_count = run["inserted"]

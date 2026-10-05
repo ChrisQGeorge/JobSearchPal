@@ -17,6 +17,8 @@ export type KeywordFilter = {
   name: string;
   mode: "off" | "include" | "exclude";
   match: "all" | "any";
+  // Newly imported leads that match are stored already dismissed.
+  auto_dismiss?: boolean;
   conditions: FilterCondition[];
 };
 
@@ -96,6 +98,7 @@ export function KeywordFilters({
                 name: "",
                 mode: "include",
                 match: "all",
+                auto_dismiss: false,
                 conditions: [{ field: "title", keywords: [] }],
               },
             ])
@@ -187,6 +190,20 @@ export function KeywordFilters({
                   matches {counts[f.id].toLocaleString()}
                 </span>
               ) : null}
+              <label
+                className={`text-[11px] flex items-center gap-1 ${
+                  f.auto_dismiss ? "text-corp-danger" : "text-corp-muted"
+                }`}
+                title="When new leads are imported, ones matching this filter are saved straight to Dismissed — whatever this filter's Off / Show only / Hide setting. Leads already in the inbox aren't touched (use Show only → select all → Dismiss for those)."
+              >
+                <input
+                  type="checkbox"
+                  className="accent-corp-accent"
+                  checked={!!f.auto_dismiss}
+                  onChange={(e) => patch(i, { auto_dismiss: e.target.checked })}
+                />
+                Auto-dismiss new matches
+              </label>
               {isCollapsed ? (
                 <span className="text-[11px] text-corp-muted">
                   {f.conditions.length} field{f.conditions.length === 1 ? "" : "s"} · {kwTotal} keyword

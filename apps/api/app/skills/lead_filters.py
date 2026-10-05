@@ -78,6 +78,9 @@ def _clean(f: Any) -> Optional[dict]:
         "name": (str(f.get("name") or "").strip() or "Untitled filter")[:60],
         "mode": f.get("mode") if f.get("mode") in MODES else "off",
         "match": f.get("match") if f.get("match") in MATCHES else "all",
+        # Newly imported leads matching this filter are stored already
+        # dismissed (independent of `mode`, which only affects viewing).
+        "auto_dismiss": bool(f.get("auto_dismiss")),
         "conditions": conditions,
     }
 
@@ -125,6 +128,39 @@ def keyword_condition(column, keywords: list[str]):
     if pat is None:
         return None
     return func.coalesce(column, "").regexp_match(pat, flags="i")
+
+
+def compile_matcher(flt: dict):
+    """Python twin of filter_condition() for leads that aren't in the
+    database yet (import time): returns `match(lead_dict) -> bool`, with
+    patterns compiled once so a batch of thousands is a few in-memory
+    regex checks per lead. `lead` uses the JobLead column names. Same
+    whole-word pattern; Python's re and MySQL's ICU agree on everything
+    keyword_pattern() emits."""
+    conds = [
+        (cond["field"], re.compile(pat, re.I))
+        for cond in flt["conditions"]
+        if (pat := keyword_pattern(cond["keywords"])) is not None
+    ]
+    combine = all if flt["match"] == "all" else any
+
+    def match(lead: dict) -> bool:
+        if not conds:
+            return False
+        return combine(rx.search(str(lead.get(field) or "")) is not None for field, rx in conds)
+
+    return match
+
+
+def lead_matches(flt: dict, lead: dict) -> bool:
+    return compile_matcher(flt)(lead)
+
+
+def auto_dismiss_filters(user_id: int) -> list[dict]:
+    return [
+        f for f in get_filters(user_id)
+        if f["auto_dismiss"] and any(c["keywords"] for c in f["conditions"])
+    ]
 
 
 def filter_condition(model, flt: dict):

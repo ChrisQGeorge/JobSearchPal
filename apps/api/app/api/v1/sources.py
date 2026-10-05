@@ -287,6 +287,7 @@ class LeadKeywordFilter(BaseModel):
     name: str = Field(default="Untitled filter", max_length=60)
     mode: str = "off"
     match: str = "all"
+    auto_dismiss: bool = False
     conditions: list[LeadFilterCondition] = []
 
 
