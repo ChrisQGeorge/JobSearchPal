@@ -254,6 +254,8 @@ class LeadFilterIn(BaseModel):
     source_id: Optional[int] = None
     q: Optional[str] = None
     remote_only: bool = False
+    # Apply the user's saved keyword filters (include / exclude modes).
+    use_filters: bool = False
 
 
 class LeadActionIn(BaseModel):
@@ -270,6 +272,21 @@ class LeadPageOut(BaseModel):
     offset: int
     limit: int
     items: list[LeadOut]
+    # Per saved filter: how many leads in the current state / source /
+    # search its keywords match (independent of the other filters).
+    filter_counts: dict[str, int] = {}
+
+
+class LeadKeywordFilter(BaseModel):
+    id: Optional[str] = None
+    name: str = Field(default="Filter", max_length=60)
+    field: str = "title"
+    mode: str = "off"
+    keywords: list[str] = []
+
+
+class LeadFiltersIn(BaseModel):
+    filters: list[LeadKeywordFilter]
 
 
 class LeadActionOut(BaseModel):
@@ -656,7 +673,42 @@ def _lead_where(user_id: int, f: LeadFilterIn) -> list:
             | JobLead.organization_name.ilike(like)
             | JobLead.location.ilike(like)
         )
+    if f.use_filters:
+        conds.extend(_keyword_filter_conds(user_id))
     return conds
+
+
+def _keyword_filter_conds(user_id: int) -> list:
+    """Active saved keyword filters → SQL: every include filter must
+    match, no exclude filter may match. Each filter checks only its own
+    field."""
+    from app.skills.lead_filters import get_filters, keyword_condition
+
+    out = []
+    for flt in get_filters(user_id):
+        if flt["mode"] == "off":
+            continue
+        cond = keyword_condition(getattr(JobLead, flt["field"]), flt["keywords"])
+        if cond is None:
+            continue
+        out.append(cond if flt["mode"] == "include" else ~cond)
+    return out
+
+
+@leads_router.get("/filters")
+async def get_lead_filters(user: User = Depends(get_current_user)) -> dict:
+    from app.skills.lead_filters import get_filters
+
+    return {"filters": get_filters(user.id)}
+
+
+@leads_router.put("/filters")
+async def put_lead_filters(
+    payload: LeadFiltersIn, user: User = Depends(get_current_user)
+) -> dict:
+    from app.skills.lead_filters import save_filters
+
+    return {"filters": save_filters(user.id, [f.model_dump() for f in payload.filters])}
 
 
 @leads_router.get("/page", response_model=LeadPageOut)
@@ -665,6 +717,7 @@ async def list_leads_page(
     source_id: Optional[int] = Query(default=None),
     q: Optional[str] = Query(default=None),
     remote_only: bool = Query(default=False),
+    use_filters: bool = Query(default=False),
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
@@ -673,9 +726,22 @@ async def list_leads_page(
     """Paged inbox with a total. Selects list columns only — never the
     description body or the raw upstream payload, which are what made a
     page of Bright Data leads several MB."""
-    conds = _lead_where(user.id, LeadFilterIn(
-        state=state, source_id=source_id, q=q, remote_only=remote_only
-    ))
+    base = LeadFilterIn(state=state, source_id=source_id, q=q, remote_only=remote_only)
+    conds = _lead_where(user.id, base.model_copy(update={"use_filters": use_filters}))
+
+    filter_counts: dict[str, int] = {}
+    if use_filters:
+        from app.skills.lead_filters import get_filters, keyword_condition
+
+        base_conds = _lead_where(user.id, base)
+        for flt in get_filters(user.id):
+            cond = keyword_condition(getattr(JobLead, flt["field"]), flt["keywords"])
+            if cond is None:
+                filter_counts[flt["id"]] = 0
+                continue
+            filter_counts[flt["id"]] = (
+                await db.execute(select(func.count(JobLead.id)).where(*base_conds, cond))
+            ).scalar_one()
     total = (
         await db.execute(select(func.count(JobLead.id)).where(*conds))
     ).scalar_one()
@@ -701,6 +767,7 @@ async def list_leads_page(
     return LeadPageOut(
         total=total, offset=offset, limit=limit,
         items=[LeadOut(**dict(r)) for r in rows],
+        filter_counts=filter_counts,
     )
 
 

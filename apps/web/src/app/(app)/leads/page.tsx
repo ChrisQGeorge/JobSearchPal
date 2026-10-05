@@ -13,6 +13,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { PageShell } from "@/components/PageShell";
 import { api, apiUrl, ApiError } from "@/lib/api";
+import { KeywordFilters, type KeywordFilter } from "./_panels/KeywordFilters";
 
 type SourceKindExample = { label: string; value: string };
 
@@ -397,6 +398,36 @@ export default function LeadsPage() {
     return () => clearTimeout(t);
   }, [search]);
 
+  // Saved keyword filters: edited locally, saved ~0.5s after the last
+  // change, then the inbox reloads with them applied server-side.
+  const [kwFilters, setKwFilters] = useState<KeywordFilter[]>([]);
+  const [kwDirty, setKwDirty] = useState(0);
+  const [filtersVersion, setFiltersVersion] = useState(0);
+  const [filterCounts, setFilterCounts] = useState<Record<string, number>>({});
+  useEffect(() => {
+    api
+      .get<{ filters: KeywordFilter[] }>("/api/v1/job-leads/filters")
+      .then((out) => setKwFilters(out.filters))
+      .catch(() => {});
+  }, []);
+  useEffect(() => {
+    if (!kwDirty) return;
+    const t = setTimeout(async () => {
+      try {
+        const out = await api.put<{ filters: KeywordFilter[] }>("/api/v1/job-leads/filters", {
+          filters: kwFilters,
+        });
+        // Adopt server-assigned ids without clobbering edits made since.
+        setKwFilters((cur) => cur.map((f, i) => ({ ...f, id: f.id ?? out.filters[i]?.id })));
+        setFiltersVersion((v) => v + 1);
+      } catch {
+        setErr("Couldn't save keyword filters.");
+      }
+    }, 500);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [kwDirty]);
+
   async function loadAll() {
     setLoading(true);
     setErr(null);
@@ -424,6 +455,7 @@ export default function LeadsPage() {
       source_id: sourceFilter === "all" ? null : sourceFilter,
       q: debouncedSearch || null,
       remote_only: remoteOnly,
+      use_filters: true,
     };
   }
 
@@ -434,11 +466,15 @@ export default function LeadsPage() {
       if (sourceFilter !== "all") params.set("source_id", String(sourceFilter));
       if (debouncedSearch) params.set("q", debouncedSearch);
       if (remoteOnly) params.set("remote_only", "true");
+      params.set("use_filters", "true");
       params.set("offset", String(pageArg * pageSize));
       params.set("limit", String(pageSize));
-      const out = await api.get<{ total: number; items: Lead[] }>(
-        `/api/v1/job-leads/page?${params.toString()}`,
-      );
+      const out = await api.get<{
+        total: number;
+        items: Lead[];
+        filter_counts?: Record<string, number>;
+      }>(`/api/v1/job-leads/page?${params.toString()}`);
+      setFilterCounts(out.filter_counts ?? {});
       // Page emptied by an action (e.g. dismissed the last page) — step back.
       if (out.items.length === 0 && out.total > 0 && pageArg > 0) {
         const last = Math.max(0, Math.ceil(out.total / pageSize) - 1);
@@ -494,7 +530,7 @@ export default function LeadsPage() {
     if (page !== 0) setPage(0);
     else void loadLeads(0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stateFilter, sourceFilter, remoteOnly, debouncedSearch, pageSize]);
+  }, [stateFilter, sourceFilter, remoteOnly, debouncedSearch, pageSize, filtersVersion]);
 
   useEffect(() => {
     void loadLeads(page);
@@ -914,6 +950,16 @@ export default function LeadsPage() {
         ) : actionMsg ? (
           <div className="text-[11px] text-corp-muted mb-2">{actionMsg}</div>
         ) : null}
+
+        <KeywordFilters
+          filters={kwFilters}
+          counts={filterCounts}
+          searchText={search}
+          onChange={(next) => {
+            setKwFilters(next);
+            setKwDirty((n) => n + 1);
+          }}
+        />
 
         {pageAllSelected && !allMatching && totalLeads > leads.length ? (
           <div className="text-xs mb-3 text-center">
