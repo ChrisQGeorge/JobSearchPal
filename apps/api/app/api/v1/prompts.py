@@ -3,6 +3,7 @@
 GET  /prompts                 — every agent action's prompt, with flags
 GET  /prompts/{key}           — default + custom variants, weights, shares
 PUT  /prompts/{key}           — replace the variant list
+DELETE /prompts/{key}/variants/{id} — permanently delete one variant
 POST /prompts/{key}/preview   — render a template against sample values
 GET  /prompts/{key}/stats     — per-variant outcomes for document prompts
 """
@@ -70,6 +71,20 @@ async def save_prompt(
     _require(key)
     try:
         return reg.save_prompt(key, [v.model_dump() for v in payload.variants])
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@router.delete("/{key}/variants/{variant_id}")
+async def delete_variant(
+    key: str, variant_id: str, _: User = Depends(get_current_user)
+) -> dict:
+    """Permanently delete one custom variant (frees its slot)."""
+    _require(key)
+    try:
+        return reg.delete_variant(key, variant_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail=f"No variant '{variant_id}' on prompt '{key}'")
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 

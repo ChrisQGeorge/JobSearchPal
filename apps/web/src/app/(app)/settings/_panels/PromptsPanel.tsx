@@ -36,6 +36,8 @@ type PromptDetail = {
   tracks_documents: boolean;
   placeholders: string[];
   variants: Variant[];
+  // Slot cap, built-in default included.
+  max_variants?: number;
 };
 
 type StatRow = {
@@ -58,6 +60,11 @@ type Preview = {
   missing_placeholders: string[];
   unknown_placeholders: string[];
 };
+
+// Server's explanation (e.g. the slot cap) rather than a generic guess.
+function errText(e: ApiError): string {
+  return typeof e.detail === "string" ? e.detail : e.info?.message ?? `HTTP ${e.status}`;
+}
 
 const pct = (r: number | null) => (r == null ? "—" : `${Math.round(r * 100)}%`);
 
@@ -131,10 +138,45 @@ export function PromptsPanel() {
     setDirty(true);
   }
 
-  function removeVariant(i: number) {
+  async function removeVariant(i: number) {
     if (!detail) return;
-    setDetail({ ...detail, variants: detail.variants.filter((_, j) => j !== i) });
-    setDirty(true);
+    const v = detail.variants[i];
+    // Never saved: just drop it from the editor.
+    if (!v.id) {
+      setDetail({ ...detail, variants: detail.variants.filter((_, j) => j !== i) });
+      setPreviews({});
+      return;
+    }
+    if (
+      !window.confirm(
+        `Permanently delete "${v.name}"? This frees its slot. Documents it already wrote keep their attribution.`,
+      )
+    )
+      return;
+    setSaving(true);
+    setMsg(null);
+    try {
+      const out = await api.delete<PromptDetail>(
+        `/api/v1/prompts/${detail.key}/variants/${encodeURIComponent(v.id)}`,
+      );
+      // Drop just that variant locally so other unsaved edits survive.
+      setDetail((d) =>
+        d
+          ? {
+              ...d,
+              max_variants: out?.max_variants ?? d.max_variants,
+              variants: d.variants.filter((x) => x.id !== v.id),
+            }
+          : d,
+      );
+      setPreviews({});
+      setMsg(`Deleted "${v.name}" — slot freed.`);
+      void loadList();
+    } catch (e) {
+      setMsg(e instanceof ApiError ? `Delete failed: ${errText(e)}` : "Delete failed.");
+    } finally {
+      setSaving(false);
+    }
   }
 
   async function preview(i: number) {
@@ -171,7 +213,7 @@ export function PromptsPanel() {
     } catch (e) {
       setMsg(
         e instanceof ApiError
-          ? `Save failed (HTTP ${e.status}) — every custom variant needs a non-empty template.`
+          ? `Save failed: ${errText(e)}`
           : "Save failed.",
       );
     } finally {
@@ -184,6 +226,9 @@ export function PromptsPanel() {
     for (const p of list) (g[p.group] ??= []).push(p);
     return Object.entries(g);
   }, [list]);
+
+  const maxSlots = detail?.max_variants ?? 12;
+  const atCap = detail ? detail.variants.length >= maxSlots : false;
 
   const activeCount = detail
     ? detail.variants.filter((v) => v.enabled && v.weight > 0).length
@@ -272,6 +317,13 @@ export function PromptsPanel() {
                   : activeCount === 0
                     ? "Nothing enabled — the built-in default will be used."
                     : "One variant active."}
+              </p>
+              <p className={`text-[11px] ${atCap ? "text-corp-accent2" : "text-corp-muted"}`}>
+                Slots used: {detail.variants.length} / {maxSlots} (built-in default
+                included).{" "}
+                {atCap
+                  ? "Full — delete a variant to make room. Disabling doesn't free a slot."
+                  : "Deleting a variant frees its slot; disabling keeps it."}
               </p>
             </div>
 
@@ -394,7 +446,8 @@ export function PromptsPanel() {
                       type="button"
                       className="jsp-btn-ghost text-xs"
                       onClick={() => addVariant(i)}
-                      disabled={saving}
+                      disabled={saving || atCap}
+                      title={atCap ? `All ${maxSlots} slots used — delete a variant first.` : undefined}
                     >
                       Duplicate as new variant
                     </button>
@@ -411,7 +464,7 @@ export function PromptsPanel() {
                         <button
                           type="button"
                           className="jsp-btn-ghost text-xs text-corp-danger border-corp-danger/40"
-                          onClick={() => removeVariant(i)}
+                          onClick={() => void removeVariant(i)}
                           disabled={saving}
                         >
                           Delete

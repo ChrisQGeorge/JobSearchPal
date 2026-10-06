@@ -347,6 +347,15 @@ TOOLS: list[Tool] = [
         _upsert_prompt_variant, write=True,
     ),
     Tool(
+        "delete_prompt_variant",
+        "Permanently delete ONE custom prompt variant, freeing its slot (each prompt "
+        "holds max_variants incl. the built-in default). The built-in can't be deleted.",
+        _obj({"key": _PROMPT_KEY, "id": {**_STR, "description": "Variant id from get_prompt"}},
+             ["key", "id"]),
+        lambda call, a: call("DELETE", f"/prompts/{a['key']}/variants/{a['id']}"),
+        write=True,
+    ),
+    Tool(
         "save_prompt",
         "Replace a prompt's ENTIRE variant list. Variants you omit are DELETED — prefer "
         "upsert_prompt_variant for single changes. Include {id:'default'} to keep the built-in.",

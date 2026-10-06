@@ -247,6 +247,8 @@ def get_prompt(key: str) -> dict:
         "tracks_documents": p.tracks_documents,
         "placeholders": placeholders(default_text),
         "variants": variants,
+        # Slot cap, built-in default included.
+        "max_variants": MAX_VARIANTS,
     }
 
 
@@ -324,12 +326,34 @@ def save_prompt(key: str, variants: list[Mapping[str, Any]]) -> dict:
                 clean["updated_at"] = now
             custom.append(clean)
         if len(custom) + 1 > MAX_VARIANTS:
-            raise ValueError(f"At most {MAX_VARIANTS} variants per prompt.")
+            raise ValueError(
+                f"At most {MAX_VARIANTS} variants per prompt (built-in default "
+                f"included) — delete one to free a slot."
+            )
         data[key] = {
             "default_enabled": default_enabled,
             "default_weight": default_weight,
             "variants": custom,
         }
+        _save(data)
+    return get_prompt(key)
+
+
+def delete_variant(key: str, variant_id: str) -> dict:
+    """Permanently remove one custom variant, freeing its slot. The
+    built-in default can't be deleted (disable it instead). Documents
+    it already generated keep their attribution string."""
+    if key not in BY_KEY:
+        raise KeyError(key)
+    if variant_id == DEFAULT_ID:
+        raise ValueError("The built-in default can't be deleted — disable it instead.")
+    with _LOCK:
+        data = _load()
+        entry = _entry(data, key)
+        kept = [v for v in entry["variants"] if v.get("id") != variant_id]
+        if len(kept) == len(entry["variants"]):
+            raise LookupError(variant_id)
+        data[key] = {**entry, "variants": kept}
         _save(data)
     return get_prompt(key)
 
