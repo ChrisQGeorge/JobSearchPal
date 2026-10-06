@@ -723,6 +723,7 @@ function QueueRow({
     "bg-corp-surface2 text-corp-muted border-corp-border";
 
   const isCompanion = item.kind === "companion";
+  const isJev = item.source === "jev";
 
   // Cost formatted as $0.0023 if present.
   const costStr =
@@ -733,7 +734,11 @@ function QueueRow({
     item.duration_ms != null ? `${(item.duration_ms / 1000).toFixed(1)}s` : null;
 
   return (
-    <li className="flex items-start gap-3 py-3 px-4">
+    <li
+      className={`flex items-start gap-3 py-3 px-4 ${
+        isJev ? "border-l-2 border-orange-500/60 bg-orange-500/5" : ""
+      }`}
+    >
       <span
         className={`inline-block px-2 py-0.5 rounded text-[10px] uppercase tracking-wider border shrink-0 mt-0.5 ${pillClass}`}
       >
@@ -782,7 +787,10 @@ function QueueRow({
           {costStr ? <span>{costStr}</span> : null}
           {item.num_turns != null ? <span>{item.num_turns} turns</span> : null}
         </div>
-        {item.last_text && item.status !== "done" && item.status !== "error" ? (
+        {item.last_text &&
+        item.status !== "error" &&
+        // Jev's final line is its verdict ("Fit 72 · GO"), worth keeping.
+        (item.status !== "done" || isJev) ? (
           <div className="text-xs text-corp-text/80 mt-1 italic truncate">
             {item.last_text}
           </div>
@@ -919,6 +927,7 @@ const SOURCE_LABEL: Record<string, string> = {
   org_research: "RESEARCH",
   autofill: "AUTOFILL",
   resume_ingest: "INGEST",
+  jev: "JEV",
 };
 const SOURCE_COLOR: Record<string, string> = {
   fetch: "bg-sky-500/25 text-sky-300 border-sky-500/40",
@@ -943,6 +952,7 @@ const SOURCE_COLOR: Record<string, string> = {
   org_research: "bg-cyan-500/25 text-cyan-300 border-cyan-500/40",
   autofill: "bg-fuchsia-500/25 text-fuchsia-300 border-fuchsia-500/40",
   resume_ingest: "bg-lime-500/25 text-lime-300 border-lime-500/40",
+  jev: "bg-orange-500/25 text-orange-300 border-orange-500/40",
 };
 
 function LiveStreamPanel() {

@@ -2183,7 +2183,14 @@ async def run_jev_score(
     # every API request failed. expire_on_commit=False keeps the loaded
     # objects usable; callers have no pending writes at this point.
     await db.commit()
-    return await score_job_fit(api_key, job_state=job_state)
+    return await score_job_fit(
+        api_key,
+        job_state=job_state,
+        activity=(
+            f"job:{job.id}",
+            f"Jev score — {job.title or 'job'}" + (f" @ {org_name}" if org_name else ""),
+        ),
+    )
 
 
 def _override_fit_with_jev(job: TrackedJob, jev_data: dict) -> None:

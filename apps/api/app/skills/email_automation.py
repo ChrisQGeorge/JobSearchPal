@@ -582,7 +582,10 @@ async def jev_triage(db, row) -> tuple[Optional[dict], dict]:
                 "body": (row.body_md or "")[:8000],
             },
             "context": "An email received by a job seeker who tracks their job applications.",
-        })
+        }, activity=(
+            f"email:{row.id}",
+            f"Jev email triage — {(row.subject or '(no subject)')[:70]}",
+        ))
     except JevError as exc:
         return None, {"jev": f"error: {exc}"[:300]}
     jobs = (

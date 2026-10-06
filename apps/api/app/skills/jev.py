@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -393,8 +395,59 @@ class JevError(RuntimeError):
     quota errors instead of burning retries."""
 
 
-async def _post(api_key: str, state: dict, questions: dict, timeout_seconds: int) -> dict:
-    """One System One round-trip; returns the `answers` map."""
+# ---- Companion Activity feed ----------------------------------------------
+#
+# Every Jev round-trip shows up on the Companion Activity page as its own
+# task row (source "jev"), like the LLM skills do. `activity` is
+# (item_id, label); item_id should be stable per logical unit of work so a
+# rescore updates the same row instead of piling up duplicates.
+
+Activity = Optional[tuple[str, str]]
+
+
+def _emit(activity: Activity, kind: str, **extra: Any) -> None:
+    if not activity:
+        return
+    try:
+        from app.skills import queue_bus
+
+        queue_bus.publish({
+            "kind": kind,
+            "source": "jev",
+            "item_id": activity[0],
+            "label": activity[1],
+            "t": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
+            **extra,
+        })
+    except Exception:  # the feed is cosmetic — never break a Jev call
+        log.debug("jev: activity publish failed", exc_info=True)
+
+
+def _finish(activity: Activity, started: float, summary: str) -> None:
+    _emit(activity, "text", text=summary)
+    _emit(activity, "done", duration_ms=int((time.monotonic() - started) * 1000))
+
+
+async def _post(
+    api_key: str,
+    state: dict,
+    questions: dict,
+    timeout_seconds: int,
+    activity: Activity = None,
+) -> dict:
+    """One System One round-trip; returns the `answers` map. Narrates
+    start / failure to the activity feed; callers report success via
+    _finish with a human summary."""
+    _emit(activity, "start")
+    _emit(activity, "text", text=f"Asking Jev {len(questions)} question(s)…")
+    try:
+        return await _post_raw(api_key, state, questions, timeout_seconds)
+    except JevError as exc:
+        _emit(activity, "error", text=str(exc))
+        raise
+
+
+async def _post_raw(api_key: str, state: dict, questions: dict, timeout_seconds: int) -> dict:
     import httpx
 
     timeout = httpx.Timeout(connect=15.0, read=float(timeout_seconds), write=30.0, pool=10.0)
@@ -500,7 +553,11 @@ def save_email_questions(texts: dict[str, Any]) -> None:
 
 
 async def classify_email(
-    api_key: str, *, email_state: dict[str, Any], timeout_seconds: int = 45
+    api_key: str,
+    *,
+    email_state: dict[str, Any],
+    timeout_seconds: int = 45,
+    activity: Activity = None,
 ) -> dict[str, float]:
     """Return {intent: probability} for every email type, plus
     "_phone_screen": probability that an interview invite is only a
@@ -523,11 +580,20 @@ async def classify_email(
         "criteria": {"true": "First recruiter call or phone screen.",
                      "false": "Team interview, or not an invitation at all."},
     }
-    answers = await _post(api_key, email_state, questions, timeout_seconds)
+    started = time.monotonic()
+    answers = await _post(api_key, email_state, questions, timeout_seconds, activity)
     try:
-        return {k: float(answers[k]["noul"]) for k in questions}
+        probs = {k: float(answers[k]["noul"]) for k in questions}
     except (KeyError, TypeError, ValueError) as exc:
-        raise JevError(f"Jev email triage: unexpected answer shape: {answers!r}"[:500]) from exc
+        err = JevError(f"Jev email triage: unexpected answer shape: {answers!r}"[:500])
+        _emit(activity, "error", text=str(err))
+        raise err from exc
+    best = max((k for k in probs if not k.startswith("_")), key=probs.get)
+    _finish(
+        activity, started,
+        f"Most likely: {EMAIL_QUESTION_LABELS.get(best, best)} ({probs[best]:.0%})",
+    )
+    return probs
 
 
 async def score_job_fit(
@@ -535,6 +601,7 @@ async def score_job_fit(
     *,
     job_state: dict[str, Any],
     timeout_seconds: int = 60,
+    activity: Activity = None,
 ) -> dict[str, Any]:
     """One evaluation round-trip covering all five dimensions plus the
     worth-applying judgment. Returns a jd_analysis-shaped dict:
@@ -543,7 +610,8 @@ async def score_job_fit(
      recommendation ("go"/"maybe"/"no-go"), confidence (0-1, mean),
      apply_probability (0-1), engine ("jev")}."""
     questions, levels, weights = _build_questions()
-    answers = await _post(api_key, job_state, questions, timeout_seconds)
+    started = time.monotonic()
+    answers = await _post(api_key, job_state, questions, timeout_seconds, activity)
 
     def _to_pct(raw_score: float, n: int) -> int:
         # Jev's score is the probability-weighted level INDEX, 0..N-1 —
@@ -567,9 +635,9 @@ async def score_job_fit(
             confidences.append(conf)
         apply_p = float(answers["apply"]["noul"])
     except (KeyError, TypeError, ValueError) as exc:
-        raise JevError(
-            f"Jev API returned an unexpected shape: {answers!r}"[:500]
-        ) from exc
+        err = JevError(f"Jev API returned an unexpected shape: {answers!r}"[:500])
+        _emit(activity, "error", text=str(err))
+        raise err from exc
 
     # Weighted average — Settings → Jev scoring controls the weights
     # (0 drops a dimension from the headline while still reporting its
@@ -594,6 +662,10 @@ async def score_job_fit(
         "go" if apply_p >= a["go_threshold"]
         else "no-go" if apply_p <= a["nogo_threshold"]
         else "maybe"
+    )
+    _finish(
+        activity, started,
+        f"Fit {fit_score} · {recommendation.upper()} (apply {apply_p:.0%})",
     )
     return {
         "engine": "jev",
