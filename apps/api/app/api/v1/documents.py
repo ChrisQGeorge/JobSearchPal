@@ -51,6 +51,7 @@ from app.models.history import (
 from app.models.jobs import Organization, TrackedJob
 from app.models.preferences import Demographics, ResumeProfile, WorkAuthorization
 from app.models.user import User
+from app.skills.prompt_registry import render_prompt
 from app.skills.runner import ClaudeCodeError
 
 log = logging.getLogger(__name__)
@@ -3154,14 +3155,14 @@ async def humanize_document(
     # self-check's reference to planted mistakes so the prompt reads
     # coherently either way.
     if payload.plant_mistakes:
-        imperfections_section = _HUMANIZE_IMPERFECTIONS_SECTION
+        imperfections_section = render_prompt("humanize_imperfections", {}).text
         self_check_mistakes = (
             " Then confirm every intentional mistake you planted is actually "
             "present in the text and listed in `intentional_mistakes`."
         )
         mistakes_schema_hint = "3-6 planted imperfections, listed for user audit"
     else:
-        imperfections_section = _HUMANIZE_NO_IMPERFECTIONS_SECTION
+        imperfections_section = render_prompt("humanize_no_imperfections", {}).text
         self_check_mistakes = ""
         mistakes_schema_hint = "empty — imperfections disabled for this run"
 

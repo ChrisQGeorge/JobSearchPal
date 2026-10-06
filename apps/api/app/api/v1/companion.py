@@ -23,6 +23,7 @@ from app.schemas.companion import (
     SendMessageIn,
     SendMessageOut,
 )
+from app.skills.prompt_registry import render_prompt
 from app.skills.runner import ClaudeCodeError, run_claude_prompt
 
 # Compact primer handed to Claude on every Companion turn. It describes the
@@ -402,28 +403,20 @@ def _format_entity_for_prompt(entity, entity_type: str) -> str:
     return "\n".join(lines)
 
 
-def _build_analyze_seed_prompt(label: str, entity_type: str) -> str:
-    """The user-visible message that opens the chat. Short and natural —
-    the heavy entity context goes in system_prompt_append instead so
-    it doesn't clutter the chat history."""
-    return (
-        f"Help me build out my {entity_type} entry — **{label}**. "
-        "Look at what's there, look at my skills catalog, and start "
-        "asking the questions that will make this entry as useful as "
-        "possible for job applications. Feel free to suggest concrete "
-        "edits — fill in missing fields, link skills, draft a "
-        "description, add related projects. Confirm before writing "
-        "anything."
-    )
+# Opening message when the user clicks "Analyze" on a history entry.
+_ANALYZE_SEED_PROMPT = (
+    "Help me build out my {entity_type} entry — **{label}**. "
+    "Look at what's there, look at my skills catalog, and start "
+    "asking the questions that will make this entry as useful as "
+    "possible for job applications. Feel free to suggest concrete "
+    "edits — fill in missing fields, link skills, draft a "
+    "description, add related projects. Confirm before writing "
+    "anything."
+)
 
-
-def _build_analyze_system_block(
-    entity_type: str, entity_label: str, entity_block: str, link_tag: str
-) -> str:
-    """The system_prompt_append the Companion sees ON TOP of the
-    primer. Frames the conversation as an entity-enrichment session
-    and tells the agent what's good behavior here."""
-    return f"""
+# Appended to the primer for an "Analyze" session ({entity_block} is
+# the entry's current data).
+_ANALYZE_MODE_PROMPT = """
 
 Entity-Analysis Mode
 ====================
@@ -469,6 +462,27 @@ field has either content or an explicit "n/a — couldn't recall".
 Summarize what changed at the end so the user knows what to expect on
 the entry next time they look at it.
 """
+
+
+def _build_analyze_seed_prompt(label: str, entity_type: str) -> str:
+    """The user-visible message that opens the chat. Short and natural —
+    the heavy entity context goes in system_prompt_append instead so
+    it doesn't clutter the chat history."""
+    return render_prompt(
+        "companion_analyze_seed", dict(label=label, entity_type=entity_type)
+    ).text
+
+
+def _build_analyze_system_block(
+    entity_type: str, entity_label: str, entity_block: str, link_tag: str
+) -> str:
+    """The system_prompt_append the Companion sees ON TOP of the
+    primer. Frames the conversation as an entity-enrichment session
+    and tells the agent what's good behavior here."""
+    return render_prompt("companion_analyze_mode", dict(
+        entity_type=entity_type, entity_label=entity_label,
+        entity_block=entity_block, link_tag=link_tag,
+    )).text
 
 
 async def _run_analyze_in_background(
@@ -621,7 +635,7 @@ async def analyze_entity(
     await db.commit()
     await db.refresh(conv)
 
-    primer = _API_PRIMER.format(display_name=user.display_name, user_id=user.id)
+    primer = render_prompt("companion_primer", dict(display_name=user.display_name, user_id=user.id)).text
     primer += _build_analyze_system_block(
         payload.entity_type, entity_label, entity_block, link_tag
     )
@@ -717,7 +731,7 @@ async def send_message(
     #    - Base URL that the subprocess can reach the API at (localhost:8000).
     #    - The user's active Persona, if any, appended as tone / voice guidance.
     api_token = create_access_token(subject=str(user.id), extra={"purpose": "companion"})
-    primer = _API_PRIMER.format(display_name=user.display_name, user_id=user.id)
+    primer = render_prompt("companion_primer", dict(display_name=user.display_name, user_id=user.id)).text
 
     # Make sure the user has at least the default "Pal" persona seeded so the
     # Companion has a voice to inherit from on first chat.
@@ -937,7 +951,7 @@ async def _build_primer_for(user: User, db: AsyncSession) -> str:
         fresh_user = user
     user = fresh_user
 
-    primer = _API_PRIMER.format(display_name=user.display_name, user_id=user.id)
+    primer = render_prompt("companion_primer", dict(display_name=user.display_name, user_id=user.id)).text
     if user.active_persona_id:
         from app.models.user import Persona as _P
         active = (

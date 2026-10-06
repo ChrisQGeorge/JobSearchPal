@@ -55,6 +55,8 @@ class JevSettingsIn(BaseModel):
     overrides: dict[str, Optional[DimensionOverrideIn]] = {}
     weights: dict[str, float] = {}
     apply: Optional[ApplyQuestionIn] = None
+    # Email-triage yes/no questions {intent: text}; omitted keeps saved.
+    email_questions: Optional[dict[str, str]] = None
 
 
 async def _decorate(cfg: dict, db: AsyncSession, user: User) -> dict:
@@ -68,6 +70,9 @@ async def _decorate(cfg: dict, db: AsyncSession, user: User) -> dict:
     # What Jev's apply question is told to treat as a hard blocker
     # (managed on Settings → Criteria List, category "Industry").
     cfg["unacceptable_industries"] = await unacceptable_industries(db, user.id)
+    from app.skills.jev import email_questions_view
+
+    cfg["email_questions"] = email_questions_view()
     return cfg
 
 
@@ -99,4 +104,8 @@ async def put_settings(
         payload.weights,
         payload.apply.model_dump() if payload.apply is not None else None,
     )
+    if payload.email_questions is not None:
+        from app.skills.jev import save_email_questions
+
+        save_email_questions(payload.email_questions)
     return await _decorate(cfg, db, user)

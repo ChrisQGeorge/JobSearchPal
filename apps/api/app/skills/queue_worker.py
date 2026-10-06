@@ -1414,8 +1414,6 @@ async def _handle_humanize(item: JobFetchQueue) -> None:
         from app.api.v1.documents import (
             _extract_json_object,
             _validate_humanizer_output,
-            _FIX_PRESERVE_IMPERFECTIONS,
-            _FIX_NO_IMPERFECTIONS,
         )
 
         data = _extract_json_object(final_text) or {}
@@ -1455,11 +1453,12 @@ async def _handle_humanize(item: JobFetchQueue) -> None:
                     "violations": violations_block,
                     "previous_output": content_md,
                     "source_body": source_body,
-                    "imperfections_directive": (
-                        _FIX_PRESERVE_IMPERFECTIONS
+                    "imperfections_directive": render_prompt(
+                        "humanize_fix_preserve_imperfections"
                         if plant_mistakes
-                        else _FIX_NO_IMPERFECTIONS
-                    ),
+                        else "humanize_fix_no_imperfections",
+                        {},
+                    ).text,
                 },
             ).text
             try:
@@ -1844,6 +1843,12 @@ def _extract_python_block(text: str) -> str:
     return ""
 
 
+# Extractor code-generation prompt (Settings → Prompts → "Write a site
+# extractor"). Values are inserted literally by the registry renderer,
+# so HTML braces in the sample are safe.
+_EXTRACTOR_CODEGEN_PROMPT = "You are writing a small Python extractor module for job postings on the domain `{domain}`.\n\nCONTRACT — the module must define exactly:\n\n    def extract(html: str) -> dict | None\n\nreturning a dict with EXACTLY these keys (None when a value isn't on the page): title, organization_name, location, remote_policy ('remote' | 'hybrid' | 'onsite' | None), employment_type, salary_min (float | None), salary_max (float | None), salary_currency, date_posted ('YYYY-MM-DD' | None), job_description (plain text or markdown — NEVER raw HTML).\n\nHard rules:\n- Imports allowed ONLY from: re, json, html, datetime, urllib.parse, bs4 (BeautifulSoup). No network, no file IO, no exec/eval, no other imports.\n- Return None when the page doesn't look like a job posting.\n- Prefer STABLE signals: JSON blobs embedded in <script> tags, data-* attributes, semantic ids/classes — never brittle text offsets. The module must generalize to OTHER postings on this domain, not just this sample.\n- Be defensive: missing nodes → None fields, never exceptions.\n\nReturn ONLY one ```python code block. No prose.\n\nEXPECTED OUTPUT for the sample below (from a validated parse — your code's output must match its title and reach at least half its description length):\n{expected_json}\n\nHTML SAMPLE (truncated):\n{html_sample}"
+
+
 async def _handle_extractor_gen(item: JobFetchQueue) -> None:
     """Have Claude WRITE a per-domain fetch extractor module, test it
     against the saved (HTML, expected-fields) sample, and install it
@@ -1882,36 +1887,13 @@ async def _handle_extractor_gen(item: JobFetchQueue) -> None:
         html, expected = sample
 
         # Built by concatenation, not .format() — the HTML is full of braces.
-        prompt = (
-            "You are writing a small Python extractor module for job postings "
-            f"on the domain `{domain}`.\n\n"
-            "CONTRACT — the module must define exactly:\n\n"
-            "    def extract(html: str) -> dict | None\n\n"
-            "returning a dict with EXACTLY these keys (None when a value "
-            "isn't on the page): title, organization_name, location, "
-            "remote_policy ('remote' | 'hybrid' | 'onsite' | None), "
-            "employment_type, salary_min (float | None), salary_max "
-            "(float | None), salary_currency, date_posted ('YYYY-MM-DD' | "
-            "None), job_description (plain text or markdown — NEVER raw "
-            "HTML).\n\n"
-            "Hard rules:\n"
-            "- Imports allowed ONLY from: re, json, html, datetime, "
-            "urllib.parse, bs4 (BeautifulSoup). No network, no file IO, no "
-            "exec/eval, no other imports.\n"
-            "- Return None when the page doesn't look like a job posting.\n"
-            "- Prefer STABLE signals: JSON blobs embedded in <script> tags, "
-            "data-* attributes, semantic ids/classes — never brittle text "
-            "offsets. The module must generalize to OTHER postings on this "
-            "domain, not just this sample.\n"
-            "- Be defensive: missing nodes → None fields, never exceptions.\n\n"
-            "Return ONLY one ```python code block. No prose.\n\n"
-            "EXPECTED OUTPUT for the sample below (from a validated parse — "
-            "your code's output must match its title and reach at least "
-            "half its description length):\n"
-            + _json.dumps(expected, indent=2, default=str)
-            + "\n\nHTML SAMPLE (truncated):\n"
-            + html[:150_000]
-        )
+        from app.skills.prompt_registry import render_prompt
+
+        prompt = render_prompt("extractor_codegen", {
+            "domain": domain,
+            "expected_json": _json.dumps(expected, indent=2, default=str),
+            "html_sample": html[:150_000],
+        }).text
 
         label = row.label or f"Write extractor: {domain}"
         try:

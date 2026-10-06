@@ -350,6 +350,10 @@ def save_scoring_config(
     apply_ov = _valid_apply(apply) if apply is not None else _valid_apply(_load_settings().get("apply"))
     if apply_ov is not None:
         new_data["apply"] = apply_ov
+    # Email-triage questions are saved separately — keep them.
+    eq = _load_settings().get("email_questions")
+    if isinstance(eq, dict) and eq:
+        new_data["email_questions"] = eq
     try:
         _SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
         _SETTINGS_PATH.write_text(json.dumps(new_data, indent=2), encoding="utf-8")
@@ -434,30 +438,88 @@ EMAIL_INTENT_QUESTIONS: dict[str, str] = {
 }
 
 
+PHONE_SCREEN_QUESTION = (
+    "If this email invites the candidate to talk, is it only a first "
+    "call with a recruiter / phone screen (rather than an interview "
+    "with the hiring team)?"
+)
+EMAIL_QUESTION_LABELS = {
+    "rejection": "Rejection",
+    "interview_invite": "Interview / screening request",
+    "take_home_assigned": "Assessment / take-home",
+    "offer": "Offer",
+    "withdrew": "Withdrawal confirmation",
+    "ghosted": "Closed without interview",
+    "status_update": "Status update",
+    "unrelated": "Not job-related",
+    "_phone_screen": "Phone screen vs. team interview",
+}
+
+
+def _email_defaults() -> dict[str, str]:
+    return {**EMAIL_INTENT_QUESTIONS, "_phone_screen": PHONE_SCREEN_QUESTION}
+
+
+def email_questions_effective() -> dict[str, str]:
+    saved = _load_settings().get("email_questions")
+    saved = saved if isinstance(saved, dict) else {}
+    out = {}
+    for k, default in _email_defaults().items():
+        v = str(saved.get(k) or "").strip()[:2000]
+        out[k] = v or default
+    return out
+
+
+def email_questions_view() -> list[dict]:
+    eff, defaults = email_questions_effective(), _email_defaults()
+    return [
+        {"key": k, "label": EMAIL_QUESTION_LABELS.get(k, k), "text": eff[k],
+         "default": defaults[k], "overridden": eff[k] != defaults[k]}
+        for k in defaults
+    ]
+
+
+def save_email_questions(texts: dict[str, Any]) -> None:
+    """Persist only the questions that differ from the default."""
+    defaults = _email_defaults()
+    clean = {
+        k: str(v).strip()[:2000]
+        for k, v in (texts or {}).items()
+        if k in defaults and str(v or "").strip() and str(v).strip() != defaults[k]
+    }
+    data = _load_settings()
+    if clean:
+        data["email_questions"] = clean
+    else:
+        data.pop("email_questions", None)
+    try:
+        _SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError as exc:
+        log.warning("Failed to persist Jev email questions: %s", exc)
+
+
 async def classify_email(
     api_key: str, *, email_state: dict[str, Any], timeout_seconds: int = 45
 ) -> dict[str, float]:
     """Return {intent: probability} for every email type, plus
     "_phone_screen": probability that an interview invite is only a
     first recruiter / phone screen."""
+    texts = email_questions_effective()
     questions: dict[str, Any] = {
         key: {
             "type": "noul",
-            "instructions": "Does this email belong in this category? " + text,
+            "instructions": "Does this email belong in this category? " + texts[key],
             "criteria": {
                 "true": "Yes — this is the email's main purpose.",
                 "false": "No — the email is about something else.",
             },
         }
-        for key, text in EMAIL_INTENT_QUESTIONS.items()
+        for key in EMAIL_INTENT_QUESTIONS
     }
     questions["_phone_screen"] = {
         "type": "noul",
-        "instructions": (
-            "If this email invites the candidate to talk, is it only a first "
-            "call with a recruiter / phone screen (rather than an interview "
-            "with the hiring team)?"
-        ),
+        "instructions": texts["_phone_screen"],
         "criteria": {"true": "First recruiter call or phone screen.",
                      "false": "Team interview, or not an invitation at all."},
     }

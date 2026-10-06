@@ -2807,6 +2807,43 @@ async def _direct_fetch_page(url: str) -> tuple[str, str, Optional[str]]:
     return md, raw_html, None
 
 
+# Skills-gap escalation (requirements-coverage gate). Three registry
+# prompts: the uncovered-lines block, the unknown-headings block, and the
+# required JSON output format.
+_SKILLS_GAP_LINES_PROMPT = (
+    "These lines come from a job posting but matched no known "
+    "skill keywords. Extract the concrete skill / technology / "
+    "tool / methodology / certification terms they ask for, "
+    "exactly as written (preserve casing like PostgreSQL, C++). "
+    "Ignore soft-skill and culture boilerplate (communication, "
+    "team player, fast-paced, …) — return nothing for those "
+    "lines. Additionally, for any line that STATES a candidate "
+    "requirement, give the short generic cue phrase (2-4 words, "
+    "lowercase) within it that signals this — e.g. \"experience "
+    "with\", \"you'll need\", \"comfortable using\" — reusable "
+    "across postings.\n\n{lines}"
+)
+_SKILLS_GAP_HEADINGS_PROMPT = (
+    "Separately, these section HEADINGS from the same posting "
+    "matched no known section marker. Classify each: does it "
+    "open a requirements/qualifications section, a nice-to-have/"
+    "preferred section, or something else (benefits, "
+    "responsibilities, company blurb, …)? For each, give the "
+    "generic marker phrase from within the heading that "
+    "signals the section type — lowercase, reusable across "
+    "postings (e.g. \"must haves\", \"what we're looking "
+    "for\"), not the full site-specific heading.\n\n{headings}"
+)
+_SKILLS_GAP_OUTPUT_PROMPT = (
+    'Return ONE JSON object, no prose: {{"required": string[], '
+    '"nice_to_have": string[], "requirement_cues": string[], '
+    '"section_markers": {{"required": string[], "nice_to_have": '
+    'string[], "other": string[]}}}} (nice_to_have skills only for '
+    "terms the line itself marks as preferred/bonus; omit lists "
+    "that don't apply)."
+)
+
+
 async def _extract_skills_via_llm(
     lines: list[str],
     headings: list[str] | None = None,
@@ -2826,41 +2863,12 @@ async def _extract_skills_via_llm(
     parts: list[str] = []
     if lines:
         numbered = "\n".join(f"- {ln}" for ln in lines[:10])
-        parts.append(
-            "These lines come from a job posting but matched no known "
-            "skill keywords. Extract the concrete skill / technology / "
-            "tool / methodology / certification terms they ask for, "
-            "exactly as written (preserve casing like PostgreSQL, C++). "
-            "Ignore soft-skill and culture boilerplate (communication, "
-            "team player, fast-paced, …) — return nothing for those "
-            "lines. Additionally, for any line that STATES a candidate "
-            "requirement, give the short generic cue phrase (2-4 words, "
-            "lowercase) within it that signals this — e.g. \"experience "
-            "with\", \"you'll need\", \"comfortable using\" — reusable "
-            "across postings.\n\n" + numbered
-        )
+        parts.append(render_prompt("skills_gap_lines", {"lines": numbered}).text)
     if headings:
         hlist = "\n".join(f"- {h}" for h in headings[:8])
-        parts.append(
-            "Separately, these section HEADINGS from the same posting "
-            "matched no known section marker. Classify each: does it "
-            "open a requirements/qualifications section, a nice-to-have/"
-            "preferred section, or something else (benefits, "
-            "responsibilities, company blurb, …)? For each, give the "
-            "generic marker phrase from within the heading that "
-            "signals the section type — lowercase, reusable across "
-            "postings (e.g. \"must haves\", \"what we're looking "
-            "for\"), not the full site-specific heading.\n\n" + hlist
-        )
-    schema = (
-        'Return ONE JSON object, no prose: {"required": string[], '
-        '"nice_to_have": string[], "requirement_cues": string[], '
-        '"section_markers": {"required": string[], "nice_to_have": '
-        'string[], "other": string[]}} (nice_to_have skills only for '
-        "terms the line itself marks as preferred/bonus; omit lists "
-        "that don't apply)."
-    )
-    prompt = "\n\n".join(parts + [schema])
+        parts.append(render_prompt("skills_gap_headings", {"headings": hlist}).text)
+    parts.append(render_prompt("skills_gap_output", {}).text)
+    prompt = "\n\n".join(parts)
     empty_markers: dict[str, list[str]] = {
         "required": [], "nice": [], "other": [], "cues": [],
     }

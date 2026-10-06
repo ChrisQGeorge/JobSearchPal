@@ -29,9 +29,18 @@ type ApplyQuestion = {
   defaults?: Omit<ApplyQuestion, "overridden" | "defaults">;
 };
 
+type EmailQuestion = {
+  key: string;
+  label: string;
+  text: string;
+  default: string;
+  overridden: boolean;
+};
+
 type JevSettings = {
   dimensions: JevDimension[];
   apply?: ApplyQuestion;
+  email_questions?: EmailQuestion[];
   unacceptable_industries?: string[];
   limits?: { min_criteria: number; max_criteria: number; max_weight: number };
 };
@@ -47,6 +56,7 @@ export function JevScoringPanel() {
   const [msg, setMsg] = useState<string | null>(null);
   const [apply, setApply] = useState<ApplyQuestion | null>(null);
   const [blockedIndustries, setBlockedIndustries] = useState<string[]>([]);
+  const [emailQs, setEmailQs] = useState<EmailQuestion[]>([]);
 
   useEffect(() => {
     api
@@ -56,6 +66,7 @@ export function JevScoringPanel() {
         if (s.limits) setLimits(s.limits);
         if (s.apply) setApply(s.apply);
         setBlockedIndustries(s.unacceptable_industries ?? []);
+        setEmailQs(s.email_questions ?? []);
       })
       .catch(() => setMsg("Could not load Jev scoring settings."));
   }, []);
@@ -96,9 +107,13 @@ export function JevScoringPanel() {
               nogo_threshold: apply.nogo_threshold,
             }
           : undefined,
+        email_questions: emailQs.length
+          ? Object.fromEntries(emailQs.map((q) => [q.key, q.text.trim()]))
+          : undefined,
       });
       setDims(out.dimensions);
       if (out.apply) setApply(out.apply);
+      if (out.email_questions) setEmailQs(out.email_questions);
       setMsg("Saved. The next score run (or a bulk Rescore) uses these prompts.");
     } catch (e) {
       setMsg(
@@ -354,6 +369,44 @@ export function JevScoringPanel() {
           </div>
         );
       })}
+
+      {emailQs.length ? (
+        <div className="jsp-card p-4 space-y-2">
+          <h4 className="text-sm font-medium">Email triage questions</h4>
+          <p className="text-[11px] text-corp-muted">
+            When Gmail import (or a pasted email) is classified, Jev answers one yes/no
+            question per email type — &ldquo;Does this email belong in this category?&rdquo;
+            plus the text below. A confident answer with a clear job match skips the LLM.
+          </p>
+          {emailQs.map((q, i) => (
+            <div key={q.key} className="space-y-0.5">
+              <div className="flex items-center gap-2">
+                <label className="jsp-label !mb-0">{q.label}</label>
+                {q.text.trim() !== q.default ? (
+                  <button
+                    type="button"
+                    className="text-[11px] text-corp-accent hover:underline ml-auto"
+                    onClick={() =>
+                      setEmailQs(emailQs.map((x, j) => (j === i ? { ...x, text: x.default } : x)))
+                    }
+                    disabled={saving}
+                  >
+                    reset
+                  </button>
+                ) : null}
+              </div>
+              <textarea
+                className="jsp-input text-xs min-h-[44px]"
+                value={q.text}
+                onChange={(e) =>
+                  setEmailQs(emailQs.map((x, j) => (j === i ? { ...x, text: e.target.value } : x)))
+                }
+                disabled={saving}
+              />
+            </div>
+          ))}
+        </div>
+      ) : null}
 
       <div className="flex items-center gap-3">
         <button
