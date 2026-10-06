@@ -40,7 +40,7 @@ log = logging.getLogger(__name__)
 router = APIRouter(tags=["mcp"])
 
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
-SERVER_INFO = {"name": "job-search-pal", "version": "1.0.0"}
+SERVER_INFO = {"name": "job-search-pal", "version": "1.1.0"}
 MAX_RESULT_CHARS = 120_000
 
 INSTRUCTIONS = (
@@ -144,6 +144,61 @@ async def _set_status(call: Call, a: dict) -> Any:
         except _ApiError as exc:
             failed.append({"job_id": jid, "error": str(exc)})
     return {"updated": ok, "failed": failed}
+
+
+_PROMPT_KEY = {"type": "string", "description": "Prompt key from list_prompts, e.g. tailor_resume"}
+_PROMPT_VARIANT_FIELDS = {
+    "id": {**_STR, "description": "Existing variant id to update ('default' = built-in); omit to create"},
+    "name": _STR,
+    "template": {**_STR, "description": "Full prompt text with {placeholders}; {{ }} for literal braces"},
+    "enabled": _BOOL,
+    "weight": {"type": "number", "minimum": 0, "maximum": 100},
+}
+
+
+def _variant_for_put(v: dict) -> dict:
+    """GET-shape variant -> PUT-shape (the built-in never sends a template)."""
+    return {
+        "id": "default" if v.get("builtin") else v.get("id"),
+        "name": v.get("name"),
+        "template": None if v.get("builtin") else v.get("template"),
+        "enabled": v.get("enabled", True),
+        "weight": v.get("weight", 1.0),
+    }
+
+
+async def _upsert_prompt_variant(call: Call, a: dict) -> Any:
+    """Create or update ONE variant without touching the others: read the
+    current list, merge, write the full list back."""
+    key = a["key"]
+    current = await call("GET", f"/prompts/{key}")
+    variants = [_variant_for_put(v) for v in current["variants"]]
+    vid = a.get("id")
+    if vid:
+        target = next((v for v in variants if v["id"] == vid), None)
+        if target is None:
+            raise _ApiError(f"No variant with id '{vid}' on prompt '{key}'.")
+        if vid == "default":
+            builtin = next(v for v in current["variants"] if v.get("builtin"))
+            if a.get("template") is not None and a["template"] != builtin["template"]:
+                raise _ApiError(
+                    "The built-in default's text can't be changed — create a new "
+                    "variant (omit id) and disable or down-weight the default."
+                )
+        for f in ("name", "template", "enabled", "weight"):
+            if f in a and a[f] is not None and not (vid == "default" and f in ("template", "name")):
+                target[f] = a[f]
+    else:
+        if not (a.get("template") or "").strip():
+            raise _ApiError("A new variant needs a non-empty template.")
+        variants.append({
+            "id": None,
+            "name": a.get("name") or "variant",
+            "template": a["template"],
+            "enabled": a.get("enabled", True),
+            "weight": a.get("weight", 1.0),
+        })
+    return await call("PUT", f"/prompts/{key}", json={"variants": variants})
 
 
 async def _import_url(call: Call, a: dict) -> Any:
@@ -255,6 +310,50 @@ TOOLS: list[Tool] = [
     Tool(
         "list_queue", "Background task queue (URL imports, scoring, tailoring) with states and errors.",
         _obj({}), lambda call, a: call("GET", "/jobs/queue"),
+    ),
+    Tool(
+        "list_prompts",
+        "Every agent-action prompt (resume, cover letter, humanize, analysis, …) with "
+        "whether it's customized or running an A/B test.",
+        _obj({}), lambda call, a: call("GET", "/prompts"),
+    ),
+    Tool(
+        "get_prompt",
+        "One prompt: placeholders, the built-in default and custom variants with "
+        "template text, enabled flag, weight and live traffic share.",
+        _obj({"key": _PROMPT_KEY}, ["key"]),
+        lambda call, a: call("GET", f"/prompts/{a['key']}"),
+    ),
+    Tool(
+        "preview_prompt",
+        "Check a template without saving: renders it with «placeholder» markers and "
+        "reports missing_placeholders (used by the default, absent here) and "
+        "unknown_placeholders (never filled in).",
+        _obj({"key": _PROMPT_KEY, "template": _STR}, ["key", "template"]),
+        lambda call, a: call("POST", f"/prompts/{a['key']}/preview", json={"template": a["template"]}),
+    ),
+    Tool(
+        "prompt_stats",
+        "A/B scoreboard for a document prompt: per variant, documents written, "
+        "jobs applied, and response / interview / offer rates (small samples flagged).",
+        _obj({"key": _PROMPT_KEY}, ["key"]),
+        lambda call, a: call("GET", f"/prompts/{a['key']}/stats"),
+    ),
+    Tool(
+        "upsert_prompt_variant",
+        "Create (omit id) or update (give id) ONE prompt variant, leaving the others "
+        "untouched. The built-in default's text can't change — only enabled / weight.",
+        _obj({"key": _PROMPT_KEY, **_PROMPT_VARIANT_FIELDS}, ["key"]),
+        _upsert_prompt_variant, write=True,
+    ),
+    Tool(
+        "save_prompt",
+        "Replace a prompt's ENTIRE variant list. Variants you omit are DELETED — prefer "
+        "upsert_prompt_variant for single changes. Include {id:'default'} to keep the built-in.",
+        _obj({"key": _PROMPT_KEY, "variants": {"type": "array", "items": _obj(_PROMPT_VARIANT_FIELDS)}},
+             ["key", "variants"]),
+        lambda call, a: call("PUT", f"/prompts/{a['key']}", json={"variants": a["variants"]}),
+        write=True,
     ),
     # -- write --
     Tool(

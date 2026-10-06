@@ -2053,6 +2053,24 @@ def _build_jd_analyze_prompt(job: TrackedJob, org_name: Optional[str] = None) ->
     )).text
 
 
+async def unacceptable_industries(db: AsyncSession, user_id: int) -> list[str]:
+    """Industries the user marked unacceptable on the Criteria List —
+    a hard blocker in Jev's "worth applying" question."""
+    from app.models.preferences import JobCriterion
+
+    rows = (
+        await db.execute(
+            select(JobCriterion.value).where(
+                JobCriterion.user_id == user_id,
+                JobCriterion.category == "Industry",
+                JobCriterion.tier == "unacceptable",
+                JobCriterion.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    return sorted({v.strip() for v in rows if v and v.strip()}, key=str.lower)
+
+
 async def run_jev_score(
     db: AsyncSession, user: User, job: TrackedJob
 ) -> Optional[dict]:
@@ -2075,6 +2093,13 @@ async def run_jev_score(
     from app.models.preferences import JobPreferences
 
     org_name = await _resolve_org_name(db, job.organization_id)
+    org_industry = None
+    if job.organization_id:
+        org_industry = (
+            await db.execute(
+                select(Organization.industry).where(Organization.id == job.organization_id)
+            )
+        ).scalar_one_or_none()
     candidate_profile = await _build_candidate_profile_block(db, user)
 
     # Job preferences feed the quality/location dimensions — the profile
@@ -2115,6 +2140,9 @@ async def run_jev_score(
             "benefits_required": prefs.benefits_required or [],
             "benefits_preferred": prefs.benefits_preferred or [],
         }
+    # Hard blocker for the "worth applying" question (Settings → Criteria
+    # List, category Industry, tier unacceptable).
+    candidate_preferences["unacceptable_industries"] = await unacceptable_industries(db, user.id)
 
     # Head off the classic mis-score: a remote role whose posting lists
     # the employer's office city. Without the note, evaluators punish
@@ -2132,6 +2160,7 @@ async def run_jev_score(
         "job_posting": {
             "title": job.title,
             "organization": org_name,
+            "organization_industry": org_industry,
             "location": job.location,
             "location_note": location_note,
             "remote_policy": job.remote_policy,

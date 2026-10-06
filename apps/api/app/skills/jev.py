@@ -163,24 +163,44 @@ _QUESTIONS: dict[str, Any] = {
             "requirements from a clearly real team.",
         ],
     },
+    # The old wording ("realistic chance of an interview") made Jev answer
+    # 0.2-0.4 for nearly every posting — 1 of ~900 jobs ever reached GO.
+    # The candidate's actual criterion is two tests: no hard blocker, and
+    # plausibly hireable on skills + experience. Pay and competition are
+    # deliberately excluded (they're scored elsewhere / unknowable).
     "apply": {
         "type": "noul",
         "instructions": (
-            "Should this candidate spend their limited time applying to "
-            "this job?"
+            "Should this candidate apply? Answer with two tests, in order. "
+            "TEST 1 — hard blockers (any one means the answer is a firm no): "
+            "the employer's industry is in "
+            "candidate_preferences.unacceptable_industries (use "
+            "job_posting.organization_industry; when it's missing, infer the "
+            "industry from the posting itself); the work arrangement is in "
+            "candidate_preferences.remote_policies_unacceptable (judge from "
+            "the posting text, not only the remote_policy field); or the "
+            "role requires a security clearance, citizenship, license or "
+            "degree the candidate doesn't have. "
+            "TEST 2 — only if nothing blocks: could this candidate plausibly "
+            "be hired based on their skills and experience? Ignore "
+            "compensation and how competitive the role might be."
         ),
         "criteria": {
             "true": (
-                "A tailored application has a realistic chance of an "
-                "interview; the fit justifies the effort."
+                "No hard blocker applies, and the candidate's skills and "
+                "experience make them a plausible hire for this role."
             ),
             "false": (
-                "The application would very likely be screened out, or a "
-                "hard blocker makes the role a poor use of time."
+                "A hard blocker applies (blocked industry, unacceptable work "
+                "arrangement, missing clearance/citizenship/license/degree), "
+                "or the candidate's skills and experience clearly don't fit."
             ),
         },
     },
 }
+
+APPLY_GO_DEFAULT = 0.50
+APPLY_NOGO_DEFAULT = 0.30
 
 # ---- User-tunable scoring prompts -----------------------------------------
 #
@@ -248,15 +268,58 @@ def get_scoring_config() -> dict:
             "default_instructions": default["instructions"],
             "default_criteria": list(default["criteria"]),
         })
-    return {"dimensions": dims}
+    return {"dimensions": dims, "apply": _apply_config(data)}
+
+
+def _apply_default() -> dict:
+    q = _QUESTIONS["apply"]
+    return {
+        "instructions": q["instructions"],
+        "criteria_true": q["criteria"]["true"],
+        "criteria_false": q["criteria"]["false"],
+        "go_threshold": APPLY_GO_DEFAULT,
+        "nogo_threshold": APPLY_NOGO_DEFAULT,
+    }
+
+
+def _valid_apply(o: Any) -> Optional[dict]:
+    """Cleaned apply-question override, or None (use the default)."""
+    if not isinstance(o, dict):
+        return None
+    d = _apply_default()
+    out = {
+        "instructions": str(o.get("instructions") or "").strip()[:4000] or d["instructions"],
+        "criteria_true": str(o.get("criteria_true") or "").strip()[:1000] or d["criteria_true"],
+        "criteria_false": str(o.get("criteria_false") or "").strip()[:1000] or d["criteria_false"],
+    }
+    try:
+        go = float(o.get("go_threshold", d["go_threshold"]))
+        nogo = float(o.get("nogo_threshold", d["nogo_threshold"]))
+    except (TypeError, ValueError):
+        go, nogo = d["go_threshold"], d["nogo_threshold"]
+    go, nogo = min(max(go, 0.0), 1.0), min(max(nogo, 0.0), 1.0)
+    if nogo >= go:  # keep a non-empty "maybe" band
+        go, nogo = d["go_threshold"], d["nogo_threshold"]
+    out["go_threshold"], out["nogo_threshold"] = round(go, 3), round(nogo, 3)
+    return None if out == d else out
+
+
+def _apply_config(data: dict) -> dict:
+    """Effective "worth applying" question + GO / NO-GO thresholds."""
+    ov = _valid_apply(data.get("apply"))
+    eff = ov or _apply_default()
+    return {**eff, "overridden": ov is not None, "defaults": _apply_default()}
 
 
 def save_scoring_config(
-    overrides: dict[str, Any], weights: dict[str, Any]
+    overrides: dict[str, Any],
+    weights: dict[str, Any],
+    apply: Optional[dict] = None,
 ) -> dict:
-    """Persist prompt overrides + weights. An override missing/invalid
-    for a key resets that dimension to the default. Returns the new
-    effective config."""
+    """Persist prompt overrides + weights (+ the apply question when
+    `apply` is given; None keeps whatever is saved). An override
+    missing/invalid for a key resets that dimension to the default.
+    Returns the new effective config."""
     keys = {k for k, _ in SCORE_DIMENSIONS}
     clean_ov: dict[str, dict] = {}
     for key, o in (overrides or {}).items():
@@ -283,12 +346,13 @@ def save_scoring_config(
         wf = max(0.0, min(MAX_WEIGHT, wf))
         if wf != 1.0:
             clean_w[key] = wf
+    new_data: dict[str, Any] = {"overrides": clean_ov, "weights": clean_w}
+    apply_ov = _valid_apply(apply) if apply is not None else _valid_apply(_load_settings().get("apply"))
+    if apply_ov is not None:
+        new_data["apply"] = apply_ov
     try:
         _SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _SETTINGS_PATH.write_text(
-            json.dumps({"overrides": clean_ov, "weights": clean_w}, indent=2),
-            encoding="utf-8",
-        )
+        _SETTINGS_PATH.write_text(json.dumps(new_data, indent=2), encoding="utf-8")
     except OSError as exc:
         log.warning("Failed to persist Jev scoring settings: %s", exc)
     return get_scoring_config()
@@ -309,7 +373,12 @@ def _build_questions() -> tuple[dict[str, Any], dict[str, int], dict[str, float]
         }
         levels[d["key"]] = len(d["criteria"])
         weights[d["key"]] = d["weight"]
-    questions["apply"] = _QUESTIONS["apply"]
+    a = cfg["apply"]
+    questions["apply"] = {
+        "type": "noul",
+        "instructions": a["instructions"],
+        "criteria": {"true": a["criteria_true"], "false": a["criteria_false"]},
+    }
     return questions, levels, weights
 
 
@@ -458,8 +527,11 @@ async def score_job_fit(
                 / total_w
             )
         )
+    a = _apply_config(_load_settings())
     recommendation = (
-        "go" if apply_p >= 0.65 else "no-go" if apply_p <= 0.35 else "maybe"
+        "go" if apply_p >= a["go_threshold"]
+        else "no-go" if apply_p <= a["nogo_threshold"]
+        else "maybe"
     )
     return {
         "engine": "jev",
