@@ -50,8 +50,12 @@ Entity graph (how the pieces fit):
      │    └─ Skills (per-role, with usage_notes)
      │
      ├─ Education ────────── organization_id → Organization (university)
-     │    └─ Course (many per education)
+     │    └─ Course (degree coursework: education_id set)
      │         └─ Skills (per-course, with usage_notes)
+     │
+     ├─ Course (standalone: education_id null — certification prep,
+     │   workshops, online classes; organization_id = provider,
+     │   certification_id = the Certification it led to)
      │
      ├─ Skills catalog (canonical, user-scoped)
      │
@@ -73,7 +77,10 @@ Key endpoints (all prefixed with /api/v1):
     GET  /history/work                       — list work experiences
     GET  /history/work/{{id}}/skills         — skills linked to that work
     GET  /history/education                  — list education entries
-    GET  /history/courses?education_id=N     — courses under an education
+    GET  /history/courses                    — all courses (?education_id=N for one
+                                               education, ?standalone=true for the rest)
+    POST /history/courses                    — education_id optional; organization_id
+                                               (provider) / certification_id optional
     GET  /history/courses/{{id}}/skills      — skills tied to a course
     GET  /history/skills                     — skill catalog
     GET  /history/certifications             — certifications

@@ -123,10 +123,27 @@ class CourseSkill(Base, IdMixin, TimestampMixin):
 
 
 class Course(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
+    """A course / class / training. Independent: it belongs to the user
+    directly and can OPTIONALLY sit under an Education entry (a degree's
+    coursework). Standalone courses (certification prep, workshops,
+    online classes) name their provider via organization_id and can
+    point at the Certification they led to."""
+
     __tablename__ = "courses"
 
-    education_id: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("educations.id", ondelete="CASCADE"), nullable=False, index=True
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    education_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("educations.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # Provider for standalone courses (Coursera, AWS, a bootcamp, …).
+    organization_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # The credential this course led to, if any.
+    certification_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("certifications.id", ondelete="SET NULL"), nullable=True, index=True
     )
     code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)

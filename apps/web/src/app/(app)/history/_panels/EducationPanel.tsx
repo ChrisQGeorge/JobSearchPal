@@ -6,7 +6,7 @@ import { OrganizationCombobox } from "@/components/OrganizationCombobox";
 import { RelatedItemsPanel } from "@/components/RelatedItemsPanel";
 import { SkillMultiSelect } from "@/components/SkillMultiSelect";
 import { api } from "@/lib/api";
-import type { Course, Education } from "@/lib/types";
+import type { Certification, Course, Education } from "@/lib/types";
 
 export function EducationPanel() {
   const [items, setItems] = useState<Education[]>([]);
@@ -135,26 +135,55 @@ export function EducationPanel() {
   );
 }
 
-// ----- Nested courses under a single Education ------------------------------
+// ----- Courses: nested under an Education, or standalone --------------------
+
+/** "Courses & Training" tab: every course, whether or not it belongs to
+ *  an education (certification prep, workshops, online classes, ...). */
+export function CoursesTrainingPanel() {
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-corp-muted">
+        Courses and classes stand on their own. Link one to an education,
+        a provider, or the certification it led to — or none of them.
+      </p>
+      <CoursesPanel editable />
+    </div>
+  );
+}
 
 function CoursesPanel({
   educationId,
   editable,
 }: {
-  educationId: number;
+  // Set: this education's coursework. Unset: all of the user's courses.
+  educationId?: number;
   editable: boolean;
 }) {
   const [courses, setCourses] = useState<Course[]>([]);
   const [loading, setLoading] = useState(true);
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<Course | null>(null);
+  const showLinks = educationId == null;
+  const [eduLabels, setEduLabels] = useState<Record<number, string>>({});
+
+  useEffect(() => {
+    if (!showLinks) return;
+    api
+      .get<Education[]>("/api/v1/history/education")
+      .then((eds) =>
+        setEduLabels(Object.fromEntries(eds.map((e) => [e.id, educationLabel(e)]))),
+      )
+      .catch(() => {});
+  }, [showLinks]);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
       setCourses(
         await api.get<Course[]>(
-          `/api/v1/history/courses?education_id=${educationId}`,
+          educationId != null
+            ? `/api/v1/history/courses?education_id=${educationId}`
+            : "/api/v1/history/courses",
         ),
       );
     } finally {
@@ -167,7 +196,11 @@ function CoursesPanel({
   }, [refresh]);
 
   async function save(payload: Partial<Course>, id?: number) {
-    const body = { ...payload, education_id: educationId };
+    const body = {
+      ...payload,
+      education_id:
+        payload.education_id !== undefined ? payload.education_id : educationId ?? null,
+    };
     if (id) await api.put(`/api/v1/history/courses/${id}`, body);
     else await api.post("/api/v1/history/courses", body);
     setAdding(false);
@@ -232,7 +265,9 @@ function CoursesPanel({
   return (
     <section className="jsp-card p-4">
       <header className="flex justify-between items-center mb-3">
-        <h3 className="text-sm uppercase tracking-wider text-corp-muted">Courses</h3>
+        <h3 className="text-sm uppercase tracking-wider text-corp-muted">
+          {showLinks ? "Courses & Training" : "Courses"}
+        </h3>
         {!adding && !editing ? (
           <button className="jsp-btn-ghost text-xs" onClick={() => setAdding(true)}>
             + Course
@@ -241,7 +276,11 @@ function CoursesPanel({
       </header>
 
       {adding ? (
-        <CourseForm onCancel={() => setAdding(false)} onSubmit={(p) => save(p)} />
+        <CourseForm
+          initial={educationId != null ? { education_id: educationId } : undefined}
+          onCancel={() => setAdding(false)}
+          onSubmit={(p) => save(p)}
+        />
       ) : null}
 
       {loading ? (
@@ -271,6 +310,19 @@ function CoursesPanel({
                           .filter(Boolean)
                           .join(" · ")}
                       </div>
+                      {showLinks ? (
+                        <div className="text-xs text-corp-muted">
+                          {[
+                            c.organization_name && `Provider: ${c.organization_name}`,
+                            c.education_id
+                              ? `Education: ${eduLabels[c.education_id] ?? "linked"}`
+                              : "Standalone",
+                            c.certification_name && `→ ${c.certification_name}`,
+                          ]
+                            .filter(Boolean)
+                            .join(" · ")}
+                        </div>
+                      ) : null}
                     </div>
                     <div className="flex gap-1 shrink-0">
                       <button
@@ -306,16 +358,28 @@ function CoursesPanel({
   );
 }
 
+function educationLabel(e: Education): string {
+  const head = [e.degree, e.field_of_study].filter(Boolean).join(" ");
+  return [head || null, e.organization_name].filter(Boolean).join(" — ") || `Education #${e.id}`;
+}
+
 function CourseForm({
   initial,
   onCancel,
   onSubmit,
 }: {
-  initial?: Course;
+  initial?: Partial<Course>;
   onCancel: () => void;
   onSubmit: (p: Partial<Course>) => Promise<void> | void;
 }) {
-  const [form, setForm] = useState<Partial<Course>>(initial ?? { name: "" });
+  const [form, setForm] = useState<Partial<Course>>({ name: "", ...initial });
+  const [educations, setEducations] = useState<Education[]>([]);
+  const [certs, setCerts] = useState<Certification[]>([]);
+
+  useEffect(() => {
+    api.get<Education[]>("/api/v1/history/education").then(setEducations).catch(() => {});
+    api.get<Certification[]>("/api/v1/history/certifications").then(setCerts).catch(() => {});
+  }, []);
 
   return (
     <form
@@ -403,6 +467,55 @@ function CourseForm({
               setForm({ ...form, instructor: e.target.value || null })
             }
           />
+        </div>
+        <div className="col-span-2">
+          <label className="jsp-label">Education (optional)</label>
+          <select
+            className="jsp-input"
+            value={form.education_id ?? ""}
+            onChange={(e) =>
+              setForm({
+                ...form,
+                education_id: e.target.value ? Number(e.target.value) : null,
+              })
+            }
+          >
+            <option value="">— Standalone (not part of an education) —</option>
+            {educations.map((ed) => (
+              <option key={ed.id} value={ed.id}>
+                {educationLabel(ed)}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="col-span-2">
+          <label className="jsp-label">Provider (optional)</label>
+          <OrganizationCombobox
+            value={form.organization_id ?? null}
+            onChange={(id) => setForm({ ...form, organization_id: id })}
+            defaultTypeOnCreate="company"
+            placeholder="Coursera, AWS, a bootcamp, ... (search or create)"
+          />
+        </div>
+        <div className="col-span-2">
+          <label className="jsp-label">Led to certification (optional)</label>
+          <select
+            className="jsp-input"
+            value={form.certification_id ?? ""}
+            onChange={(e) =>
+              setForm({
+                ...form,
+                certification_id: e.target.value ? Number(e.target.value) : null,
+              })
+            }
+          >
+            <option value="">— None —</option>
+            {certs.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+              </option>
+            ))}
+          </select>
         </div>
         <div className="col-span-2">
           <label className="jsp-label">Notable work</label>

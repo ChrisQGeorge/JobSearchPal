@@ -38,7 +38,9 @@ router = APIRouter(prefix="/admin", tags=["data-io"])
 # Every model class whose rows we export, in FK-safe insert order.
 USER_MODELS = [
     Persona, JobPreferences, JobCriterion, WorkAuthorization, Demographics,
-    Skill, WorkExperience, Education, Course, Certification, Language,
+    # Certification before Course: courses can reference the credential
+    # they led to, and the importer remaps FKs in this order.
+    Skill, WorkExperience, Education, Certification, Course, Language,
     Project, Publication, Presentation, Achievement, VolunteerWork, Contact,
     CustomEvent, WorkExperienceSkill, CourseSkill, ProjectSkill, EntityLink,
     TrackedJob, InterviewRound, ApplicationEvent, InterviewArtifact, JobFetchQueue,
@@ -74,10 +76,6 @@ async def _rows_for(db: AsyncSession, model: type, user_id: int) -> list[dict]:
             CompanionConversation,
             CompanionConversation.id == ConversationMessage.conversation_id,
         ).where(CompanionConversation.user_id == user_id)
-    elif model is Course:
-        stmt = select(model).join(
-            Education, Education.id == Course.education_id
-        ).where(Education.user_id == user_id)
     elif model is InterviewRound or model is ApplicationEvent or model is InterviewArtifact:
         stmt = select(model).join(
             TrackedJob, TrackedJob.id == model.tracked_job_id
@@ -89,9 +87,7 @@ async def _rows_for(db: AsyncSession, model: type, user_id: int) -> list[dict]:
     elif model is CourseSkill:
         stmt = select(model).join(
             Course, Course.id == CourseSkill.course_id
-        ).join(Education, Education.id == Course.education_id).where(
-            Education.user_id == user_id
-        )
+        ).where(Course.user_id == user_id)
     elif model is ProjectSkill:
         stmt = select(model).join(
             Project, Project.id == ProjectSkill.project_id

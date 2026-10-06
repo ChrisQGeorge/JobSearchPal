@@ -81,7 +81,7 @@ type SkillAttachments = {
     term: string | null;
     start_date: string | null;
     end_date: string | null;
-    education_id: number;
+    education_id: number | null;
     education_degree: string | null;
     organization_id: number | null;
     organization_name: string | null;

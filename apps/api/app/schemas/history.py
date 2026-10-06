@@ -108,7 +108,13 @@ class TimelineEvent(BaseModel):
 
 
 class CourseIn(BaseModel):
-    education_id: int
+    # Optional: a course can stand alone (certification prep, workshops,
+    # online classes) or sit under an Education entry as its coursework.
+    education_id: Optional[int] = None
+    # Provider for standalone courses (Coursera, AWS, a bootcamp, …).
+    organization_id: Optional[int] = None
+    # The credential this course led to, if any.
+    certification_id: Optional[int] = None
     code: Optional[str] = None
     name: str = Field(min_length=1, max_length=255)
     term: Optional[str] = None
@@ -125,6 +131,9 @@ class CourseIn(BaseModel):
 class CourseOut(CourseIn):
     model_config = ConfigDict(from_attributes=True)
     id: int
+    # Display names, filled by the router.
+    organization_name: Optional[str] = None
+    certification_name: Optional[str] = None
 
 
 class CertificationIn(BaseModel):

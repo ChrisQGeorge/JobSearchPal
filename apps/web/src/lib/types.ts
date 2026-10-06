@@ -531,7 +531,13 @@ export type SendMessageResponse = {
 
 export type Course = {
   id: number;
-  education_id: number;
+  // Optional: standalone courses (certification prep, workshops, online
+  // classes) have no education.
+  education_id?: number | null;
+  organization_id?: number | null;
+  certification_id?: number | null;
+  organization_name?: string | null;
+  certification_name?: string | null;
   code?: string | null;
   name: string;
   term?: string | null;

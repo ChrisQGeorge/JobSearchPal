@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { PageShell } from "@/components/PageShell";
 import { api, ApiError } from "@/lib/api";
-import { EducationPanel } from "./_panels/EducationPanel";
+import { CoursesTrainingPanel, EducationPanel } from "./_panels/EducationPanel";
 import { OrganizationsPanel } from "./_panels/OrganizationsPanel";
 import { SkillsPanel } from "./_panels/SkillsPanel";
 import { WorkPanel } from "./_panels/WorkPanel";
@@ -24,6 +24,7 @@ import type {
 type Tab =
   | "work"
   | "education"
+  | "courses"
   | "skills"
   | "certifications"
   | "projects"
@@ -39,6 +40,7 @@ type Tab =
 const TABS: { key: Tab; label: string }[] = [
   { key: "work", label: "Work" },
   { key: "education", label: "Education" },
+  { key: "courses", label: "Courses & Training" },
   { key: "skills", label: "Skills" },
   { key: "certifications", label: "Certifications" },
   { key: "projects", label: "Projects" },
@@ -87,6 +89,7 @@ export default function HistoryEditorPage() {
 
       {tab === "work" && <WorkPanel />}
       {tab === "education" && <EducationPanel />}
+      {tab === "courses" && <CoursesTrainingPanel />}
       {tab === "skills" && <SkillsPanel />}
       {tab === "achievements" && (
         <GenericEntityPanel<Achievement>

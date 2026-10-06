@@ -11,7 +11,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -720,13 +720,20 @@ async def skill_attachments(
                     _Course.term,
                     _Course.start_date,
                     _Course.end_date,
-                    _Education.id,
-                    _Education.organization_id,
+                    _Course.education_id,
+                    # Education's school for coursework; the course's own
+                    # provider for standalone courses.
+                    func.coalesce(_Education.organization_id, _Course.organization_id),
                     _Education.degree,
                     _CS.usage_notes,
                 ).join(_CS, _CS.course_id == _Course.id)
-                .join(_Education, _Education.id == _Course.education_id)
-                .where(_CS.skill_id == skill_id, _Education.user_id == user.id)
+                .outerjoin(_Education, _Education.id == _Course.education_id)
+                .where(
+                    _CS.skill_id == skill_id,
+                    _Course.user_id == user.id,
+                    _Course.deleted_at.is_(None),
+                    or_(_Course.education_id.is_(None), _Education.deleted_at.is_(None)),
+                )
                 .order_by(
                     _Course.end_date.is_(None).desc(),
                     _Course.end_date.desc(),
@@ -1240,45 +1247,89 @@ async def _get_owned_education(
     return ed
 
 
+def _visible_courses(user_id: int):
+    """Courses this user owns that are shown: not deleted, and either
+    standalone or under an education that isn't deleted (a soft-deleted
+    education still hides its coursework, as it always has)."""
+    return (
+        select(Course)
+        .outerjoin(Education, Course.education_id == Education.id)
+        .where(
+            Course.user_id == user_id,
+            Course.deleted_at.is_(None),
+            or_(Course.education_id.is_(None), Education.deleted_at.is_(None)),
+        )
+    )
+
+
 async def _get_owned_course(
     db: AsyncSession, course_id: int, user_id: int
 ) -> Course:
-    stmt = (
-        select(Course)
-        .join(Education, Course.education_id == Education.id)
-        .where(
-            Course.id == course_id,
-            Course.deleted_at.is_(None),
-            Education.user_id == user_id,
-            Education.deleted_at.is_(None),
-        )
-    )
-    c = (await db.execute(stmt)).scalar_one_or_none()
+    c = (
+        await db.execute(_visible_courses(user_id).where(Course.id == course_id))
+    ).scalar_one_or_none()
     if c is None:
         raise HTTPException(status_code=404, detail="Course not found")
     return c
 
 
+async def _check_course_links(db: AsyncSession, data: dict, user_id: int) -> None:
+    """Every link on a course must point at something this user owns."""
+    if data.get("education_id") is not None:
+        await _get_owned_education(db, data["education_id"], user_id)
+    if data.get("certification_id") is not None:
+        await _get_owned(db, Certification, data["certification_id"], user_id)
+    if data.get("organization_id") is not None:
+        exists = (
+            await db.execute(
+                select(Organization.id).where(
+                    Organization.id == data["organization_id"],
+                    Organization.deleted_at.is_(None),
+                )
+            )
+        ).first()
+        if exists is None:
+            raise HTTPException(status_code=404, detail="Organization not found")
+
+
+async def _course_out(db: AsyncSession, courses: list[Course]) -> list[CourseOut]:
+    """CourseOut rows with provider + certification display names."""
+    org_ids = {c.organization_id for c in courses if c.organization_id}
+    cert_ids = {c.certification_id for c in courses if c.certification_id}
+    orgs = (
+        dict((await db.execute(select(Organization.id, Organization.name).where(Organization.id.in_(org_ids)))).all())
+        if org_ids else {}
+    )
+    certs = (
+        dict((await db.execute(select(Certification.id, Certification.name).where(Certification.id.in_(cert_ids)))).all())
+        if cert_ids else {}
+    )
+    out = []
+    for c in courses:
+        o = CourseOut.model_validate(c)
+        o.organization_name = orgs.get(c.organization_id)
+        o.certification_name = certs.get(c.certification_id)
+        out.append(o)
+    return out
+
+
 @router.get("/courses", response_model=list[CourseOut])
 async def list_courses(
     education_id: int | None = None,
+    standalone: bool = False,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
-) -> list[Course]:
-    """All courses for this user, optionally filtered to a single education entry."""
-    stmt = (
-        select(Course)
-        .join(Education, Course.education_id == Education.id)
-        .where(
-            Education.user_id == user.id,
-            Education.deleted_at.is_(None),
-            Course.deleted_at.is_(None),
-        )
-    )
+) -> list[CourseOut]:
+    """All of this user's courses. `education_id` narrows to one
+    education's coursework; `standalone=true` to courses not under any
+    education."""
+    stmt = _visible_courses(user.id)
     if education_id is not None:
         stmt = stmt.where(Course.education_id == education_id)
+    elif standalone:
+        stmt = stmt.where(Course.education_id.is_(None))
     stmt = stmt.order_by(Course.term.asc(), Course.id.asc())
-    return list((await db.execute(stmt)).scalars().all())
+    return await _course_out(db, list((await db.execute(stmt)).scalars().all()))
 
 
 @router.post("/courses", response_model=CourseOut, status_code=status.HTTP_201_CREATED)
@@ -1286,13 +1337,14 @@ async def create_course(
     payload: CourseIn,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
-) -> Course:
-    await _get_owned_education(db, payload.education_id, user.id)
-    obj = Course(**payload.model_dump(exclude_unset=True))
+) -> CourseOut:
+    data = payload.model_dump(exclude_unset=True)
+    await _check_course_links(db, data, user.id)
+    obj = Course(user_id=user.id, **data)
     db.add(obj)
     await db.commit()
     await db.refresh(obj)
-    return obj
+    return (await _course_out(db, [obj]))[0]
 
 
 @router.put("/courses/{entity_id}", response_model=CourseOut)
@@ -1301,16 +1353,22 @@ async def update_course(
     payload: CourseIn,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
-) -> Course:
+) -> CourseOut:
+    """Partial update. Sending education_id: null detaches the course
+    from its education (it becomes standalone); same for the provider
+    and certification links."""
     obj = await _get_owned_course(db, entity_id, user.id)
     data = payload.model_dump(exclude_unset=True)
-    if "education_id" in data and data["education_id"] != obj.education_id:
-        await _get_owned_education(db, data["education_id"], user.id)
+    await _check_course_links(
+        db,
+        {k: v for k, v in data.items() if v != getattr(obj, k, None)},
+        user.id,
+    )
     for k, v in data.items():
         setattr(obj, k, v)
     await db.commit()
     await db.refresh(obj)
-    return obj
+    return (await _course_out(db, [obj]))[0]
 
 
 @router.delete("/courses/{entity_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -1722,19 +1780,20 @@ async def timeline(
             )
         )
 
-    # Courses: joined via Education for ownership, pulled separately to avoid
-    # re-reading the Education list.
-    course_rows = (
-        await db.execute(
-            select(Course)
-            .join(Education, Course.education_id == Education.id)
-            .where(
-                Education.user_id == user.id,
-                Education.deleted_at.is_(None),
-                Course.deleted_at.is_(None),
+    # Courses: owned directly; ones under a deleted education stay hidden.
+    course_rows = (await db.execute(_visible_courses(user.id))).scalars().all()
+    # Standalone courses group under their provider on the timeline.
+    provider_ids = {
+        c.organization_id for c in course_rows
+        if c.education_id is None and c.organization_id and c.organization_id not in org_names
+    }
+    if provider_ids:
+        for oid, oname in (
+            await db.execute(
+                select(Organization.id, Organization.name).where(Organization.id.in_(provider_ids))
             )
-        )
-    ).scalars().all()
+        ).all():
+            org_names[oid] = oname
     # Prefer the course's own start_date/end_date (added in migration 0008).
     # Fall back to the parent Education's range only if neither is set, so a
     # course without explicit dates still renders somewhere sensible.
@@ -1749,7 +1808,11 @@ async def timeline(
         parent_start, parent_end = ed_dates.get(c.education_id, (None, None))
         start = c.start_date or parent_start
         end = c.end_date or parent_end
-        parent_org_id = ed_org_id.get(c.education_id)
+        # Coursework: the education's school (unchanged). Standalone: the
+        # course's own provider.
+        parent_org_id = (
+            ed_org_id.get(c.education_id) if c.education_id is not None else c.organization_id
+        )
         effective_org = (
             org_names.get(parent_org_id) if parent_org_id is not None else None
         )
