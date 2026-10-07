@@ -2,6 +2,12 @@
 const nextConfig = {
   reactStrictMode: true,
   output: "standalone",
+  experimental: {
+    // Rewrite-proxied requests (all /api/*) time out after 30s by
+    // default — too short for large uploads when not behind Caddy
+    // (Caddy sends lead-import uploads straight to the api).
+    proxyTimeout: 10 * 60 * 1000,
+  },
   // Proxy every /api/* and /health/* request from the browser to the api
   // container. The browser always hits the web server's origin, so the user
   // can change API_PORT / WEB_PORT in .env without rebuilding the frontend,

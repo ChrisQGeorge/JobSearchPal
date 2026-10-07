@@ -13,6 +13,7 @@ import Link from "next/link";
 import { Fragment, useEffect, useState } from "react";
 import { PageShell } from "@/components/PageShell";
 import { api, apiUrl, ApiError } from "@/lib/api";
+import { FileImport } from "./_panels/FileImport";
 import { KeywordFilters, type KeywordFilter } from "./_panels/KeywordFilters";
 
 type SourceKindExample = { label: string; value: string };
@@ -84,9 +85,12 @@ const BD_KEYWORD_KIND = "brightdata_keyword";
 type RunSnapshot = {
   id: string | null;
   label: string;
-  // queued (not sent yet) | sending | starting | running | ready |
+  // queued (not sent yet) | sending | verifying (trigger outcome unknown —
+  // checking Bright Data's snapshot list) | starting | running | ready |
   // imported | failed. Triggers are never retried (each may be billed).
   status: string;
+  note?: string | null;
+  adopted?: boolean;
   attempts?: number;
   // Batched run: the searches this one Bright Data call covers.
   searches?: string[];
@@ -201,6 +205,8 @@ function RunProgress({ source }: { source: Source }) {
                     ? "failed — details below"
                     : x.status === "sending"
                       ? "sending to Bright Data…"
+                    : x.status === "verifying"
+                      ? "checking whether Bright Data started it…"
                     : x.status === "queued"
                       ? "waiting to send…"
                     : x.status === "ready"
@@ -210,6 +216,9 @@ function RunProgress({ source }: { source: Source }) {
                         : "searching…"}
               </span>
             </li>
+            {x.note && x.status !== "failed" ? (
+              <li className="pl-6 text-corp-accent2 whitespace-pre-wrap break-words">{x.note}</li>
+            ) : null}
             {x.status === "failed" && x.error ? (
               // Full reason, never truncated — it's the only record of
               // what went wrong (nothing is retried).
@@ -898,6 +907,12 @@ export default function LeadsPage() {
                       ? "Import now"
                       : "Poll now"}
                 </button>
+                {s.kind.startsWith("brightdata_") ? (
+                  <FileImport
+                    sourceId={s.id}
+                    onImported={() => void Promise.all([loadAll(), loadLeads()])}
+                  />
+                ) : null}
                 <button
                   type="button"
                   className="jsp-btn-ghost text-xs"

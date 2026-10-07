@@ -636,6 +636,74 @@ async def parse_keyword_csv(
     )
 
 
+# Bright Data exports run to hundreds of MB (14 searches × thousands of
+# jobs with full descriptions). Spooled to disk, never held in memory.
+MAX_IMPORT_FILE_BYTES = 2 * 1024 * 1024 * 1024
+
+
+@router.post("/{source_id:int}/import-file")
+async def import_file(
+    source_id: int,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Import a Bright Data export (the JSON you download from a
+    finished snapshot — JSON array or JSON Lines) into this source's
+    lead inbox exactly as if the API had delivered it: same mapping,
+    the source's filters, dedupe, and auto-dismiss keyword filters. No
+    Bright Data call is made and the Top # cap doesn't apply (the data
+    is already paid for). Runs in the background; poll GET for progress."""
+    import os
+
+    from app.sources import file_import as fi
+
+    src = await _owned_source(db, source_id, user.id)
+    if fi.mapper_for(src.kind) is None:
+        raise HTTPException(
+            status_code=422,
+            detail="File import is only for Bright Data sources (LinkedIn keyword / LinkedIn / Glassdoor).",
+        )
+    if fi.is_running(src.id):
+        raise HTTPException(status_code=409, detail="A file import is already running for this source.")
+    await db.commit()  # don't hold a pooled connection during the upload
+
+    path = fi.spool_path(src.id)
+    size = 0
+    try:
+        with open(path, "wb") as out:
+            while True:
+                chunk = await file.read(1 << 20)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_IMPORT_FILE_BYTES:
+                    raise HTTPException(status_code=413, detail="File larger than 2 GB.")
+                out.write(chunk)
+    except BaseException:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+    if size == 0:
+        os.remove(path)
+        raise HTTPException(status_code=422, detail="The uploaded file is empty.")
+    return fi.start(src.id, path, file.filename or "upload.json", size)
+
+
+@router.get("/{source_id:int}/import-file")
+async def import_file_progress(
+    source_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    from app.sources import file_import as fi
+
+    await _owned_source(db, source_id, user.id)
+    return fi.progress(source_id) or {"status": None}
+
+
 @router.post("/{source_id:int}/poll", response_model=SourceOut)
 async def poll_now(
     source_id: int,

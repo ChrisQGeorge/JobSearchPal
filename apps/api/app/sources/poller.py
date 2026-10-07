@@ -279,7 +279,11 @@ async def poll_source(
 
 
 async def _insert_leads(
-    db: AsyncSession, source: JobSource, raw_leads: list[dict[str, Any]], cap: int
+    db: AsyncSession,
+    source: JobSource,
+    raw_leads: list[dict[str, Any]],
+    cap: int,
+    existing: Optional[set] = None,
 ) -> tuple[int, Optional[str], int]:
     """Dedupe + filter + insert up to `cap` new JobLead rows. Returns
     (inserted, error, auto_dismissed) — error only on a concurrent-insert
@@ -304,15 +308,19 @@ async def _insert_leads(
     # insert and tried to recover by rolling back the session, which left
     # the async pool in a bad state and exploded with MissingGreenlet on
     # the next access.
-    existing_ext = set(
-        (
-            await db.execute(
-                select(JobLead.external_id).where(
-                    JobLead.source_id == source.id,
+    # `existing` lets a chunked caller (file import) fetch this once and
+    # share it across chunks; it's updated in place.
+    if existing is None:
+        existing = set(
+            (
+                await db.execute(
+                    select(JobLead.external_id).where(
+                        JobLead.source_id == source.id,
+                    )
                 )
-            )
-        ).scalars().all()
-    )
+            ).scalars().all()
+        )
+    existing_ext = existing
 
     inserted = 0
     for raw in raw_leads:
@@ -387,6 +395,14 @@ TRIGGERS_PER_TICK = 3
 # and an entry interrupted mid-send (crash, restart) is marked failed
 # rather than re-sent. Failures carry a verbose reason instead.
 ERROR_CHARS = 1500
+# When a trigger's outcome is unknown (connection error, timeout, 5xx, or
+# the app died mid-send), the run isn't failed: Bright Data's snapshot
+# list (free) is checked each tick for this long, and a snapshot that
+# started anyway is adopted and collected like any other.
+VERIFY_WINDOW = timedelta(minutes=10)
+# Snapshots created this long before our send are still considered ours
+# (clock skew between us and Bright Data).
+VERIFY_SKEW = timedelta(minutes=2)
 
 
 def _run_of(source: JobSource) -> Optional[dict]:
@@ -403,6 +419,62 @@ def _set_filters(source: JobSource, **changes) -> None:
         else:
             f[k] = v
     source.filters = f  # reassign so SQLAlchemy sees the JSON change
+
+
+async def _verify_unconfirmed(run: dict, s: dict, api_key: str, dataset_id) -> None:
+    """One verification step for an entry whose trigger outcome is
+    unknown: adopt a snapshot Bright Data started at/after our send, or
+    fail once VERIFY_WINDOW passes with no such snapshot. Read-only."""
+    from app.sources import brightdata as bd
+
+    try:
+        sent = datetime.fromisoformat(s.get("sent_at") or "")
+    except ValueError:
+        sent = _now()
+    if sent.tzinfo is None:
+        sent = sent.replace(tzinfo=timezone.utc)
+    # Original reason minus its "not retried" sentence (said again below);
+    # the [trigger: …] request context is kept.
+    why = (s.get("error") or "Trigger outcome unknown.").replace(
+        " Not retried automatically (each trigger may be billed).", ""
+    )
+    taken = {x.get("id") for x in run["snapshots"] if x.get("id")}
+    lookup_err = None
+    try:
+        found = [
+            f for f in await bd.find_snapshots_since(api_key, dataset_id, sent - VERIFY_SKEW)
+            if f["id"] not in taken
+        ]
+    except Exception as exc:  # noqa: BLE001 — free call; try again next tick
+        found, lookup_err = [], f"{type(exc).__name__}: {str(exc).strip() or 'no detail'}"
+    if found:
+        snap = found[0]
+        s["id"] = snap["id"]
+        s["status"] = "starting"
+        s["adopted"] = True
+        s["error"] = None
+        s["note"] = (
+            f"{why} — but Bright Data did start snapshot {snap['id']} "
+            f"(created {snap['created'].isoformat(timespec='seconds')}); collecting it."
+        )[:ERROR_CHARS]
+        log.info("keyword run: adopted snapshot %s after unconfirmed trigger", snap["id"])
+        return
+    if _now() - sent < VERIFY_WINDOW:
+        s["note"] = (
+            "Checking with Bright Data whether this search started"
+            + (f" (last check failed: {lookup_err})" if lookup_err else "")
+            + "…"
+        )
+        return
+    s["status"] = "failed"
+    s["error"] = (
+        f"{why} Bright Data lists no snapshot for this dataset created since "
+        f"{(sent - VERIFY_SKEW).isoformat(timespec='seconds')} "
+        f"(checked for {int(VERIFY_WINDOW.total_seconds() // 60)} min), so the search did "
+        "not start and nothing should have been charged. Not re-sent automatically — "
+        "run the import again when ready."
+        + (f" Last lookup error: {lookup_err}." if lookup_err else "")
+    )[:ERROR_CHARS]
 
 
 async def _poll_keyword(
@@ -463,17 +535,21 @@ async def _poll_keyword(
     for s in run["snapshots"]:
         if s.get("id"):
             continue
-        if s["status"] in ("sending", "retry"):
-            # "sending": the app stopped mid-trigger. "retry": left by the
-            # short-lived auto-retry build. Either way, never re-send.
-            interrupted = s["status"] == "sending"
+        if s["status"] == "sending":
+            # The app stopped mid-trigger: outcome unknown. Never re-send —
+            # look for the snapshot instead.
+            s["status"] = "verifying"
+            s.setdefault("sent_at", _now().isoformat(timespec="seconds"))
+            s["error"] = "The app was interrupted while sending this search to Bright Data."
+        if s["status"] == "retry":
+            # Left by the short-lived auto-retry build: never re-send.
             s["status"] = "failed"
             s["error"] = (
-                ("The app was interrupted while sending this search to Bright Data, so "
-                 "whether it started is unknown — check Bright Data's dashboard before "
-                 "importing again." if interrupted else
-                 f"{s.get('error') or 'Trigger failed'} (not re-sent: automatic retries are off)")
+                f"{s.get('error') or 'Trigger failed'} (not re-sent: automatic retries are off)"
             )[:ERROR_CHARS]
+            continue
+        if s["status"] == "verifying":
+            await _verify_unconfirmed(run, s, api_key, ctx.get("dataset_id"))
             continue
         if s["status"] != "queued" or budget <= 0:
             continue
@@ -489,6 +565,7 @@ async def _poll_keyword(
         # Persist "sending" BEFORE the call: if the process dies mid-call
         # the next tick sees it and fails the entry instead of re-sending.
         s["status"], s["attempts"] = "sending", 1
+        s["sent_at"] = _now().isoformat(timespec="seconds")
         _set_filters(source, run=run)
         if db is not None:
             await db.commit()
@@ -497,6 +574,12 @@ async def _poll_keyword(
                 api_key, batch, dataset_id=ctx.get("dataset_id"), limit=cap
             )
             s["status"], s["error"] = "starting", None
+        except bd.TriggerUnconfirmed as exc:
+            # Bright Data may have started it anyway — find out (free)
+            # rather than fail or re-send.
+            s["status"] = "verifying"
+            s["error"] = str(exc)[:ERROR_CHARS]
+            log.warning("source %s keyword trigger unconfirmed; verifying: %s", source.id, s["error"])
         except Exception as exc:  # noqa: BLE001 — recorded on the run, never retried
             s["status"] = "failed"
             s["error"] = (str(exc).strip() or type(exc).__name__)[:ERROR_CHARS]

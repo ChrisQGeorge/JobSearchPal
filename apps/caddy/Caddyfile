@@ -30,14 +30,27 @@ https://:443 {
 	bind 0.0.0.0
 	tls /data/jsp-tls/cert.pem /data/jsp-tls/key.pem
 
-	# Larger upload cap for resume / cover-letter ingest.
-	request_body {
-		max_size 50MB
+	# Bright Data export uploads (lead import) run to hundreds of MB:
+	# send them straight to the API — Next's rewrite proxy would buffer
+	# and time out — with their own size cap.
+	@leadImport path_regexp leadImport ^/api/v1/job-sources/[0-9]+/import-file$
+	handle @leadImport {
+		request_body {
+			max_size 2GB
+		}
+		reverse_proxy api:8000
 	}
 
-	reverse_proxy web:3000 {
-		# Keep websocket + SSE upgrades transparent for the
-		# Companion's queue stream.
-		flush_interval -1
+	handle {
+		# Larger upload cap for resume / cover-letter ingest.
+		request_body {
+			max_size 50MB
+		}
+
+		reverse_proxy web:3000 {
+			# Keep websocket + SSE upgrades transparent for the
+			# Companion's queue stream.
+			flush_interval -1
+		}
 	}
 }
