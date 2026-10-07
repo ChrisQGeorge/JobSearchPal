@@ -1766,13 +1766,21 @@ function AutoArchiveButton({ onArchived }: { onArchived: () => void }) {
     setErr(null);
     setBusy("running");
     try {
-      const out = await api.post<{ archived: number }>(
+      const out = await api.post<{ archived: number; lost?: number }>(
         "/api/v1/jobs/auto-archive",
         {},
       );
       setPreview(null);
       onArchived();
-      alert(`Archived ${out.archived} stale job${out.archived === 1 ? "" : "s"}.`);
+      const lost = out.lost ?? 0;
+      alert(
+        [
+          out.archived ? `Archived ${out.archived} stale job${out.archived === 1 ? "" : "s"}.` : "",
+          lost ? `Marked ${lost} stale application${lost === 1 ? "" : "s"} as lost.` : "",
+        ]
+          .filter(Boolean)
+          .join(" ") || "Nothing changed.",
+      );
     } catch (e) {
       setErr(
         e instanceof ApiError
@@ -1788,7 +1796,7 @@ function AutoArchiveButton({ onArchived }: { onArchived: () => void }) {
     return (
       <div className="jsp-card p-3 ml-2 max-w-sm text-[11px]">
         <div className="font-medium mb-1">
-          Auto-archive: {preview.total} job{preview.total === 1 ? "" : "s"}
+          Auto-close: {preview.total} stale job{preview.total === 1 ? "" : "s"}
         </div>
         {preview.total > 0 ? (
           <>
@@ -1829,7 +1837,7 @@ function AutoArchiveButton({ onArchived }: { onArchived: () => void }) {
               onClick={execute}
               disabled={busy === "running"}
             >
-              {busy === "running" ? "…" : "Archive"}
+              {busy === "running" ? "…" : "Apply"}
             </button>
           ) : null}
         </div>
@@ -1845,12 +1853,13 @@ function AutoArchiveButton({ onArchived }: { onArchived: () => void }) {
       onClick={loadPreview}
       disabled={busy !== "idle"}
       title={
-        "Move stale rows to status=archived: pre-application ≥60 days, " +
-        "in-flight ≥90 days, ghosted/lost/withdrawn ≥30 days. " +
+        "Close out stale rows (no activity): not-yet-applied ≥60 days → archived; " +
+        "active applications (applied → assessment) ≥90 days → lost; " +
+        "ghosted / withdrawn ≥30 days → archived. Lost jobs stay lost. " +
         "Always shows a preview first."
       }
     >
-      {busy === "preview" ? "…" : "Auto-archive stale"}
+      {busy === "preview" ? "…" : "Close out stale"}
     </button>
   );
 }

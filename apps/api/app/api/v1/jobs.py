@@ -669,25 +669,28 @@ async def tracker_view(
     }
 
 
-# --- Tracked-job archiving --------------------------------------------------
+# --- Tracked-job auto-close ------------------------------------------------
 #
-# Three buckets, each with its own staleness window:
-#   - "open" pre-application states (to_review, watching, interested) —
-#     stale fast (60 days) because the job posting itself usually expires.
-#   - "in-flight" application states (applied, phone_screen, take_home,
-#     onsite, final_round) — stale at 90 days; no response in 3 months
-#     means the listing is dead even if the user never saw a rejection.
-#   - terminal-but-not-yet-archived (ghosted, lost, withdrawn) — stale at
-#     30 days because they're already done; archiving is just tidying.
-#
-# Statuses we explicitly never auto-archive: offer, hired, archived (already
-# archived), and `not_interested` (the user chose that — let them keep the
-# row visible if they want with the closed-jobs toggle).
-_AUTO_ARCHIVE_BUCKETS: dict[int, tuple[str, ...]] = {
-    60: ("to_review", "watching", "interested"),
-    90: ("applied", "phone_screen", "take_home", "onsite", "final_round"),
-    30: ("ghosted", "lost", "withdrawn"),
-}
+# Staleness rules (no update to the job within N days), each with the
+# status the job moves to:
+#   - pre-application (to_review, watching, interested) ≥60d → archived;
+#     the posting has usually expired.
+#   - active applications (applied … assessment) ≥90d → LOST: three
+#     months without any movement means the application is dead. Lost
+#     (not archived) keeps it in the outcome metrics.
+#   - ghosted / withdrawn ≥30d → archived (tidying). `lost` is deliberately
+#     NOT here: those stay lost.
+# Never touched: offer, won, lost, not_interested, archived, in_progress.
+_AUTO_CLOSE_RULES: tuple[tuple[str, int, tuple[str, ...], str], ...] = (
+    ("not applied, idle ≥60d → archived", 60, ("to_review", "watching", "interested"), "archived"),
+    (
+        "applications with no activity ≥90d → lost",
+        90,
+        ("applied", "responded", "screening", "interviewing", "assessment"),
+        "lost",
+    ),
+    ("ghosted / withdrawn ≥30d → archived", 30, ("ghosted", "withdrawn"), "archived"),
+)
 
 
 class AutoArchivePreviewOut(BaseModel):
@@ -699,6 +702,7 @@ class AutoArchivePreviewOut(BaseModel):
     total: int
     sample_titles: list[str]
     archived: int = 0  # 0 on preview, actual count on execute
+    lost: int = 0  # 0 on preview, applications closed as lost on execute
 
 
 def _auto_archive_cutoff(days: int) -> datetime:
@@ -707,17 +711,11 @@ def _auto_archive_cutoff(days: int) -> datetime:
 
 async def _collect_auto_archive_candidates(
     db: AsyncSession, user_id: int
-) -> dict[str, list[TrackedJob]]:
-    """Returns {bucket_label: [jobs…]} for every staleness rule, where
-    bucket_label is e.g. "open ≥60d". Respects soft-delete and skips
-    rows already at status=archived."""
-    out: dict[str, list[TrackedJob]] = {}
-    for days, statuses in _AUTO_ARCHIVE_BUCKETS.items():
-        label_states = {
-            (60, ("to_review", "watching", "interested")): "open ≥60d",
-            (90, ("applied", "phone_screen", "take_home", "onsite", "final_round")): "in-flight ≥90d",
-            (30, ("ghosted", "lost", "withdrawn")): "closed ≥30d",
-        }.get((days, statuses), f"≥{days}d")
+) -> dict[str, tuple[str, list[TrackedJob]]]:
+    """{rule_label: (target_status, [jobs…])} for every staleness rule.
+    Respects soft-delete."""
+    out: dict[str, tuple[str, list[TrackedJob]]] = {}
+    for label, days, statuses, target in _AUTO_CLOSE_RULES:
         rows = (
             await db.execute(
                 select(TrackedJob).where(
@@ -728,7 +726,7 @@ async def _collect_auto_archive_candidates(
                 )
             )
         ).scalars().all()
-        out[label_states] = list(rows)
+        out[label] = (target, list(rows))
     return out
 
 
@@ -739,10 +737,10 @@ async def auto_archive_preview(
 ) -> AutoArchivePreviewOut:
     """Read-only preview — how many jobs would be archived right now."""
     by_bucket = await _collect_auto_archive_candidates(db, user.id)
-    counts = {label: len(rows) for label, rows in by_bucket.items()}
+    counts = {label: len(rows) for label, (_t, rows) in by_bucket.items()}
     total = sum(counts.values())
     sample: list[str] = []
-    for rows in by_bucket.values():
+    for _t, rows in by_bucket.values():
         for j in rows[:5]:
             sample.append(j.title)
             if len(sample) >= 10:
@@ -762,40 +760,45 @@ async def auto_archive_execute(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> AutoArchivePreviewOut:
-    """Execute the archive sweep — flip every stale row to status=archived
-    and emit a status-change ApplicationEvent so the activity feed reflects
-    why the row went archived ("auto-archive: stale ≥60d")."""
+    """Execute the sweep — move every stale row to its rule's status
+    (archived, or lost for stale active applications) and emit a
+    status-change ApplicationEvent saying why."""
     by_bucket = await _collect_auto_archive_candidates(db, user.id)
-    counts = {label: len(rows) for label, rows in by_bucket.items()}
+    counts = {label: len(rows) for label, (_t, rows) in by_bucket.items()}
     total = sum(counts.values())
     sample: list[str] = []
-    archived = 0
+    archived = lost = 0
     now = datetime.now(tz=timezone.utc)
-    for label, rows in by_bucket.items():
+    for label, (target, rows) in by_bucket.items():
         for j in rows:
             prev_status = j.status
-            j.status = "archived"
+            j.status = target
+            verb = "Auto-closed as lost" if target == "lost" else "Auto-archived"
             db.add(
                 ApplicationEvent(
                     tracked_job_id=j.id,
                     event_type="status_change",
                     event_date=now,
                     details_md=(
-                        f"Auto-archived from `{prev_status}` ({label}) — "
+                        f"{verb} from `{prev_status}` ({label}) — "
                         "no activity within the staleness window."
                     ),
                 )
             )
-            archived += 1
+            if target == "lost":
+                lost += 1
+            else:
+                archived += 1
             if len(sample) < 10:
                 sample.append(j.title)
-    if archived:
+    if archived or lost:
         await db.commit()
     return AutoArchivePreviewOut(
         candidates_by_bucket=counts,
         total=total,
         sample_titles=sample,
         archived=archived,
+        lost=lost,
     )
 
 
