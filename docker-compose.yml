@@ -8,8 +8,9 @@ services:
       MYSQL_USER: ${MYSQL_USER}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD}
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-    # max_connections at 200 leaves room for the api's 30-slot pool plus the
-    # worker, poller, healthcheck pings, and the occasional admin shell
+    # max_connections at 200 leaves room for the api's three pools (browse
+    # 15+15, work 10+10, background 8+4 = 62 max) plus healthcheck pings
+    # and the occasional admin shell
     # without ever hitting the cap. MySQL's default 151 is a hair tight
     # for a long-running interactive session.
     # performance_schema alone costs MySQL ~150-200 MB RSS and this

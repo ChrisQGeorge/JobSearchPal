@@ -29,7 +29,7 @@ from sqlalchemy.orm import load_only
 
 log = logging.getLogger(__name__)
 
-from app.core.database import get_db
+from app.core.database import get_db, long_running
 from app.core.deps import get_current_user, get_current_user_streaming
 from app.models.history import Skill
 from app.models.jobs import (
@@ -876,6 +876,7 @@ async def get_job(
 
 
 @router.get("/{job_id:int}/posting-preview")
+@long_running
 async def posting_preview(
     job_id: int,
     refresh: bool = False,
@@ -1690,6 +1691,7 @@ class InterviewRetroOut(BaseModel):
     "/{job_id:int}/rounds/{round_id:int}/prep",
     response_model=InterviewPrepOut,
 )
+@long_running
 async def interview_prep(
     job_id: int,
     round_id: int,
@@ -1765,6 +1767,7 @@ async def interview_prep(
     "/{job_id:int}/rounds/{round_id:int}/retrospective",
     response_model=InterviewRetroOut,
 )
+@long_running
 async def interview_retrospective(
     job_id: int,
     round_id: int,
@@ -2340,6 +2343,7 @@ async def _resolve_org_name(db: AsyncSession, org_id: Optional[int]) -> Optional
 
 
 @router.post("/{job_id:int}/analyze-jd", response_model=TrackedJobOut)
+@long_running
 async def analyze_jd(
     job_id: int,
     db: AsyncSession = Depends(get_db),
@@ -2491,6 +2495,7 @@ class RecomputeAllOut(BaseModel):
 
 
 @router.post("/recompute-fit-score-all", response_model=RecomputeAllOut)
+@long_running
 async def recompute_all_fit_scores(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -2552,6 +2557,7 @@ class BatchAnalyzeIn(BaseModel):
 
 
 @router.post("/batch-analyze-jd", response_model=BatchAnalyzeOut)
+@long_running
 async def batch_analyze_jd(
     body: Optional[BatchAnalyzeIn] = None,
     force: bool = False,
@@ -3543,6 +3549,7 @@ def build_tracked_job_payload(
 
 
 @router.post("/fetch-from-url", response_model=FetchedJobInfo)
+@long_running
 async def fetch_from_url(
     body: FetchFromUrlIn,
     user: User = Depends(get_current_user),
@@ -4169,6 +4176,7 @@ async def download_import_template(_: User = Depends(get_current_user)) -> Respo
 
 
 @router.post("/import")
+@long_running
 async def import_jobs_from_xlsx(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
@@ -4295,6 +4303,7 @@ async def download_queue_import_template(
 
 
 @router.post("/queue-import")
+@long_running
 async def import_queue_from_xlsx(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),

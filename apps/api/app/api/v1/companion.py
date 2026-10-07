@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
+from app.core.database import get_db, long_running
 from app.core.deps import get_current_user, get_current_user_streaming
 from app.core.security import create_access_token
 from app.models.companion import CompanionConversation, ConversationMessage
@@ -708,6 +708,7 @@ async def delete_conversation(
 
 
 @router.post("/conversations/{conv_id}/messages", response_model=SendMessageOut)
+@long_running
 async def send_message(
     conv_id: int,
     payload: SendMessageIn,

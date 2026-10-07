@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
+from app.core.database import get_db, long_running
 from app.core.deps import get_current_user
 from app.models.emails import ParsedEmail
 from app.models.jobs import ApplicationEvent, TrackedJob
@@ -545,6 +545,7 @@ async def list_parsed_emails(
 
 
 @router.post("/parse", response_model=EmailParseOut, status_code=status.HTTP_201_CREATED)
+@long_running
 async def parse_email(
     payload: EmailParseIn,
     db: AsyncSession = Depends(get_db),
@@ -631,6 +632,7 @@ async def parse_email(
 
 
 @router.post("/{parsed_id:int}/reparse", response_model=EmailParseOut)
+@long_running
 async def reparse_email(
     parsed_id: int,
     db: AsyncSession = Depends(get_db),

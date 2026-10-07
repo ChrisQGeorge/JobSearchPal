@@ -38,8 +38,11 @@ covers adapter signature differences across SQLAlchemy versions.
 """
 from __future__ import annotations
 
+import asyncio
 import types
 from typing import AsyncIterator
+
+from starlette.requests import Request
 
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -125,6 +128,71 @@ BgSessionLocal = async_sessionmaker(
     autoflush=False,
 )
 
+# ---- Request lanes -----------------------------------------------------------
+#
+# Requests are split so browsing always has connections of its own:
+#   browse — page loads and quick actions (the `engine` pool above). Long
+#            work never draws from it.
+#   work   — request handlers marked @long_running (LLM calls, outside
+#            fetches, big imports) and bearer-token callers (the AI's own
+#            curl callbacks into the API, MCP agents). Own pool, and at
+#            most WORK_CONCURRENCY marked handlers run at once — the rest
+#            wait their turn (scheduled) instead of crowding browsing out.
+#   background — queue worker / pollers (bg_engine above).
+# get_db() picks the lane per request; see lane_for().
+work_engine = create_async_engine(
+    settings.async_database_url,
+    pool_pre_ping=True,
+    pool_recycle=1800,
+    pool_size=10,
+    max_overflow=10,
+    # Work requests are already slow; waiting a little for a connection
+    # beats failing.
+    pool_timeout=60,
+    pool_use_lifo=True,
+    connect_args={"connect_timeout": 10},
+    echo=False,
+)
+work_engine.sync_engine.dialect.do_ping = types.MethodType(
+    _aiomysql_do_ping, work_engine.sync_engine.dialect
+)
+WorkSessionLocal = async_sessionmaker(
+    bind=work_engine,
+    expire_on_commit=False,
+    autoflush=False,
+)
+
+WORK_CONCURRENCY = 6
+_work_slots: "asyncio.Semaphore | None" = None
+_work_waiting = 0
+
+
+def long_running(fn):
+    """Mark a route handler as long-running: it runs in the work lane
+    (own DB pool, at most WORK_CONCURRENCY at once). Apply under the
+    @router decorator."""
+    fn.__jsp_lane__ = "work"
+    return fn
+
+
+def _is_bearer_only(scope) -> bool:
+    headers = dict(scope.get("headers") or [])
+    auth = headers.get(b"authorization", b"")
+    cookie = headers.get(b"cookie", b"")
+    return auth.lower().startswith(b"bearer ") and (
+        settings.COOKIE_NAME.encode() + b"=" not in cookie
+    )
+
+
+def lane_for(scope) -> str:
+    """'work' for @long_running handlers and bearer-only (agent) calls,
+    else 'browse'."""
+    if getattr(scope.get("endpoint"), "__jsp_lane__", None) == "work":
+        return "work"
+    if _is_bearer_only(scope):
+        return "work"
+    return "browse"
+
 
 # ---- Who is holding connections? -------------------------------------------
 #
@@ -140,7 +208,7 @@ from contextvars import ContextVar
 
 db_holder_var: ContextVar[str] = ContextVar("db_holder", default="background")
 HOLD_WARN_SECONDS = 20.0
-_HOLDERS: dict[str, dict[int, tuple[str, float]]] = {"web": {}, "background": {}}
+_HOLDERS: dict[str, dict[int, tuple[str, float]]] = {"web": {}, "work": {}, "background": {}}
 _hold_log = _logging.getLogger("app.db.holders")
 
 
@@ -165,6 +233,7 @@ def _track(name: str, eng) -> None:
 
 
 _track("web", engine)
+_track("work", work_engine)
 _track("background", bg_engine)
 
 
@@ -181,7 +250,7 @@ def connection_holders(limit: int = 10) -> dict[str, list[dict]]:
 def pool_status() -> dict:
     """Checked-out / idle counts for both pools (for /health/deep)."""
     out = {}
-    for name, eng in (("web", engine), ("background", bg_engine)):
+    for name, eng in (("web", engine), ("work", work_engine), ("background", bg_engine)):
         p = eng.sync_engine.pool
         try:
             out[name] = {
@@ -195,6 +264,40 @@ def pool_status() -> dict:
     return out
 
 
-async def get_db() -> AsyncIterator[AsyncSession]:
-    async with SessionLocal() as session:
-        yield session
+async def get_db(request: Request) -> AsyncIterator[AsyncSession]:
+    """Session for this request's lane (see lane_for). A @long_running
+    handler first takes a work slot — when all are busy it waits here,
+    before touching the database, so a queue of long requests never
+    holds connections while it waits. Bearer-only callbacks skip the
+    slot: they run INSIDE a long request (the AI calling back into the
+    API) and waiting on their own parent would deadlock."""
+    global _work_slots, _work_waiting
+    scope = request.scope
+    lane = lane_for(scope)
+    scope.setdefault("state", {})["db_lane"] = lane
+    if lane == "browse":
+        async with SessionLocal() as session:
+            yield session
+        return
+    marked = getattr(scope.get("endpoint"), "__jsp_lane__", None) == "work"
+    if not marked or _is_bearer_only(scope):
+        async with WorkSessionLocal() as session:
+            yield session
+        return
+    if _work_slots is None:
+        _work_slots = asyncio.Semaphore(WORK_CONCURRENCY)
+    _work_waiting += 1
+    try:
+        await _work_slots.acquire()
+    finally:
+        _work_waiting -= 1
+    try:
+        async with WorkSessionLocal() as session:
+            yield session
+    finally:
+        _work_slots.release()
+
+
+def lanes_status() -> dict:
+    busy = (WORK_CONCURRENCY - _work_slots._value) if _work_slots is not None else 0
+    return {"work_slots": WORK_CONCURRENCY, "work_running": busy, "work_waiting": _work_waiting}

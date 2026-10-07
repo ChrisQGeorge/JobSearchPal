@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
+from app.core.database import get_db, long_running
 from app.core.deps import get_current_user
 from app.models.documents import GeneratedDocument
 from app.models.history import (
@@ -196,6 +196,7 @@ def _parse_date(v: Any):
 
 
 @router.post("/resume-ingest", response_model=IngestOut)
+@long_running
 async def resume_ingest(
     payload: IngestIn,
     db: AsyncSession = Depends(get_db),

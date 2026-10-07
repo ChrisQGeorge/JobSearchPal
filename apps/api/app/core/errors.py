@@ -215,11 +215,12 @@ async def deep_health() -> dict:
     from app.models.jobs import JobFetchQueue
     from app.skills import worker_settings
 
-    from app.core.database import connection_holders
+    from app.core.database import connection_holders, lanes_status
 
     out: dict[str, Any] = {
         "responsiveness": snapshot(),
         "db_pools": pool_status(),
+        "db_lanes": lanes_status(),
         "db_holders": connection_holders(),
     }
     t0 = time.monotonic()

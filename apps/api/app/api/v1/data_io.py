@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.inspection import inspect as sa_inspect
 
-from app.core.database import get_db
+from app.core.database import get_db, long_running
 from app.core.deps import get_current_user
 from app.models.base import Base
 from app.models.companion import CompanionConversation, ConversationMessage
@@ -99,6 +99,7 @@ async def _rows_for(db: AsyncSession, model: type, user_id: int) -> list[dict]:
 
 
 @router.get("/export")
+@long_running
 async def export_all(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -124,6 +125,7 @@ async def export_all(
 
 
 @router.post("/import")
+@long_running
 async def import_all(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
