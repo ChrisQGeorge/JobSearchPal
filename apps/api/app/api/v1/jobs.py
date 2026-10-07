@@ -904,6 +904,47 @@ async def posting_preview(
     return {**out, "job_remote_policy": job.remote_policy}
 
 
+@router.get("/{job_id:int}/posting-snapshot")
+@long_running
+async def posting_snapshot(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Response:
+    """The posting rendered as the site serves it — for boards that refuse
+    to be framed (LinkedIn & co). The page's own HTML with <base> pointing
+    at the original site, delivered under a CSP sandbox (opaque origin: its
+    scripts can't use the session or call this API). See
+    app/skills/posting_preview.py."""
+    from html import escape as _html_escape
+
+    from fastapi.responses import HTMLResponse
+
+    from app.skills import posting_preview as pp
+
+    job = await _get_owned_job(db, job_id, user.id)
+    url = (job.source_url or "").strip()
+    await db.commit()  # release the connection before the outbound fetch
+    if not url:
+        raise HTTPException(status_code=404, detail="This job has no posting URL.")
+    try:
+        html, _final = await pp.snapshot(url)
+    except pp.PreviewError as exc:
+        html = (
+            "<!doctype html><meta charset=utf-8><body style='font:14px system-ui;padding:16px'>"
+            f"Couldn't render the posting: {_html_escape(str(exc))}</body>"
+        )
+    return HTMLResponse(
+        html,
+        headers={
+            "Content-Security-Policy": pp.SNAPSHOT_CSP,
+            "Cache-Control": "private, max-age=300",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+    )
+
+
 @router.put("/{job_id:int}", response_model=TrackedJobOut)
 async def update_job(
     job_id: int,

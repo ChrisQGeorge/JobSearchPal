@@ -7,7 +7,7 @@
 // does allow framing, the live page can be shown too.
 
 import { useEffect, useState } from "react";
-import { api, ApiError } from "@/lib/api";
+import { api, apiUrl, ApiError } from "@/lib/api";
 
 type Arrangement = "onsite" | "hybrid" | "remote" | "mixed" | null;
 
@@ -53,7 +53,13 @@ export function PostingPreview({
   const [data, setData] = useState<Preview | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [view, setView] = useState<"text" | "page">("text");
+  // page  = rendered snapshot served by our API (works for boards that
+  //         refuse framing, e.g. LinkedIn) — the default
+  // live  = the real site in an iframe (only when the site allows it)
+  // text  = readable copy
+  const [view, setView] = useState<"page" | "live" | "text">("page");
+  // Bumped on Refresh so the snapshot iframe reloads.
+  const [snapVer, setSnapVer] = useState(0);
   // Hidden = nothing is fetched or framed. Remembered across every job
   // page (one localStorage key). null until read, so a hidden preference
   // never triggers a load on the first render.
@@ -78,7 +84,7 @@ export function PostingPreview({
         `/api/v1/jobs/${jobId}/posting-preview${refresh ? "?refresh=true" : ""}`,
       );
       setData(d);
-      setView(d.embeddable && (d.thin || !d.text.trim()) ? "page" : "text");
+      if (refresh) setSnapVer((v) => v + 1);
     } catch (e) {
       setErr(
         e instanceof ApiError
@@ -170,18 +176,27 @@ export function PostingPreview({
               ))
           : null}
         <span className="ml-auto flex gap-1.5 items-center">
-          {!collapsed && data?.embeddable ? (
+          {!collapsed && data ? (
             <span className="flex rounded border border-corp-border overflow-hidden text-[11px]">
-              {(["text", "page"] as const).map((v) => (
-                <button
-                  key={v}
-                  type="button"
-                  onClick={() => setView(v)}
-                  className={`px-2 py-0.5 ${view === v ? "bg-corp-accent/20 text-corp-accent" : "text-corp-muted"}`}
-                >
-                  {v === "text" ? "Text" : "Live page"}
-                </button>
-              ))}
+              {(data.embeddable ? (["page", "live", "text"] as const) : (["page", "text"] as const)).map(
+                (v) => (
+                  <button
+                    key={v}
+                    type="button"
+                    onClick={() => setView(v)}
+                    title={
+                      v === "page"
+                        ? "The page as the site renders it (a sandboxed copy fetched by the server)"
+                        : v === "live"
+                          ? "The real site, embedded"
+                          : "Readable text only"
+                    }
+                    className={`px-2 py-0.5 ${view === v ? "bg-corp-accent/20 text-corp-accent" : "text-corp-muted"}`}
+                  >
+                    {v === "page" ? "Page" : v === "live" ? "Live site" : "Text"}
+                  </button>
+                ),
+              )}
             </span>
           ) : null}
           {!collapsed ? (
@@ -236,14 +251,28 @@ export function PostingPreview({
             </p>
           ) : data.thin ? (
             <p className="text-[11px] text-corp-muted">
-              The site returned almost no readable text (it builds the page with JavaScript or
-              blocks automated viewers){data.embeddable ? " — showing the live page instead." : " — use “Open ↗”."}
+              The site returned almost no readable text — it builds the page with JavaScript or
+              blocks automated viewers, so the Page view may be incomplete
+              {data.embeddable ? "; try Live site" : "; use “Open ↗”"}.
             </p>
           ) : null}
-          {view === "page" && data.embeddable ? (
+          {view === "page" ? (
+            // Our own endpoint, but the HTML inside is the job site's: no
+            // allow-same-origin, so its scripts run in an opaque origin and
+            // can't use the session or reach the app (the response also
+            // carries a CSP sandbox header).
+            <iframe
+              key={`snap-${jobId}-${snapVer}`}
+              src={apiUrl(`/api/v1/jobs/${jobId}/posting-snapshot?v=${snapVer}`)}
+              className="w-full h-[75vh] rounded border border-corp-border bg-white"
+              sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms"
+              referrerPolicy="no-referrer"
+              title="Job posting (rendered copy)"
+            />
+          ) : view === "live" && data.embeddable ? (
             <iframe
               src={data.final_url}
-              className="w-full h-[70vh] rounded border border-corp-border bg-white"
+              className="w-full h-[75vh] rounded border border-corp-border bg-white"
               sandbox="allow-scripts allow-same-origin allow-popups allow-forms"
               referrerPolicy="no-referrer"
               title="Job posting"
@@ -253,9 +282,11 @@ export function PostingPreview({
               {data.text}
             </div>
           ) : null}
-          {!data.embeddable && data.frame_reason ? (
+          {view === "page" ? (
             <p className="text-[10px] text-corp-muted">
-              Live page unavailable here: {data.frame_reason}.
+              Rendered copy of the page as the site served it to the server (interactive bits that
+              need a login or the site's own scripts may not work — use “Open ↗” for those).
+              {!data.embeddable && data.frame_reason ? ` The live site can't be embedded: ${data.frame_reason}.` : ""}
             </p>
           ) : null}
         </>

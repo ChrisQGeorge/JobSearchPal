@@ -31,6 +31,8 @@ MAX_BYTES = 3_000_000
 MAX_TEXT = 60_000
 CACHE_TTL = 30 * 60
 _CACHE: dict[str, tuple[float, dict]] = {}
+# Raw HTML per URL for the rendered snapshot: (fetched_at, html, final_url).
+_RAW: dict[str, tuple[float, str, str]] = {}
 
 # Signal → patterns (case-insensitive, word-bounded).
 _SIGNALS: dict[str, list[str]] = {
@@ -174,12 +176,79 @@ async def fetch_preview(url: str) -> dict[str, Any]:
         "cached": False,
     }
     _CACHE[url] = (time.monotonic(), out)
-    if len(_CACHE) > 200:
-        for k in sorted(_CACHE, key=lambda k: _CACHE[k][0])[:50]:
-            _CACHE.pop(k, None)
+    if "html" in ctype or raw.lstrip()[:1] == "<":
+        _RAW[url] = (time.monotonic(), raw, final_url)
+    for store in (_CACHE, _RAW):
+        if len(store) > 200:
+            for k in sorted(store, key=lambda k: store[k][0])[:50]:
+                store.pop(k, None)
     return out
 
 
 def invalidate(url: Optional[str]) -> None:
     if url:
         _CACHE.pop(url.strip(), None)
+        _RAW.pop(url.strip(), None)
+
+
+# ---- Rendered snapshot -------------------------------------------------------
+#
+# Boards like LinkedIn refuse to be framed, so the live page can't be shown
+# directly. The snapshot is the page's own HTML, served back from our origin
+# into an iframe: <base href> points every relative stylesheet / image /
+# script / link at the original site, so it renders like the real page.
+#
+# Safety: third-party HTML served from our origin would otherwise run with
+# our cookies. The response carries `Content-Security-Policy: sandbox ...`
+# WITHOUT allow-same-origin (and the iframe is sandboxed the same way), so
+# the page runs in an opaque origin: its scripts can't read the session
+# cookie, call our API as the user, or touch the parent page.
+
+SNAPSHOT_CSP = "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms"
+
+_META_CSP = re.compile(
+    r"<meta[^>]+http-equiv\s*=\s*[\"']?content-security-policy[^>]*>", re.I
+)
+_BASE_TAG = re.compile(r"<base\b[^>]*>", re.I)
+_HEAD_OPEN = re.compile(r"<head\b[^>]*>", re.I)
+
+
+def _snapshot_banner(final_url: str) -> str:
+    from html import escape
+
+    return (
+        '<div style="all:initial;display:block;position:sticky;top:0;z-index:2147483647;'
+        'font:12px system-ui,sans-serif;background:#1f2937;color:#e5e7eb;padding:4px 8px">'
+        "Snapshot of " + escape(final_url) + " — links open on the real site.</div>"
+    )
+
+
+def build_snapshot(raw_html: str, final_url: str) -> str:
+    """The page's HTML, rebased onto the original site."""
+    from html import escape
+
+    html = _META_CSP.sub("", raw_html)
+    html = _BASE_TAG.sub("", html)  # ours must be the only <base>
+    base = f'<base href="{escape(final_url, quote=True)}" target="_blank">'
+    m = _HEAD_OPEN.search(html)
+    if m:
+        html = html[: m.end()] + base + html[m.end():]
+    else:
+        html = f"<head>{base}</head>" + html
+    body = re.search(r"<body\b[^>]*>", html, re.I)
+    if body:
+        html = html[: body.end()] + _snapshot_banner(final_url) + html[body.end():]
+    return html
+
+
+async def snapshot(url: str) -> tuple[str, str]:
+    """(html, final_url) — from the preview cache, fetching if needed."""
+    url = (url or "").strip()
+    hit = _RAW.get(url)
+    if not hit or time.monotonic() - hit[0] >= CACHE_TTL:
+        _CACHE.pop(url, None)  # force a real fetch so _RAW is filled
+        await fetch_preview(url)
+        hit = _RAW.get(url)
+    if not hit:
+        raise PreviewError("The posting didn't return an HTML page to render.")
+    return build_snapshot(hit[1], hit[2]), hit[2]
