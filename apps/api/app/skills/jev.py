@@ -19,6 +19,7 @@ managed on Settings → API Keys — never hardcoded, never in env.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -447,28 +448,118 @@ async def _post(
         raise
 
 
+# At most this many Jev calls in flight at once (queue worker + email
+# triage + interactive scoring share it). A bulk rescore then queues
+# here instead of piling onto Jev until requests time out.
+JEV_MAX_CONCURRENT = 4
+CONNECT_TIMEOUT = 15.0
+_jev_slots: Optional[asyncio.Semaphore] = None
+_jev_inflight = 0
+_jev_waiting = 0
+
+
+def jev_load() -> dict[str, int]:
+    return {"max": JEV_MAX_CONCURRENT, "in_flight": _jev_inflight, "waiting": _jev_waiting}
+
+
+def _transport_reason(exc: Exception, read_timeout: float) -> tuple[str, str]:
+    """(what happened, likely cause) for an httpx transport failure.
+    httpx timeouts stringify to "" — never rely on str(exc) alone."""
+    import httpx
+
+    name = type(exc).__name__
+    detail = str(exc).strip()
+    if isinstance(exc, httpx.ConnectTimeout):
+        return (f"couldn't open a connection within {CONNECT_TIMEOUT:.0f}s ({name})",
+                "network / DNS trouble on the server, or api.typesafe.ai unreachable")
+    if isinstance(exc, httpx.ReadTimeout):
+        return (f"connected, but Jev sent no answer within {read_timeout:.0f}s ({name})",
+                "Jev is slow or busy right now — the request may still have been processed")
+    if isinstance(exc, httpx.WriteTimeout):
+        return (f"timed out sending the request ({name})", "slow or congested upstream network")
+    if isinstance(exc, httpx.PoolTimeout):
+        return (f"no free HTTP connection ({name})", "too many concurrent requests in this process")
+    if isinstance(exc, httpx.ConnectError):
+        return (f"couldn't connect ({name}: {detail or 'no detail'})",
+                "DNS failure, firewall, or api.typesafe.ai down")
+    if isinstance(exc, (httpx.RemoteProtocolError, httpx.ReadError)):
+        return (f"the connection dropped mid-response ({name}: {detail or 'no detail'})",
+                "Jev closed the connection — usually a restart or heavy load on their side")
+    return (f"{name}: {detail or 'no detail'}", "unexpected network error")
+
+
 async def _post_raw(api_key: str, state: dict, questions: dict, timeout_seconds: int) -> dict:
     import httpx
 
-    timeout = httpx.Timeout(connect=15.0, read=float(timeout_seconds), write=30.0, pool=10.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            resp = await client.post(
-                _API_URL,
-                json={"state": state, "model": _MODEL, "questions": questions},
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-            )
-        except httpx.HTTPError as exc:
-            raise JevError(f"Jev API transport error: {exc}") from exc
-    if resp.status_code >= 400:
-        raise JevError(f"Jev API HTTP {resp.status_code}: {resp.text[:500]}")
+    global _jev_slots, _jev_inflight, _jev_waiting
+    if _jev_slots is None:
+        _jev_slots = asyncio.Semaphore(JEV_MAX_CONCURRENT)
+    body = {"state": state, "model": _MODEL, "questions": questions}
+    size_kb = len(json.dumps(body, default=str)) / 1024
+    queued_at = time.monotonic()
+    _jev_waiting += 1
     try:
-        return resp.json()["answers"]
-    except (KeyError, ValueError) as exc:
-        raise JevError(f"Jev API returned an unexpected shape: {resp.text[:500]}") from exc
+        await _jev_slots.acquire()
+    finally:
+        _jev_waiting -= 1
+    waited = time.monotonic() - queued_at
+    _jev_inflight += 1
+    started = time.monotonic()
+    timeout = httpx.Timeout(
+        connect=CONNECT_TIMEOUT, read=float(timeout_seconds), write=30.0, pool=10.0
+    )
+
+    def ctx() -> str:
+        return (
+            f"[POST {_API_URL} model={_MODEL}, {len(questions)} question(s), "
+            f"{size_kb:.1f} KB; failed after {time.monotonic() - started:.1f}s"
+            + (f", waited {waited:.1f}s for a Jev slot" if waited >= 0.5 else "")
+            + f"; {_jev_inflight} Jev call(s) in flight, {_jev_waiting} waiting]"
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            try:
+                resp = await client.post(
+                    _API_URL,
+                    json=body,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                )
+            except httpx.HTTPError as exc:
+                what, why = _transport_reason(exc, float(timeout_seconds))
+                raise JevError(
+                    f"Jev API transport error: {what}. Likely cause: {why}. Not retried "
+                    f"automatically — rescore the job when ready. {ctx()}"
+                ) from exc
+        if resp.status_code >= 400:
+            rid = resp.headers.get("x-request-id") or resp.headers.get("request-id")
+            hint = (
+                "rate limited — the task waits and resumes automatically"
+                if resp.status_code == 429
+                else "API key rejected — check Settings → API Keys → TypeSafe Jev"
+                if resp.status_code in (401, 403)
+                else "Jev server error"
+                if resp.status_code >= 500
+                else "Jev rejected the request (bad input)"
+            )
+            raise JevError(
+                f"Jev API HTTP {resp.status_code} ({hint}): "
+                f"{(resp.text or '').strip()[:800] or '(empty body)'}"
+                + (f" [Jev request id {rid}]" if rid else "")
+                + f" {ctx()}"
+            )
+        try:
+            return resp.json()["answers"]
+        except (KeyError, ValueError) as exc:
+            raise JevError(
+                f"Jev API returned an unexpected shape: {(resp.text or '')[:800]} {ctx()}"
+            ) from exc
+    finally:
+        _jev_inflight -= 1
+        _jev_slots.release()
 
 
 # ---- Email triage ----------------------------------------------------------
@@ -556,7 +647,7 @@ async def classify_email(
     api_key: str,
     *,
     email_state: dict[str, Any],
-    timeout_seconds: int = 45,
+    timeout_seconds: int = 90,
     activity: Activity = None,
 ) -> dict[str, float]:
     """Return {intent: probability} for every email type, plus
@@ -600,7 +691,7 @@ async def score_job_fit(
     api_key: str,
     *,
     job_state: dict[str, Any],
-    timeout_seconds: int = 60,
+    timeout_seconds: int = 120,
     activity: Activity = None,
 ) -> dict[str, Any]:
     """One evaluation round-trip covering all five dimensions plus the

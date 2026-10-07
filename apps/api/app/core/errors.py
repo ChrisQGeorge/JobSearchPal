@@ -221,6 +221,7 @@ async def deep_health() -> dict:
         "responsiveness": snapshot(),
         "db_pools": pool_status(),
         "db_lanes": lanes_status(),
+        "jev": _jev_load(),
         "db_holders": connection_holders(),
     }
     t0 = time.monotonic()
@@ -249,6 +250,15 @@ async def deep_health() -> dict:
     }
     out["memory"] = _memory()
     return out
+
+
+def _jev_load() -> dict:
+    try:
+        from app.skills.jev import jev_load
+
+        return jev_load()
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _memory() -> dict:

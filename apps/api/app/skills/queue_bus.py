@@ -155,7 +155,7 @@ def _apply_event_to_registry(event: dict[str, Any]) -> None:
     elif kind == "error":
         task["status"] = "error"
         task["finished_at"] = now
-        task["error"] = _trim_text(str(event.get("text") or "unknown error"), cap=500)
+        task["error"] = _trim_text(str(event.get("text") or "unknown error"), cap=1500)
 
     _fan_task_update(task)
 
