@@ -84,7 +84,10 @@ const BD_KEYWORD_KIND = "brightdata_keyword";
 type RunSnapshot = {
   id: string | null;
   label: string;
-  status: string; // starting | running | ready | imported | failed
+  // queued (not sent yet) | retry (trigger failed, will retry) |
+  // starting | running | ready | imported | failed
+  status: string;
+  attempts?: number;
   leads: number;
   found?: number;
   auto_dismissed?: number;
@@ -167,18 +170,33 @@ function RunProgress({ source }: { source: Source }) {
                   <span className="text-corp-ok">✓</span>
                 ) : x.status === "failed" ? (
                   <span className="text-corp-danger">✕</span>
+                ) : x.status === "retry" ? (
+                  <span className="text-corp-accent2" title={x.error ?? undefined}>↻</span>
                 ) : (
                   <Spinner />
                 )}
               </span>
               <span className="truncate">{x.label}</span>
-              <span className="ml-auto text-corp-muted whitespace-nowrap">
+              <span
+                className={`ml-auto whitespace-nowrap truncate max-w-[60%] ${
+                  x.status === "failed"
+                    ? "text-corp-danger"
+                    : x.status === "retry"
+                      ? "text-corp-accent2"
+                      : "text-corp-muted"
+                }`}
+                title={x.error ?? undefined}
+              >
                 {x.status === "imported"
                   ? `${x.leads} new${x.auto_dismissed ? ` · ${x.auto_dismissed} auto-dismissed` : ""}${
                       x.found != null && x.found !== x.leads ? ` of ${x.found} found` : ""
                     }`
                   : x.status === "failed"
                     ? x.error ?? "failed"
+                    : x.status === "retry"
+                      ? x.error ?? "retrying shortly…"
+                    : x.status === "queued"
+                      ? "waiting to send…"
                     : x.status === "ready"
                       ? "downloading…"
                       : x.status === "starting"

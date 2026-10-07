@@ -39,7 +39,9 @@ log = logging.getLogger(__name__)
 
 
 BRIGHTDATA_API_BASE = "https://api.brightdata.com"
-TRIGGER_TIMEOUT_SECONDS = 30
+# Discovery triggers can take a while to answer when Bright Data is busy
+# (several back-to-back keyword rows); 30s produced spurious timeouts.
+TRIGGER_TIMEOUT_SECONDS = 90
 POLL_TIMEOUT_SECONDS = 120
 POLL_INTERVAL_SECONDS = 5
 # Keyword discovery scrapes result pages per input row — noticeably
@@ -91,6 +93,18 @@ class SnapshotPending(RuntimeError):
     def __init__(self, snapshot_id: str, message: str):
         super().__init__(message)
         self.snapshot_id = snapshot_id
+
+
+class TriggerTransient(RuntimeError):
+    """A trigger failed for a reason worth retrying later: timeout,
+    dropped connection, rate limit, or a Bright Data 5xx. A 4xx
+    validation error is a plain RuntimeError (retrying won't help)."""
+
+
+def _exc_text(exc: BaseException) -> str:
+    # httpx timeouts stringify to "" — always name the exception.
+    detail = str(exc).strip()
+    return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
 
 
 def clean_keyword_inputs(rows: Any) -> list[dict[str, str]]:
@@ -152,12 +166,22 @@ async def _trigger(
     ) as client:
         try:
             resp = await client.post(url, params=params, json=inputs)
+        except httpx.TimeoutException as exc:
+            raise TriggerTransient(
+                f"Bright Data didn't answer within {TRIGGER_TIMEOUT_SECONDS}s "
+                f"({type(exc).__name__})"
+            ) from exc
         except httpx.HTTPError as exc:
-            raise RuntimeError(f"Bright Data trigger failed: {exc}") from exc
+            raise TriggerTransient(f"Bright Data trigger failed: {_exc_text(exc)}") from exc
     if resp.status_code in (401, 403):
         raise RuntimeError(
             "Bright Data rejected the API key (HTTP "
             f"{resp.status_code}). Update the key on the Settings page."
+        )
+    if resp.status_code == 429 or resp.status_code >= 500:
+        raise TriggerTransient(
+            f"Bright Data trigger returned HTTP {resp.status_code}: "
+            f"{resp.text[:300] or 'no body'}"
         )
     if resp.status_code >= 400:
         raise RuntimeError(

@@ -130,7 +130,7 @@ async def poll_source(
     from app.sources.brightdata import SnapshotPending
 
     if source.kind == "brightdata_keyword":
-        return await _poll_keyword(db, source)
+        return await _poll_keyword(db, source, quick=quick)
 
     try:
         ctx = await _build_ctx(db, source)
@@ -379,6 +379,13 @@ async def _insert_leads(
 # ---- Bright Data keyword discovery: one run per row, imported as each lands --
 
 ACTIVE_TICK_SECONDS = 15
+# Keyword-run triggers are spread across ticks: a slow Bright Data
+# trigger (up to TRIGGER_TIMEOUT_SECONDS) then delays only a few rows,
+# and a foreground "Poll now" never waits on one.
+TRIGGERS_PER_TICK = 3
+# Transient trigger failures (timeout, dropped connection, 429, 5xx) are
+# retried on later ticks up to this many attempts in total.
+MAX_TRIGGER_ATTEMPTS = 3
 
 
 def _run_of(source: JobSource) -> Optional[dict]:
@@ -397,7 +404,9 @@ def _set_filters(source: JobSource, **changes) -> None:
     source.filters = f  # reassign so SQLAlchemy sees the JSON change
 
 
-async def _poll_keyword(db: AsyncSession, source: JobSource) -> tuple[int, Optional[str]]:
+async def _poll_keyword(
+    db: AsyncSession, source: JobSource, *, quick: bool = False
+) -> tuple[int, Optional[str]]:
     """Advance a saved keyword query by one step. No active run → trigger
     one Bright Data snapshot per row. Active run → check each snapshot's
     status and import the ones that are ready. Never blocks waiting on
@@ -436,21 +445,49 @@ async def _poll_keyword(db: AsyncSession, source: JobSource) -> tuple[int, Optio
             source.last_polled_at = _now()
             source.last_error = msg
             return 0, msg
-        snaps = []
-        for row in rows:
-            entry = {"id": None, "label": bd.keyword_row_label(row),
-                     "status": "starting", "leads": 0, "error": None}
-            try:
-                entry["id"] = await bd.trigger_keyword_row(
-                    api_key, row, dataset_id=ctx.get("dataset_id"), limit=cap
-                )
-            except Exception as exc:  # noqa: BLE001 — one bad row mustn't sink the rest
-                entry["status"] = "failed"
-                entry["error"] = str(exc)[:300]
-            snaps.append(entry)
+        # Rows start "queued" (not yet sent); the trigger step below
+        # sends a few per tick.
+        snaps = [{"id": None, "label": bd.keyword_row_label(row), "row": row,
+                  "status": "queued", "attempts": 0, "leads": 0, "error": None}
+                 for row in rows]
         run = {"started_at": _now().isoformat(timespec="seconds"),
                "inserted": 0, "snapshots": snaps}
-        log.info("source %s keyword run: triggered %d searches", source.id, len(snaps))
+        log.info("source %s keyword run: %d searches queued", source.id, len(snaps))
+
+    # --- Trigger step: queued rows + transient failures due a retry ----
+    by_label = {bd.keyword_row_label(r): r for r in bd.keyword_run_rows(source.filters)}
+    budget = 0 if quick else TRIGGERS_PER_TICK
+    for s in run["snapshots"]:
+        if s.get("id"):
+            continue
+        # Runs from before retries existed: a trigger failure with an
+        # empty reason was a timeout — give it the retry it deserved.
+        if (s["status"] == "failed" and "attempts" not in s
+                and (s.get("error") or "").rstrip().endswith("trigger failed:")):
+            s["status"], s["attempts"] = "retry", 1
+        if s["status"] not in ("queued", "retry") or budget <= 0:
+            continue
+        row = s.get("row") or by_label.get(s["label"])
+        if row is None:
+            s["status"], s["error"] = "failed", "search row no longer on this source"
+            continue
+        budget -= 1
+        s["attempts"] = int(s.get("attempts") or 0) + 1
+        try:
+            s["id"] = await bd.trigger_keyword_row(
+                api_key, row, dataset_id=ctx.get("dataset_id"), limit=cap
+            )
+            s["status"], s["error"] = "starting", None
+        except bd.TriggerTransient as exc:
+            if s["attempts"] < MAX_TRIGGER_ATTEMPTS:
+                s["status"] = "retry"
+                s["error"] = f"{exc} — retrying (attempt {s['attempts']}/{MAX_TRIGGER_ATTEMPTS})"[:300]
+            else:
+                s["status"] = "failed"
+                s["error"] = f"{exc} — gave up after {s['attempts']} attempts"[:300]
+        except Exception as exc:  # noqa: BLE001 — one bad row mustn't sink the rest
+            s["status"] = "failed"
+            s["error"] = (str(exc).strip() or type(exc).__name__)[:300]
 
     inserted_now = 0
     try:
