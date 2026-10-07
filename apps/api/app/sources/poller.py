@@ -399,7 +399,7 @@ ERROR_CHARS = 1500
 # the app died mid-send), the run isn't failed: Bright Data's snapshot
 # list (free) is checked each tick for this long, and a snapshot that
 # started anyway is adopted and collected like any other.
-VERIFY_WINDOW = timedelta(minutes=10)
+VERIFY_WINDOW = timedelta(hours=1)
 # Snapshots created this long before our send are still considered ours
 # (clock skew between us and Bright Data).
 VERIFY_SKEW = timedelta(minutes=2)
