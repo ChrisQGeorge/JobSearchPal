@@ -27,6 +27,7 @@ exact ID for each subscribed scraper."""
 from __future__ import annotations
 
 import asyncio
+import time
 import logging
 from typing import Any, Optional
 from urllib.parse import quote_plus
@@ -39,9 +40,10 @@ log = logging.getLogger(__name__)
 
 
 BRIGHTDATA_API_BASE = "https://api.brightdata.com"
-# Discovery triggers can take a while to answer when Bright Data is busy
-# (several back-to-back keyword rows); 30s produced spurious timeouts.
-TRIGGER_TIMEOUT_SECONDS = 90
+# Discovery triggers can take a while to answer when Bright Data is busy;
+# 30s produced spurious timeouts. Triggers are NEVER retried (each one
+# may be billed), so be generous — this runs in the background poller.
+TRIGGER_TIMEOUT_SECONDS = 180
 POLL_TIMEOUT_SECONDS = 120
 POLL_INTERVAL_SECONDS = 5
 # Keyword discovery scrapes result pages per input row — noticeably
@@ -93,12 +95,6 @@ class SnapshotPending(RuntimeError):
     def __init__(self, snapshot_id: str, message: str):
         super().__init__(message)
         self.snapshot_id = snapshot_id
-
-
-class TriggerTransient(RuntimeError):
-    """A trigger failed for a reason worth retrying later: timeout,
-    dropped connection, rate limit, or a Bright Data 5xx. A 4xx
-    validation error is a plain RuntimeError (retrying won't help)."""
 
 
 def _exc_text(exc: BaseException) -> str:
@@ -156,6 +152,16 @@ async def _trigger(
         params["limit_per_input"] = limit_per_input
     if extra_params:
         params.update(extra_params)
+    # Context for every failure message: what was asked of Bright Data.
+    what = (
+        f"[trigger: dataset {dataset_id}, {len(inputs)} search input"
+        f"{'s' if len(inputs) != 1 else ''}, limit_per_input "
+        f"{params.get('limit_per_input', 'none')}"
+        + (f", {', '.join(f'{k}={v}' for k, v in (extra_params or {}).items())}" if extra_params else "")
+        + "]"
+    )
+    no_retry = "Not retried automatically (each trigger may be billed)."
+    started = time.monotonic()
     async with httpx.AsyncClient(
         timeout=TRIGGER_TIMEOUT_SECONDS,
         headers={
@@ -167,32 +173,48 @@ async def _trigger(
         try:
             resp = await client.post(url, params=params, json=inputs)
         except httpx.TimeoutException as exc:
-            raise TriggerTransient(
-                f"Bright Data didn't answer within {TRIGGER_TIMEOUT_SECONDS}s "
-                f"({type(exc).__name__})"
+            raise RuntimeError(
+                f"Bright Data didn't answer the trigger within {TRIGGER_TIMEOUT_SECONDS}s "
+                f"({type(exc).__name__}). It MAY still have started the collection — check "
+                "Bright Data's dashboard (Web Scraper API → Logs / Snapshots) before running "
+                f"this import again. {no_retry} {what}"
             ) from exc
         except httpx.HTTPError as exc:
-            raise TriggerTransient(f"Bright Data trigger failed: {_exc_text(exc)}") from exc
+            raise RuntimeError(
+                f"Couldn't reach Bright Data after {time.monotonic() - started:.1f}s "
+                f"({_exc_text(exc)}). The request most likely never arrived, so nothing "
+                f"should have been charged. {no_retry} {what}"
+            ) from exc
+    elapsed = f"after {time.monotonic() - started:.1f}s"
+    body_text = (resp.text or "").strip()[:1000] or "(empty body)"
     if resp.status_code in (401, 403):
         raise RuntimeError(
-            "Bright Data rejected the API key (HTTP "
-            f"{resp.status_code}). Update the key on the Settings page."
-        )
-    if resp.status_code == 429 or resp.status_code >= 500:
-        raise TriggerTransient(
-            f"Bright Data trigger returned HTTP {resp.status_code}: "
-            f"{resp.text[:300] or 'no body'}"
+            f"Bright Data rejected the API key (HTTP {resp.status_code} {elapsed}): "
+            f"{body_text}. Update the key on Settings → API Keys. {what}"
         )
     if resp.status_code >= 400:
-        raise RuntimeError(
-            f"Bright Data trigger returned HTTP {resp.status_code}: "
-            f"{resp.text[:300]}"
+        hint = (
+            "Rate limited by Bright Data — wait a bit before importing again."
+            if resp.status_code == 429
+            else "Bright Data had a server error."
+            if resp.status_code >= 500
+            else "Bright Data rejected the request — usually an invalid value in one of "
+            "the search rows (check location / experience / job type spellings)."
         )
-    body = resp.json() if resp.content else {}
+        raise RuntimeError(
+            f"Bright Data trigger returned HTTP {resp.status_code} {elapsed}. {hint} "
+            f"Response: {body_text}. {no_retry} {what}"
+        )
+    try:
+        body = resp.json() if resp.content else {}
+    except ValueError:
+        body = body_text
     snapshot_id = body.get("snapshot_id") if isinstance(body, dict) else None
     if not snapshot_id:
         raise RuntimeError(
-            f"Bright Data trigger didn't return a snapshot_id: {body!r}"
+            f"Bright Data accepted the trigger (HTTP {resp.status_code} {elapsed}) but "
+            f"returned no snapshot_id: {str(body)[:1000]}. Check its dashboard before "
+            f"importing again. {no_retry} {what}"
         )
     return str(snapshot_id)
 

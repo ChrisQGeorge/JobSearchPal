@@ -383,9 +383,10 @@ ACTIVE_TICK_SECONDS = 15
 # matters for runs started before batching (one trigger per row). A
 # foreground "Poll now" never waits on a trigger.
 TRIGGERS_PER_TICK = 3
-# Transient trigger failures (timeout, dropped connection, 429, 5xx) are
-# retried on later ticks up to this many attempts in total.
-MAX_TRIGGER_ATTEMPTS = 3
+# A trigger may be billed, so each one is sent AT MOST ONCE: no retries,
+# and an entry interrupted mid-send (crash, restart) is marked failed
+# rather than re-sent. Failures carry a verbose reason instead.
+ERROR_CHARS = 1500
 
 
 def _run_of(source: JobSource) -> Optional[dict]:
@@ -456,18 +457,25 @@ async def _poll_keyword(
                "inserted": 0, "snapshots": snaps}
         log.info("source %s keyword run: %d searches queued as one call", source.id, len(rows))
 
-    # --- Trigger step: queued rows + transient failures due a retry ----
+    # --- Trigger step: send queued entries, each AT MOST ONCE ----------
     by_label = {bd.keyword_row_label(r): r for r in bd.keyword_run_rows(source.filters)}
     budget = 0 if quick else TRIGGERS_PER_TICK
     for s in run["snapshots"]:
         if s.get("id"):
             continue
-        # Runs from before retries existed: a trigger failure with an
-        # empty reason was a timeout — give it the retry it deserved.
-        if (s["status"] == "failed" and "attempts" not in s
-                and (s.get("error") or "").rstrip().endswith("trigger failed:")):
-            s["status"], s["attempts"] = "retry", 1
-        if s["status"] not in ("queued", "retry") or budget <= 0:
+        if s["status"] in ("sending", "retry"):
+            # "sending": the app stopped mid-trigger. "retry": left by the
+            # short-lived auto-retry build. Either way, never re-send.
+            interrupted = s["status"] == "sending"
+            s["status"] = "failed"
+            s["error"] = (
+                ("The app was interrupted while sending this search to Bright Data, so "
+                 "whether it started is unknown — check Bright Data's dashboard before "
+                 "importing again." if interrupted else
+                 f"{s.get('error') or 'Trigger failed'} (not re-sent: automatic retries are off)")
+            )[:ERROR_CHARS]
+            continue
+        if s["status"] != "queued" or budget <= 0:
             continue
         # Batched entry carries its rows; entries from older per-row
         # runs carry one row (or are matched back by label).
@@ -475,25 +483,28 @@ async def _poll_keyword(
             [s.get("row") or by_label.get(s["label"])] if (s.get("row") or s["label"] in by_label) else []
         )
         if not batch:
-            s["status"], s["error"] = "failed", "search row no longer on this source"
+            s["status"], s["error"] = "failed", "Search row no longer on this source — not sent."
             continue
         budget -= 1
-        s["attempts"] = int(s.get("attempts") or 0) + 1
+        # Persist "sending" BEFORE the call: if the process dies mid-call
+        # the next tick sees it and fails the entry instead of re-sending.
+        s["status"], s["attempts"] = "sending", 1
+        _set_filters(source, run=run)
+        if db is not None:
+            await db.commit()
         try:
             s["id"] = await bd.trigger_keyword_rows(
                 api_key, batch, dataset_id=ctx.get("dataset_id"), limit=cap
             )
             s["status"], s["error"] = "starting", None
-        except bd.TriggerTransient as exc:
-            if s["attempts"] < MAX_TRIGGER_ATTEMPTS:
-                s["status"] = "retry"
-                s["error"] = f"{exc} — retrying (attempt {s['attempts']}/{MAX_TRIGGER_ATTEMPTS})"[:300]
-            else:
-                s["status"] = "failed"
-                s["error"] = f"{exc} — gave up after {s['attempts']} attempts"[:300]
-        except Exception as exc:  # noqa: BLE001 — one bad row mustn't sink the rest
+        except Exception as exc:  # noqa: BLE001 — recorded on the run, never retried
             s["status"] = "failed"
-            s["error"] = (str(exc).strip() or type(exc).__name__)[:300]
+            s["error"] = (str(exc).strip() or type(exc).__name__)[:ERROR_CHARS]
+            log.warning("source %s keyword trigger failed (not retried): %s", source.id, s["error"])
+        # Save the snapshot id (or the failure) right away.
+        _set_filters(source, run=run)
+        if db is not None:
+            await db.commit()
 
     inserted_now = 0
     try:
@@ -512,7 +523,11 @@ async def _poll_keyword(
         try:
             status = await bd.snapshot_status(api_key, s["id"])
         except Exception as exc:  # noqa: BLE001 — transient; retry next tick
-            s["error"] = f"progress check failed: {exc}"[:300]
+            # Status checks are free, so this one IS retried next tick.
+            s["error"] = (
+                f"Progress check for snapshot {s['id']} failed "
+                f"({type(exc).__name__}: {str(exc).strip() or 'no detail'}) — checking again shortly."
+            )[:ERROR_CHARS]
             continue
         if status in ("failed", "canceled"):
             s["status"] = "failed"
@@ -528,7 +543,12 @@ async def _poll_keyword(
             continue
         except Exception as exc:  # noqa: BLE001
             s["status"] = "failed"
-            s["error"] = f"download failed: {exc}"[:300]
+            s["error"] = (
+                f"Bright Data finished snapshot {s['id']} but downloading it failed "
+                f"({type(exc).__name__}: {str(exc).strip() or 'no detail'}). The results are "
+                "already paid for — download them from Bright Data's dashboard using that "
+                "snapshot id rather than re-running the import."
+            )[:ERROR_CHARS]
             continue
         room = cap - int(run.get("inserted") or 0)
         n = auto = 0
@@ -563,13 +583,17 @@ async def _poll_keyword(
     source.last_polled_at = _now()
     source.last_lead_count = run["inserted"]
     if failed and len(failed) == len(run["snapshots"]):
-        source.last_error = f"All {len(failed)} searches failed — first error: {failed[0]['error']}"[:1000]
+        source.last_error = (
+            f"Import failed — {failed[0]['error']}" if len(failed) == 1
+            else f"All {len(failed)} searches failed — "
+            + " | ".join(f"{s['label']}: {s['error']}" for s in failed[:5])
+        )[:3000]
         return inserted_now, source.last_error
     # Partial failures are shown on the source row, not raised.
     source.last_error = (
         f"{len(failed)} of {len(run['snapshots'])} searches failed — "
-        + "; ".join(f"{s['label']}: {s['error']}" for s in failed[:3])
-    )[:1000] if failed else None
+        + " | ".join(f"{s['label']}: {s['error']}" for s in failed[:5])
+    )[:3000] if failed else None
     return inserted_now, None
 
 

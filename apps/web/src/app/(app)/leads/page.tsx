@@ -84,8 +84,8 @@ const BD_KEYWORD_KIND = "brightdata_keyword";
 type RunSnapshot = {
   id: string | null;
   label: string;
-  // queued (not sent yet) | retry (trigger failed, will retry) |
-  // starting | running | ready | imported | failed
+  // queued (not sent yet) | sending | starting | running | ready |
+  // imported | failed. Triggers are never retried (each may be billed).
   status: string;
   attempts?: number;
   // Batched run: the searches this one Bright Data call covers.
@@ -183,31 +183,24 @@ function RunProgress({ source }: { source: Source }) {
                   <span className="text-corp-ok">✓</span>
                 ) : x.status === "failed" ? (
                   <span className="text-corp-danger">✕</span>
-                ) : x.status === "retry" ? (
-                  <span className="text-corp-accent2" title={x.error ?? undefined}>↻</span>
                 ) : (
                   <Spinner />
                 )}
               </span>
               <span className="truncate">{x.label}</span>
               <span
-                className={`ml-auto whitespace-nowrap truncate max-w-[60%] ${
-                  x.status === "failed"
-                    ? "text-corp-danger"
-                    : x.status === "retry"
-                      ? "text-corp-accent2"
-                      : "text-corp-muted"
+                className={`ml-auto whitespace-nowrap ${
+                  x.status === "failed" ? "text-corp-danger" : "text-corp-muted"
                 }`}
-                title={x.error ?? undefined}
               >
                 {x.status === "imported"
                   ? `${x.leads} new${x.auto_dismissed ? ` · ${x.auto_dismissed} auto-dismissed` : ""}${
                       x.found != null && x.found !== x.leads ? ` of ${x.found} found` : ""
                     }`
                   : x.status === "failed"
-                    ? x.error ?? "failed"
-                    : x.status === "retry"
-                      ? x.error ?? "retrying shortly…"
+                    ? "failed — details below"
+                    : x.status === "sending"
+                      ? "sending to Bright Data…"
                     : x.status === "queued"
                       ? "waiting to send…"
                     : x.status === "ready"
@@ -217,6 +210,13 @@ function RunProgress({ source }: { source: Source }) {
                         : "searching…"}
               </span>
             </li>
+            {x.status === "failed" && x.error ? (
+              // Full reason, never truncated — it's the only record of
+              // what went wrong (nothing is retried).
+              <li className="pl-6 text-corp-danger whitespace-pre-wrap break-words select-text">
+                {x.error}
+              </li>
+            ) : null}
             {x.searches?.length ? (
               <li className="pl-6 text-corp-muted space-y-0.5">
                 {x.searches.map((label, k) => (
@@ -229,6 +229,32 @@ function RunProgress({ source }: { source: Source }) {
         </ul>
       ) : null}
     </div>
+  );
+}
+
+/** Source-level error: one line by default, expands to the full,
+ *  selectable message (Bright Data failures are verbose on purpose). */
+function SourceError({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <span className="text-[11px] text-corp-danger basis-full min-w-0">
+      {open ? (
+        <span className="whitespace-pre-wrap break-words select-text">error: {text} </span>
+      ) : (
+        <span className="inline-block max-w-full truncate align-bottom" title={text}>
+          error: {text}
+        </span>
+      )}
+      {text.length > 80 ? (
+        <button
+          type="button"
+          className="underline ml-1 text-corp-muted"
+          onClick={() => setOpen((o) => !o)}
+        >
+          {open ? "less" : "full error"}
+        </button>
+      ) : null}
+    </span>
   );
 }
 
@@ -837,12 +863,7 @@ export default function LeadsPage() {
                 {isCollecting(s) ? (
                   <RunProgress source={s} />
                 ) : s.last_error ? (
-                  <span
-                    className="text-[11px] text-corp-danger truncate max-w-xs"
-                    title={s.last_error}
-                  >
-                    error: {s.last_error}
-                  </span>
+                  <SourceError text={s.last_error} />
                 ) : null}
                 <LastRunNote source={s} />
                 <span className="text-[11px] text-corp-muted">
