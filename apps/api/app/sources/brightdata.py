@@ -658,13 +658,14 @@ async def fetch_linkedin(
     )
 
 
-# ---------- Keyword discovery: one run per input row ---------------------------
+# ---------- Keyword discovery: one call for all rows ---------------------------
 #
-# Bright Data only delivers a snapshot once the WHOLE run is ready (the
-# progress API reports status only — no partial records). So a saved
-# query is triggered as one snapshot per input row: rows finish
-# independently and the poller imports each as it lands, which is what
-# makes progress visible. Orchestration lives in sources/poller.py
+# A saved query is triggered as ONE snapshot whose inputs are all of its
+# rows, so a job several searches match is collected (and billed) once.
+# Trade-off: Bright Data only delivers a snapshot when the whole run is
+# ready, so leads land together at the end rather than search by search.
+# (Runs started before batching used one snapshot per row; the poller
+# still resumes those.) Orchestration lives in sources/poller.py
 # (_poll_keyword); these are the API pieces.
 
 
@@ -687,16 +688,27 @@ def keyword_row_label(row: dict) -> str:
     return " · ".join(bits)[:120]
 
 
-async def trigger_keyword_row(
-    api_key: str, row: dict, *, dataset_id: Optional[str], limit: Optional[int]
+async def trigger_keyword_rows(
+    api_key: str, rows: list[dict], *, dataset_id: Optional[str], limit: Optional[int]
 ) -> str:
+    """ONE snapshot for all of a saved query's rows (each row is one
+    input of the same call), so a job matched by several searches is
+    collected once instead of once per search. `limit` is per input."""
     return await _trigger(
         api_key,
         dataset_id or DEFAULT_DATASET_LINKEDIN,
-        [row],
+        rows,
         limit_per_input=limit,
         extra_params={"type": "discover_new", "discover_by": "keyword"},
     )
+
+
+async def trigger_keyword_row(
+    api_key: str, row: dict, *, dataset_id: Optional[str], limit: Optional[int]
+) -> str:
+    """Single-row trigger — only for resuming runs started before
+    keyword queries were batched into one call."""
+    return await trigger_keyword_rows(api_key, [row], dataset_id=dataset_id, limit=limit)
 
 
 async def snapshot_status(api_key: str, snapshot_id: str) -> str:

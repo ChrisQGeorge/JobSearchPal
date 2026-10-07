@@ -379,9 +379,9 @@ async def _insert_leads(
 # ---- Bright Data keyword discovery: one run per row, imported as each lands --
 
 ACTIVE_TICK_SECONDS = 15
-# Keyword-run triggers are spread across ticks: a slow Bright Data
-# trigger (up to TRIGGER_TIMEOUT_SECONDS) then delays only a few rows,
-# and a foreground "Poll now" never waits on one.
+# Triggers per tick. New runs are a single batched call; this only
+# matters for runs started before batching (one trigger per row). A
+# foreground "Poll now" never waits on a trigger.
 TRIGGERS_PER_TICK = 3
 # Transient trigger failures (timeout, dropped connection, 429, 5xx) are
 # retried on later ticks up to this many attempts in total.
@@ -407,11 +407,11 @@ def _set_filters(source: JobSource, **changes) -> None:
 async def _poll_keyword(
     db: AsyncSession, source: JobSource, *, quick: bool = False
 ) -> tuple[int, Optional[str]]:
-    """Advance a saved keyword query by one step. No active run → trigger
-    one Bright Data snapshot per row. Active run → check each snapshot's
-    status and import the ones that are ready. Never blocks waiting on
-    Bright Data; the poller ticks every 15s while a run is active, so
-    leads appear search by search and the source row shows progress
+    """Advance a saved keyword query by one step. No active run → queue
+    ONE Bright Data snapshot covering every row (sent by the trigger
+    step). Active run → check the snapshot's status and import it when
+    ready. Never blocks waiting on Bright Data; the poller ticks every
+    15s while a run is active and the source row shows progress
     (filters["run"]). Returns (leads inserted this step, error)."""
     from app.sources import brightdata as bd
     from app.sources.brightdata import SnapshotPending
@@ -445,14 +445,16 @@ async def _poll_keyword(
             source.last_polled_at = _now()
             source.last_error = msg
             return 0, msg
-        # Rows start "queued" (not yet sent); the trigger step below
-        # sends a few per tick.
-        snaps = [{"id": None, "label": bd.keyword_row_label(row), "row": row,
-                  "status": "queued", "attempts": 0, "leads": 0, "error": None}
-                 for row in rows]
+        # All rows go to Bright Data as ONE call (one snapshot): a job
+        # that several searches match is collected — and billed — once,
+        # instead of once per search. The entry starts "queued"; the
+        # trigger step below sends it.
+        snaps = [{"id": None, "label": f"{len(rows)} search{'es' if len(rows) != 1 else ''} · one Bright Data call",
+                  "rows": rows, "searches": [bd.keyword_row_label(r) for r in rows],
+                  "status": "queued", "attempts": 0, "leads": 0, "error": None}]
         run = {"started_at": _now().isoformat(timespec="seconds"),
                "inserted": 0, "snapshots": snaps}
-        log.info("source %s keyword run: %d searches queued", source.id, len(snaps))
+        log.info("source %s keyword run: %d searches queued as one call", source.id, len(rows))
 
     # --- Trigger step: queued rows + transient failures due a retry ----
     by_label = {bd.keyword_row_label(r): r for r in bd.keyword_run_rows(source.filters)}
@@ -467,15 +469,19 @@ async def _poll_keyword(
             s["status"], s["attempts"] = "retry", 1
         if s["status"] not in ("queued", "retry") or budget <= 0:
             continue
-        row = s.get("row") or by_label.get(s["label"])
-        if row is None:
+        # Batched entry carries its rows; entries from older per-row
+        # runs carry one row (or are matched back by label).
+        batch = s.get("rows") or (
+            [s.get("row") or by_label.get(s["label"])] if (s.get("row") or s["label"] in by_label) else []
+        )
+        if not batch:
             s["status"], s["error"] = "failed", "search row no longer on this source"
             continue
         budget -= 1
         s["attempts"] = int(s.get("attempts") or 0) + 1
         try:
-            s["id"] = await bd.trigger_keyword_row(
-                api_key, row, dataset_id=ctx.get("dataset_id"), limit=cap
+            s["id"] = await bd.trigger_keyword_rows(
+                api_key, batch, dataset_id=ctx.get("dataset_id"), limit=cap
             )
             s["status"], s["error"] = "starting", None
         except bd.TriggerTransient as exc:

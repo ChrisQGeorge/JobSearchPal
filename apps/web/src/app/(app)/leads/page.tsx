@@ -10,7 +10,7 @@
 // they inflate active-application counts.
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { PageShell } from "@/components/PageShell";
 import { api, apiUrl, ApiError } from "@/lib/api";
 import { KeywordFilters, type KeywordFilter } from "./_panels/KeywordFilters";
@@ -88,6 +88,8 @@ type RunSnapshot = {
   // starting | running | ready | imported | failed
   status: string;
   attempts?: number;
+  // Batched run: the searches this one Bright Data call covers.
+  searches?: string[];
   leads: number;
   found?: number;
   auto_dismissed?: number;
@@ -133,8 +135,14 @@ function RunProgress({ source }: { source: Source }) {
       </span>
     );
   }
-  const total = run.snapshots.length;
-  const done = run.snapshots.filter((x) => x.status === "imported" || x.status === "failed").length;
+  // Count searches, not snapshots: a batched run is one snapshot
+  // covering every search.
+  const weight = (x: RunSnapshot) => x.searches?.length || 1;
+  const total = run.snapshots.reduce((n, x) => n + weight(x), 0);
+  const done = run.snapshots
+    .filter((x) => x.status === "imported" || x.status === "failed")
+    .reduce((n, x) => n + weight(x), 0);
+  const batched = run.snapshots.some((x) => x.searches?.length);
   const pct = total ? Math.round((done / total) * 100) : 0;
   return (
     <div className="basis-full order-last">
@@ -142,7 +150,11 @@ function RunProgress({ source }: { source: Source }) {
         type="button"
         className="w-full text-left"
         onClick={() => setOpen((o) => !o)}
-        title="Each saved search runs as its own Bright Data job; results import as each one finishes."
+        title={
+          batched
+            ? "All saved searches run as one Bright Data job (a job several searches match is billed once); results import when it finishes."
+            : "Each saved search runs as its own Bright Data job; results import as each one finishes."
+        }
       >
         <div className="flex items-center gap-2 text-[11px] text-corp-accent">
           <Spinner />
@@ -164,7 +176,8 @@ function RunProgress({ source }: { source: Source }) {
       {open ? (
         <ul className="mt-2 space-y-0.5 text-[11px]">
           {run.snapshots.map((x, i) => (
-            <li key={x.id ?? i} className="flex items-center gap-2">
+            <Fragment key={x.id ?? i}>
+            <li className="flex items-center gap-2">
               <span className="w-4 text-center">
                 {x.status === "imported" ? (
                   <span className="text-corp-ok">✓</span>
@@ -204,6 +217,14 @@ function RunProgress({ source }: { source: Source }) {
                         : "searching…"}
               </span>
             </li>
+            {x.searches?.length ? (
+              <li className="pl-6 text-corp-muted space-y-0.5">
+                {x.searches.map((label, k) => (
+                  <div key={k} className="truncate">· {label}</div>
+                ))}
+              </li>
+            ) : null}
+            </Fragment>
           ))}
         </ul>
       ) : null}
