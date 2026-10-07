@@ -9,6 +9,7 @@ import { SkillsAnalysis } from "@/components/SkillsAnalysis";
 import { StatusBadge } from "@/components/StatusBadge";
 import { api, apiUrl, ApiError } from "@/lib/api";
 import { scoredOnlyParam } from "@/lib/queuePrefs";
+import { PostingPreview } from "./_PostingPreview";
 import {
   ARTIFACT_KINDS,
   EDUCATION_REQUIRED,
@@ -187,6 +188,15 @@ export default function JobDetailPage({
       <Link href="/jobs" className="text-sm text-corp-muted hover:text-corp-accent">
         ← All jobs
       </Link>
+
+      <div className="mt-3">
+        <PostingPreview
+          jobId={job.id}
+          sourceUrl={job.source_url}
+          remotePolicy={job.remote_policy}
+          onSetRemotePolicy={(p) => patch({ remote_policy: p })}
+        />
+      </div>
 
       <div className="flex gap-2 mt-4 mb-4 border-b border-corp-border">
         {(
@@ -764,7 +774,7 @@ function ApplyAction({
   // `in_progress` (the new "I clicked Apply, the posting is open in a
   // tab, am I done?" state) and for inApplyFlow (so the user can still
   // navigate through `interested` rows from the apply queue).
-  const active = inApplyFlow || status === "in_progress";
+  const active = inApplyFlow || status === "in_progress" || status === "interested";
 
   const fetchQueue = useCallback(async (): Promise<number[]> => {
     // Mirrors the review-queue fetch above — honor "Scored jobs only".
@@ -873,13 +883,16 @@ function ApplyAction({
       // (status moved to in_progress). On `interested` rows from the
       // Apply Queue, the user clicks Apply first.
       const triageable = status === "in_progress";
+      // Interested rows: 2 / 3 work too (1 = Applied needs the Apply click
+      // first, which opens the posting).
+      const passable = triageable || status === "interested";
       if (e.key === "1" && triageable && busy === null) {
         e.preventDefault();
         void triage("applied", "applied", false);
-      } else if (e.key === "2" && triageable && busy === null) {
+      } else if (e.key === "2" && passable && busy === null) {
         e.preventDefault();
         void triage("not_interested", "not_interested", false);
-      } else if (e.key === "3" && triageable && busy === null) {
+      } else if (e.key === "3" && passable && busy === null) {
         e.preventDefault();
         void triage(status, "skip", true);
       } else if (e.key === "j") {
@@ -943,6 +956,39 @@ function ApplyAction({
             <kbd>j</kbd>/<kbd>k</kbd> next/prev
           </span>
         ) : null}
+        {navErr ? (
+          <span className="text-[10px] text-corp-danger ml-2">{navErr}</span>
+        ) : null}
+      </div>
+    );
+  }
+
+  // Queued to apply (the Apply → button sits beside these): same
+  // Not interested / Skip pair as in_progress, minus Applied.
+  if (status === "interested") {
+    return (
+      <div className="flex items-center gap-1.5">
+        <button
+          type="button"
+          className="jsp-btn-ghost text-xs text-corp-danger border-corp-danger/40"
+          onClick={() => triage("not_interested", "not_interested", false)}
+          disabled={busy !== null}
+          title="Not applying after all — mark as not interested and jump to the next interested job (key: 2)"
+        >
+          {busy === "not_interested" ? "…" : "Not interested"}
+          {inApplyFlow ? <kbd className="ml-1 opacity-60 text-[10px]">2</kbd> : null}
+        </button>
+        <button
+          type="button"
+          className="jsp-btn-ghost text-xs"
+          onClick={() => triage(status, "skip", true)}
+          disabled={busy !== null}
+          title="Leave this one interested and jump to the next (key: 3)"
+        >
+          {busy === "skip" ? "…" : "Skip"}
+          {inApplyFlow ? <kbd className="ml-1 opacity-60 text-[10px]">3</kbd> : null}
+        </button>
+        {counter}
         {navErr ? (
           <span className="text-[10px] text-corp-danger ml-2">{navErr}</span>
         ) : null}

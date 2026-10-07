@@ -875,6 +875,34 @@ async def get_job(
     return job
 
 
+@router.get("/{job_id:int}/posting-preview")
+async def posting_preview(
+    job_id: int,
+    refresh: bool = False,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Server-side fetch of the job's apply link for the detail page:
+    readable text, whether the site allows framing, and the work-
+    arrangement wording found (remote / hybrid / on-site). See
+    app/skills/posting_preview.py."""
+    from app.skills import posting_preview as pp
+
+    job = await _get_owned_job(db, job_id, user.id)
+    url = (job.source_url or "").strip()
+    # Release the pooled connection before the (slow) outbound fetch.
+    await db.commit()
+    if not url:
+        raise HTTPException(status_code=404, detail="This job has no posting URL.")
+    if refresh:
+        pp.invalidate(url)
+    try:
+        out = await pp.fetch_preview(url)
+    except pp.PreviewError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return {**out, "job_remote_policy": job.remote_policy}
+
+
 @router.put("/{job_id:int}", response_model=TrackedJobOut)
 async def update_job(
     job_id: int,
