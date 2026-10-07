@@ -153,6 +153,11 @@ export default function DashboardPage() {
               Status distribution
             </h2>
             <StatusBarChart counts={metrics.statusCounts} />
+            {metrics.ghostedCount > 0 ? (
+              <p className="text-[11px] text-corp-muted mt-1.5">
+                Lost includes {metrics.ghostedCount} ghosted.
+              </p>
+            ) : null}
           </section>
 
           <section className="jsp-card p-5">
@@ -230,15 +235,22 @@ type Metrics = {
   appliedThisWeek: number;
   appliedLast30Days: number;
   statusCounts: Map<JobStatus, number>;
+  // How many of the "lost" count are ghosted jobs.
+  ghostedCount: number;
   funnelCounts: Array<{ status: JobStatus; count: number }>;
   activitySeries: Array<{ date: string; count: number }>;
 };
 
 function computeMetrics(jobs: TrackedJobSummary[]): Metrics {
+  // The dashboard counts ghosted as lost (an application nobody answered
+  // is an application lost); the tracker keeps them distinct.
   const statusCounts = new Map<JobStatus, number>();
   for (const s of JOB_STATUSES) statusCounts.set(s, 0);
+  let ghostedCount = 0;
   for (const j of jobs) {
-    statusCounts.set(j.status, (statusCounts.get(j.status) ?? 0) + 1);
+    const s: JobStatus = j.status === "ghosted" ? "lost" : j.status;
+    if (j.status === "ghosted") ghostedCount += 1;
+    statusCounts.set(s, (statusCounts.get(s) ?? 0) + 1);
   }
 
   const activeCount = ACTIVE_STATUSES.reduce(
@@ -299,6 +311,7 @@ function computeMetrics(jobs: TrackedJobSummary[]): Metrics {
     appliedThisWeek,
     appliedLast30Days,
     statusCounts,
+    ghostedCount,
     funnelCounts,
     activitySeries,
   };

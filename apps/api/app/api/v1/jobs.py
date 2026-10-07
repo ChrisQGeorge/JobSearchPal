@@ -675,21 +675,23 @@ async def tracker_view(
 # status the job moves to:
 #   - pre-application (to_review, watching, interested) ≥60d → archived;
 #     the posting has usually expired.
-#   - active applications (applied … assessment) ≥90d → LOST: three
-#     months without any movement means the application is dead. Lost
-#     (not archived) keeps it in the outcome metrics.
-#   - ghosted / withdrawn ≥30d → archived (tidying). `lost` is deliberately
-#     NOT here: those stay lost.
-# Never touched: offer, won, lost, not_interested, archived, in_progress.
+#   - active applications (applied … assessment) ≥90d → GHOSTED: three
+#     months without any movement means the employer went silent. Kept
+#     out of the archive so it stays in the outcome metrics (the
+#     dashboard counts ghosted as lost).
+#   - withdrawn ≥30d → archived (tidying). `lost` and `ghosted` are
+#     deliberately NOT here: those stay as they are.
+# Never touched: offer, won, lost, ghosted, not_interested, archived,
+# in_progress.
 _AUTO_CLOSE_RULES: tuple[tuple[str, int, tuple[str, ...], str], ...] = (
     ("not applied, idle ≥60d → archived", 60, ("to_review", "watching", "interested"), "archived"),
     (
-        "applications with no activity ≥90d → lost",
+        "applications with no activity ≥90d → ghosted",
         90,
         ("applied", "responded", "screening", "interviewing", "assessment"),
-        "lost",
+        "ghosted",
     ),
-    ("ghosted / withdrawn ≥30d → archived", 30, ("ghosted", "withdrawn"), "archived"),
+    ("withdrawn ≥30d → archived", 30, ("withdrawn",), "archived"),
 )
 
 
@@ -702,7 +704,7 @@ class AutoArchivePreviewOut(BaseModel):
     total: int
     sample_titles: list[str]
     archived: int = 0  # 0 on preview, actual count on execute
-    lost: int = 0  # 0 on preview, applications closed as lost on execute
+    ghosted: int = 0  # 0 on preview, applications closed as ghosted on execute
 
 
 def _auto_archive_cutoff(days: int) -> datetime:
@@ -761,19 +763,19 @@ async def auto_archive_execute(
     user: User = Depends(get_current_user),
 ) -> AutoArchivePreviewOut:
     """Execute the sweep — move every stale row to its rule's status
-    (archived, or lost for stale active applications) and emit a
+    (archived, or ghosted for stale active applications) and emit a
     status-change ApplicationEvent saying why."""
     by_bucket = await _collect_auto_archive_candidates(db, user.id)
     counts = {label: len(rows) for label, (_t, rows) in by_bucket.items()}
     total = sum(counts.values())
     sample: list[str] = []
-    archived = lost = 0
+    archived = ghosted = 0
     now = datetime.now(tz=timezone.utc)
     for label, (target, rows) in by_bucket.items():
         for j in rows:
             prev_status = j.status
             j.status = target
-            verb = "Auto-closed as lost" if target == "lost" else "Auto-archived"
+            verb = "Auto-closed as ghosted" if target == "ghosted" else "Auto-archived"
             db.add(
                 ApplicationEvent(
                     tracked_job_id=j.id,
@@ -785,20 +787,20 @@ async def auto_archive_execute(
                     ),
                 )
             )
-            if target == "lost":
-                lost += 1
+            if target == "ghosted":
+                ghosted += 1
             else:
                 archived += 1
             if len(sample) < 10:
                 sample.append(j.title)
-    if archived or lost:
+    if archived or ghosted:
         await db.commit()
     return AutoArchivePreviewOut(
         candidates_by_bucket=counts,
         total=total,
         sample_titles=sample,
         archived=archived,
-        lost=lost,
+        ghosted=ghosted,
     )
 
 

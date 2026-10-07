@@ -1766,17 +1766,17 @@ function AutoArchiveButton({ onArchived }: { onArchived: () => void }) {
     setErr(null);
     setBusy("running");
     try {
-      const out = await api.post<{ archived: number; lost?: number }>(
+      const out = await api.post<{ archived: number; ghosted?: number }>(
         "/api/v1/jobs/auto-archive",
         {},
       );
       setPreview(null);
       onArchived();
-      const lost = out.lost ?? 0;
+      const ghosted = out.ghosted ?? 0;
       alert(
         [
           out.archived ? `Archived ${out.archived} stale job${out.archived === 1 ? "" : "s"}.` : "",
-          lost ? `Marked ${lost} stale application${lost === 1 ? "" : "s"} as lost.` : "",
+          ghosted ? `Marked ${ghosted} stale application${ghosted === 1 ? "" : "s"} as ghosted.` : "",
         ]
           .filter(Boolean)
           .join(" ") || "Nothing changed.",
@@ -1854,8 +1854,8 @@ function AutoArchiveButton({ onArchived }: { onArchived: () => void }) {
       disabled={busy !== "idle"}
       title={
         "Close out stale rows (no activity): not-yet-applied ≥60 days → archived; " +
-        "active applications (applied → assessment) ≥90 days → lost; " +
-        "ghosted / withdrawn ≥30 days → archived. Lost jobs stay lost. " +
+        "active applications (applied → assessment) ≥90 days → ghosted; " +
+        "withdrawn ≥30 days → archived. Lost and ghosted jobs stay as they are. " +
         "Always shows a preview first."
       }
     >
