@@ -84,7 +84,6 @@ KEYWORD_ENUMS: dict[str, tuple[str, ...]] = {
                          "Mid-Senior level", "Director", "Executive"),
     "time_range": ("Past 24 hours", "Past week", "Past month", "Any time"),
 }
-_REMOTE_POLICY = {"remote": "remote", "hybrid": "hybrid", "on-site": "onsite", "onsite": "onsite"}
 KEYWORD_TIME_RANGES = ("Past 24 hours", "Past week", "Past month", "Any time")
 MAX_KEYWORD_INPUT_ROWS = 50
 
@@ -394,7 +393,7 @@ def _remote_from_record(rec: dict, location: str) -> Optional[str]:
     like "unless posted as a fully remote role" or "hybrid cloud"
     mislabel jobs, and a wrong "remote" makes the Jev location score
     ignore real geography. Unknown stays None."""
-    for key in ("job_workplace_type", "workplace_type", "remote"):
+    for key in ("job_workplace_type", "workplace_type"):
         v = str(rec.get(key) or "").lower()
         if "remote" in v:
             return "remote"
@@ -402,16 +401,11 @@ def _remote_from_record(rec: dict, location: str) -> Optional[str]:
             return "hybrid"
         if "on-site" in v or "onsite" in v:
             return "onsite"
-    # A query filtered by LinkedIn's own workplace filter (the `remote`
-    # input column) only returns matching jobs, and each record echoes
-    # the input row that found it.
-    di = rec.get("discovery_input")
-    if not isinstance(di, dict):
-        di = (rec.get("input") or {}).get("discovery_input") if isinstance(rec.get("input"), dict) else None
-    if isinstance(di, dict):
-        tag = _REMOTE_POLICY.get(str(di.get("remote") or "").strip().lower())
-        if tag:
-            return tag
+    # NOT used: the search row's `remote` input (echoed back as
+    # discovery_input / a top-level "remote" key). LinkedIn's public
+    # search ignores the workplace filter (verified 2026-10-07: f_WT=1/2/3
+    # return identical results), so a "Remote" row returns on-site jobs
+    # too — trusting it labelled them all remote. Unknown stays None.
     if _re.search(r"\bremote\b", location or "", _re.I):
         return "remote"
     return None

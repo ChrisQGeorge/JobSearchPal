@@ -313,7 +313,8 @@ const BD_COLUMNS: {
   {
     key: "remote",
     label: "Workplace",
-    hint: "LinkedIn's workplace filter — Remote returns only remote jobs",
+    hint:
+      "Sent as LinkedIn's workplace filter, but LinkedIn's public search ignores it — results can include on-site and hybrid jobs. Imported leads are NOT labelled from this column; check the posting.",
     options: ["Remote", "Hybrid", "On-site"],
   },
   {
