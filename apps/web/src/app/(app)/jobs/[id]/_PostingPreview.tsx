@@ -54,14 +54,19 @@ export function PostingPreview({
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [view, setView] = useState<"text" | "page">("text");
-  const [collapsed, setCollapsed] = useState(false);
+  // Hidden = nothing is fetched or framed. Remembered across every job
+  // page (one localStorage key). null until read, so a hidden preference
+  // never triggers a load on the first render.
+  const [collapsed, setCollapsed] = useState<boolean | null>(null);
 
   useEffect(() => {
+    let hidden = false;
     try {
-      setCollapsed(localStorage.getItem(COLLAPSE_KEY) === "1");
+      hidden = localStorage.getItem(COLLAPSE_KEY) === "1";
     } catch {
-      /* storage blocked */
+      /* storage blocked — default to shown */
     }
+    setCollapsed(hidden);
   }, []);
 
   async function load(refresh = false) {
@@ -85,23 +90,29 @@ export function PostingPreview({
     }
   }
 
+  // New job → drop the previous job's preview.
   useEffect(() => {
     setData(null);
+    setErr(null);
+  }, [jobId, sourceUrl]);
+
+  // Load only while shown (and only once per job until Refresh).
+  useEffect(() => {
+    if (collapsed !== false || data || loading || err) return;
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobId, sourceUrl]);
+  }, [collapsed, jobId, sourceUrl, data, err]);
 
   if (!sourceUrl) return null;
 
   function toggle() {
-    setCollapsed((c) => {
-      try {
-        localStorage.setItem(COLLAPSE_KEY, c ? "0" : "1");
-      } catch {
-        /* ignore */
-      }
-      return !c;
-    });
+    const next = !collapsed;
+    try {
+      localStorage.setItem(COLLAPSE_KEY, next ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+    setCollapsed(next);
   }
 
   const guess = data?.arrangement.guess ?? null;
@@ -112,10 +123,18 @@ export function PostingPreview({
   return (
     <section className="jsp-card p-3 mb-4 space-y-2">
       <div className="flex flex-wrap items-center gap-2">
-        <button type="button" onClick={toggle} className="text-sm font-medium hover:text-corp-accent">
-          {collapsed ? "▸" : "▾"} Posting
+        <span className="text-sm font-medium">Posting</span>
+        <button
+          type="button"
+          onClick={toggle}
+          className="jsp-btn-ghost text-[11px] py-0.5"
+          title="Hidden: the posting isn't fetched or shown. Remembered on every job page."
+        >
+          {collapsed ? "Show posting" : "Hide posting"}
         </button>
-        {loading ? (
+        {collapsed ? (
+          <span className="text-[11px] text-corp-muted">hidden — not loaded</span>
+        ) : loading ? (
           <span className="text-[11px] text-corp-muted">loading the posting…</span>
         ) : data ? (
           <span
@@ -127,15 +146,15 @@ export function PostingPreview({
             {guess ? `Posting says: ${LABEL[guess]}` : "Arrangement not stated"}
           </span>
         ) : null}
-        {mismatch ? (
+        {!collapsed && mismatch ? (
           <span className="text-[11px] text-corp-danger">
             Job is saved as <b>{listed}</b>
           </span>
         ) : null}
-        {data && guess === "mixed" ? (
+        {!collapsed && data && guess === "mixed" ? (
           <span className="text-[11px] text-corp-muted">set it yourself:</span>
         ) : null}
-        {data && (mismatch || guess === "mixed")
+        {!collapsed && data && (mismatch || guess === "mixed")
           ? (["onsite", "hybrid", "remote"] as const)
               .filter((p) => p !== listed)
               .map((p) => (
@@ -151,16 +170,13 @@ export function PostingPreview({
               ))
           : null}
         <span className="ml-auto flex gap-1.5 items-center">
-          {data?.embeddable ? (
+          {!collapsed && data?.embeddable ? (
             <span className="flex rounded border border-corp-border overflow-hidden text-[11px]">
               {(["text", "page"] as const).map((v) => (
                 <button
                   key={v}
                   type="button"
-                  onClick={() => {
-                    setView(v);
-                    setCollapsed(false);
-                  }}
+                  onClick={() => setView(v)}
                   className={`px-2 py-0.5 ${view === v ? "bg-corp-accent/20 text-corp-accent" : "text-corp-muted"}`}
                 >
                   {v === "text" ? "Text" : "Live page"}
@@ -168,15 +184,17 @@ export function PostingPreview({
               ))}
             </span>
           ) : null}
-          <button
-            type="button"
-            className="jsp-btn-ghost text-[11px] py-0.5"
-            onClick={() => void load(true)}
-            disabled={loading}
-            title="Fetch the posting again"
-          >
-            Refresh
-          </button>
+          {!collapsed ? (
+            <button
+              type="button"
+              className="jsp-btn-ghost text-[11px] py-0.5"
+              onClick={() => void load(true)}
+              disabled={loading}
+              title="Fetch the posting again"
+            >
+              Refresh
+            </button>
+          ) : null}
           <a
             href={sourceUrl}
             target="_blank"
@@ -188,7 +206,7 @@ export function PostingPreview({
         </span>
       </div>
 
-      {err ? (
+      {err && !collapsed ? (
         <p className="text-[11px] text-corp-danger whitespace-pre-wrap">
           {err} Use “Open ↗” to view it on the site.
         </p>
