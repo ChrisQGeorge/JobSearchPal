@@ -593,6 +593,9 @@ async def parse_email(
         await db.refresh(row)
         return row
 
+    # Release the pooled DB connection while the model runs (can take
+    # minutes); loaded objects stay usable (expire_on_commit=False).
+    await db.commit()
     try:
         final_text = await run_claude_to_bus(
             prompt=build_classify_prompt(row),
@@ -639,6 +642,9 @@ async def reparse_email(
     row = await _owned(db, parsed_id, user.id)
     if not (row.body_md or "").strip():
         raise HTTPException(status_code=422, detail="No body stored to reparse.")
+    # Release the pooled DB connection while the model runs (can take
+    # minutes); loaded objects stay usable (expire_on_commit=False).
+    await db.commit()
     try:
         final_text = await run_claude_to_bus(
             prompt=build_classify_prompt(row),

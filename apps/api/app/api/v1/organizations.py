@@ -492,6 +492,9 @@ async def run_org_research_pipeline(
 
     from app.skills.queue_bus import run_claude_to_bus
 
+    # Release the pooled DB connection while the model runs (can take
+    # minutes); loaded objects stay usable (expire_on_commit=False).
+    await db.commit()
     final_text = await run_claude_to_bus(
         prompt=prompt,
         source="org_research",

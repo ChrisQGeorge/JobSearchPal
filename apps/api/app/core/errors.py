@@ -79,10 +79,17 @@ def classify(exc: BaseException) -> tuple[int, str, str]:
     mod = type(exc).__module__ or ""
     text = str(exc)
     if mod.startswith("sqlalchemy") and name == "TimeoutError":
+        try:
+            from app.core.database import connection_holders
+
+            top = connection_holders(5)["web"]
+            held = "; ".join(f"{h['by']} ({h['held_s']:.0f}s)" for h in top) or "none recorded"
+        except Exception:  # noqa: BLE001
+            held = "unavailable"
         return 503, "DB_POOL_EXHAUSTED", (
-            "Every database connection was busy for 10s. Background tasks may be "
-            "saturating the pool — check /health/deep (pools, queue) and "
-            "`docker logs jsp-api`."
+            "Every web database connection was busy for 10s. Longest holders: "
+            f"{held}. Full list: /health/deep (db_holders); `docker logs jsp-api` "
+            "shows 'web DB connection held …' warnings."
         )
     if mod.startswith("sqlalchemy") and name in ("OperationalError", "InterfaceError", "DisconnectionError"):
         return 503, "DB_UNAVAILABLE", (
@@ -127,6 +134,9 @@ class RequestContext:
         rid = uuid.uuid4().hex[:8]
         scope.setdefault("state", {})["request_id"] = rid
         token = request_id_var.set(rid)
+        from app.core.database import db_holder_var
+
+        holder_token = db_holder_var.set(f"{scope.get('method', '?')} {scope.get('path', '?')} #{rid}")
         t0 = time.monotonic()
         status_holder = {"status": 0}
 
@@ -149,6 +159,7 @@ class RequestContext:
                     scope.get("method"), path, dt, status_holder["status"], rid,
                 )
             request_id_var.reset(token)
+            db_holder_var.reset(holder_token)
 
 
 def install(app: FastAPI) -> None:
@@ -204,7 +215,13 @@ async def deep_health() -> dict:
     from app.models.jobs import JobFetchQueue
     from app.skills import worker_settings
 
-    out: dict[str, Any] = {"responsiveness": snapshot(), "db_pools": pool_status()}
+    from app.core.database import connection_holders
+
+    out: dict[str, Any] = {
+        "responsiveness": snapshot(),
+        "db_pools": pool_status(),
+        "db_holders": connection_holders(),
+    }
     t0 = time.monotonic()
     try:
         async with SessionLocal() as db:

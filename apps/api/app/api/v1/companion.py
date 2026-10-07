@@ -790,6 +790,9 @@ async def send_message(
             _format_attachments_block(attachments) + payload.content
         )
 
+    # Release the pooled DB connection while the model runs (can take
+    # minutes); loaded objects stay usable (expire_on_commit=False).
+    await db.commit()
     try:
         result = await run_claude_prompt(
             prompt=effective_prompt,

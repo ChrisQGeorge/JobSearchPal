@@ -126,6 +126,58 @@ BgSessionLocal = async_sessionmaker(
 )
 
 
+# ---- Who is holding connections? -------------------------------------------
+#
+# Every checkout is tagged with the current request ("GET /api/v1/x #rid",
+# set by core.errors.RequestContext) or "background". When the web pool
+# runs dry, the 503 names the longest holders, /health/deep lists them,
+# and a web connection held > HOLD_WARN_SECONDS is logged at checkin —
+# so the next exhaustion points straight at its cause.
+
+import logging as _logging
+import time as _time
+from contextvars import ContextVar
+
+db_holder_var: ContextVar[str] = ContextVar("db_holder", default="background")
+HOLD_WARN_SECONDS = 20.0
+_HOLDERS: dict[str, dict[int, tuple[str, float]]] = {"web": {}, "background": {}}
+_hold_log = _logging.getLogger("app.db.holders")
+
+
+def _track(name: str, eng) -> None:
+    from sqlalchemy import event
+
+    holders = _HOLDERS[name]
+
+    @event.listens_for(eng.sync_engine.pool, "checkout")
+    def _on_checkout(_dbapi, record, _proxy):  # noqa: ANN001
+        holders[id(record)] = (db_holder_var.get(), _time.monotonic())
+
+    @event.listens_for(eng.sync_engine.pool, "checkin")
+    def _on_checkin(_dbapi, record):  # noqa: ANN001
+        info = holders.pop(id(record), None)
+        if info and name == "web":
+            held = _time.monotonic() - info[1]
+            if held > HOLD_WARN_SECONDS:
+                _hold_log.warning(
+                    "web DB connection held %.0fs by %s — commit before slow calls", held, info[0]
+                )
+
+
+_track("web", engine)
+_track("background", bg_engine)
+
+
+def connection_holders(limit: int = 10) -> dict[str, list[dict]]:
+    """Current holders per pool, longest first."""
+    now = _time.monotonic()
+    out: dict[str, list[dict]] = {}
+    for name, holders in _HOLDERS.items():
+        rows = sorted(holders.values(), key=lambda t: t[1])
+        out[name] = [{"by": by, "held_s": round(now - t0, 1)} for by, t0 in rows[:limit]]
+    return out
+
+
 def pool_status() -> dict:
     """Checked-out / idle counts for both pools (for /health/deep)."""
     out = {}
