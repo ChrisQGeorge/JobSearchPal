@@ -515,15 +515,14 @@ function ReviewAction({
     }
   }
 
-  // Keyboard shortcuts on the review-flow detail page:
+  // Keyboard shortcuts:
   //   1 = interested, 2 = not_interested, 3 = skip (status=reviewed)
-  //   j = next, k = previous
-  // Only active when the user arrived via /jobs/review, the row is still
-  // to_review (for 1/2/3), and focus isn't in an input. j/k always work
-  // in the review flow regardless of status so the user can scroll past
-  // already-triaged rows without losing their place.
+  //     — whenever the row is to_review (the buttons are showing), from
+  //     any entry point, as long as focus isn't in an input.
+  //   j = next, k = previous — review flow only (needs the queue); work
+  //     regardless of status so the user can scroll past triaged rows.
   useEffect(() => {
-    if (!inReviewFlow) return;
+    if (!inReviewFlow && status !== "to_review") return;
     function isTextish(el: EventTarget | null): boolean {
       if (!(el instanceof HTMLElement)) return false;
       const tag = el.tagName;
@@ -533,7 +532,7 @@ function ReviewAction({
     }
     function onKey(e: KeyboardEvent) {
       if (isTextish(e.target)) return;
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
       if (e.key === "1" && status === "to_review" && busy === null) {
         e.preventDefault();
         void triage("interested", "interested");
@@ -543,10 +542,10 @@ function ReviewAction({
       } else if (e.key === "3" && status === "to_review" && busy === null) {
         e.preventDefault();
         void triage("reviewed", "skip");
-      } else if (e.key === "j") {
+      } else if (e.key === "j" && inReviewFlow) {
         e.preventDefault();
         void goNext();
-      } else if (e.key === "k") {
+      } else if (e.key === "k" && inReviewFlow) {
         e.preventDefault();
         void goPrev();
       }
@@ -574,7 +573,7 @@ function ReviewAction({
           title="Mark this job as interested and jump to the next to-review row (key: 1)"
         >
           {busy === "interested" ? "…" : "Interested"}
-          {inReviewFlow ? <kbd className="ml-1 opacity-60 text-[10px]">1</kbd> : null}
+          <kbd className="ml-1 opacity-60 text-[10px]">1</kbd>
         </button>
         <button
           type="button"
@@ -584,7 +583,7 @@ function ReviewAction({
           title="Mark this job as not interested and jump to the next to-review row (key: 2)"
         >
           {busy === "not_interested" ? "…" : "Not interested"}
-          {inReviewFlow ? <kbd className="ml-1 opacity-60 text-[10px]">2</kbd> : null}
+          <kbd className="ml-1 opacity-60 text-[10px]">2</kbd>
         </button>
         <button
           type="button"
@@ -597,7 +596,7 @@ function ReviewAction({
           }
         >
           {busy === "skip" ? "…" : "Skip"}
-          {inReviewFlow ? <kbd className="ml-1 opacity-60 text-[10px]">3</kbd> : null}
+          <kbd className="ml-1 opacity-60 text-[10px]">3</kbd>
         </button>
         {counter}
         {inReviewFlow && ids.length > 0 ? (
@@ -721,6 +720,29 @@ function MoveToApplyButton({
   disabled: boolean;
   onApply: () => void;
 }) {
+  // Key 1 = Apply → (consistent with 1 = the primary action on
+  // to_review / in_progress rows). A keydown is a user gesture, so the
+  // posting's window.open isn't popup-blocked.
+  useEffect(() => {
+    if (status !== "interested" || disabled) return;
+    function onKey(e: KeyboardEvent) {
+      const el = e.target;
+      if (
+        el instanceof HTMLElement &&
+        (["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName) || el.isContentEditable)
+      )
+        return;
+      if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
+      if (e.key === "1") {
+        e.preventDefault();
+        go();
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status, disabled, sourceUrl, jobId]);
+
   if (status !== "interested") return null;
   function go() {
     if (sourceUrl) {
@@ -733,8 +755,8 @@ function MoveToApplyButton({
     onApply();
   }
   const title = sourceUrl
-    ? "Open the posting in a new tab, download the latest tailored resume + cover letter, and move this row to in-progress."
-    : "Download the latest tailored resume + cover letter and move this row to in-progress (no source URL on file — open the posting manually).";
+    ? "Open the posting in a new tab, download the latest tailored resume + cover letter, and move this row to in-progress (key: 1)."
+    : "Download the latest tailored resume + cover letter and move this row to in-progress (no source URL on file — open the posting manually) (key: 1).";
   return (
     <button
       type="button"
@@ -743,7 +765,7 @@ function MoveToApplyButton({
       disabled={disabled}
       title={title}
     >
-      Apply →
+      Apply →<kbd className="ml-1 opacity-60 text-[10px]">1</kbd>
     </button>
   );
 }
@@ -867,8 +889,11 @@ function ApplyAction({
   // Apply-flow keyboard shortcuts mirror the review-flow ones:
   //   1 = applied, 2 = not_interested, 3 = skip (keep status)
   //   j = next, k = previous
+  // 1/2/3 whenever the in_progress / interested buttons are showing (1 on
+  // an interested row is the Apply → button's own shortcut, handled in
+  // MoveToApplyButton); j/k only in the apply flow (needs the queue).
   useEffect(() => {
-    if (!inApplyFlow) return;
+    if (!inApplyFlow && status !== "in_progress" && status !== "interested") return;
     function isTextish(el: EventTarget | null): boolean {
       if (!(el instanceof HTMLElement)) return false;
       const tag = el.tagName;
@@ -878,7 +903,7 @@ function ApplyAction({
     }
     function onKey(e: KeyboardEvent) {
       if (isTextish(e.target)) return;
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
       // Triage keyboard nav only fires once the user has clicked Apply
       // (status moved to in_progress). On `interested` rows from the
       // Apply Queue, the user clicks Apply first.
@@ -895,10 +920,10 @@ function ApplyAction({
       } else if (e.key === "3" && passable && busy === null) {
         e.preventDefault();
         void triage(status, "skip", true);
-      } else if (e.key === "j") {
+      } else if (e.key === "j" && inApplyFlow) {
         e.preventDefault();
         void goNext();
-      } else if (e.key === "k") {
+      } else if (e.key === "k" && inApplyFlow) {
         e.preventDefault();
         void goPrev();
       }
@@ -928,7 +953,7 @@ function ApplyAction({
           title="Mark as applied and jump to the next row (key: 1)"
         >
           {busy === "applied" ? "…" : "Applied"}
-          {inApplyFlow ? <kbd className="ml-1 opacity-60 text-[10px]">1</kbd> : null}
+          <kbd className="ml-1 opacity-60 text-[10px]">1</kbd>
         </button>
         <button
           type="button"
@@ -938,7 +963,7 @@ function ApplyAction({
           title="Changed your mind — mark as not interested and jump to the next (key: 2)"
         >
           {busy === "not_interested" ? "…" : "Not interested"}
-          {inApplyFlow ? <kbd className="ml-1 opacity-60 text-[10px]">2</kbd> : null}
+          <kbd className="ml-1 opacity-60 text-[10px]">2</kbd>
         </button>
         <button
           type="button"
@@ -948,7 +973,7 @@ function ApplyAction({
           title="Leave this one alone and jump to the next (key: 3)"
         >
           {busy === "skip" ? "…" : "Skip"}
-          {inApplyFlow ? <kbd className="ml-1 opacity-60 text-[10px]">3</kbd> : null}
+          <kbd className="ml-1 opacity-60 text-[10px]">3</kbd>
         </button>
         {counter}
         {inApplyFlow && ids.length > 0 ? (
@@ -976,7 +1001,7 @@ function ApplyAction({
           title="Not applying after all — mark as not interested and jump to the next interested job (key: 2)"
         >
           {busy === "not_interested" ? "…" : "Not interested"}
-          {inApplyFlow ? <kbd className="ml-1 opacity-60 text-[10px]">2</kbd> : null}
+          <kbd className="ml-1 opacity-60 text-[10px]">2</kbd>
         </button>
         <button
           type="button"
@@ -986,7 +1011,7 @@ function ApplyAction({
           title="Leave this one interested and jump to the next (key: 3)"
         >
           {busy === "skip" ? "…" : "Skip"}
-          {inApplyFlow ? <kbd className="ml-1 opacity-60 text-[10px]">3</kbd> : null}
+          <kbd className="ml-1 opacity-60 text-[10px]">3</kbd>
         </button>
         {counter}
         {navErr ? (
