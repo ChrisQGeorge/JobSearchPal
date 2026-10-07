@@ -55,6 +55,7 @@ type SortKey =
   | "org"
   | "industry"
   | "fit"
+  | "jev"
   | "skill_match_pct"
   | "salary"
   | "applied"
@@ -64,6 +65,7 @@ type SortKey =
 // best/highest first"); text and date columns start ascending.
 const NUMERIC_SORT_KEYS: ReadonlySet<SortKey> = new Set<SortKey>([
   "fit",
+  "jev",
   "skill_match_pct",
   "salary",
 ]);
@@ -81,6 +83,9 @@ function sortValue(
       return j.organization_industry?.toLowerCase() || null;
     case "fit":
       return j.fit_score ?? null;
+    case "jev":
+      // Apply probability orders within a verdict too (0.72 GO > 0.55 GO).
+      return j.jev_apply_probability ?? null;
     case "skill_match_pct":
       return j.skill_match_pct ?? null;
     case "salary":
@@ -93,6 +98,46 @@ function sortValue(
     default:
       return null;
   }
+}
+
+const JEV_STYLE: Record<string, string> = {
+  go: "border-corp-ok/50 bg-corp-ok/10 text-corp-ok",
+  maybe: "border-corp-accent2/50 bg-corp-accent2/10 text-corp-accent2",
+  "no-go": "border-corp-danger/50 bg-corp-danger/10 text-corp-danger",
+};
+
+/** Jev's overall apply verdict: GO / MAYBE / NO-GO (+ probability). */
+function JevVerdict({ job }: { job: TrackedJobSummary }) {
+  const rec = job.jev_recommendation;
+  if (!rec) return <span className="text-corp-muted text-xs">—</span>;
+  const p = job.jev_apply_probability;
+  return (
+    <span
+      className={`text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded-full border whitespace-nowrap ${JEV_STYLE[rec] ?? ""}`}
+      title={`Jev's overall apply verdict${p != null ? ` — ${Math.round(p * 100)}% worth applying` : ""}. Thresholds: Settings → Jev scoring.`}
+    >
+      {rec}
+      {p != null ? ` ${Math.round(p * 100)}%` : ""}
+    </span>
+  );
+}
+
+/** "You already have an active application at this company." */
+function SameCompanyActive({ job, compact }: { job: TrackedJobSummary; compact?: boolean }) {
+  const others = job.same_company_active ?? [];
+  if (others.length === 0) {
+    return compact ? null : <span className="text-corp-muted text-xs">—</span>;
+  }
+  const lines = others.map((o) => `• ${o.title} (${o.status})`).join("\n");
+  return (
+    <span
+      className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded-full border border-corp-accent/50 bg-corp-accent/10 text-corp-accent whitespace-nowrap"
+      title={`Active application${others.length > 1 ? "s" : ""} at this company:\n${lines}`}
+    >
+      {compact ? "Applied here " : "Yes · "}
+      {others.length}
+    </span>
+  );
 }
 
 /** Compact posted-range label for the Salary column: "80k–120k", "150k",
@@ -296,6 +341,8 @@ export default function JobTrackerPage() {
     salaryMin: "",
     fitMin: "",
     fitMax: "",
+    jev: "", // "" | go | maybe | no-go | none (not Jev-scored)
+    sameCo: "", // "" | yes | no
   });
   const anyColFilter = Object.values(colFilters).some((v) => v.trim() !== "");
   function setColFilter(key: keyof typeof colFilters, value: string) {
@@ -374,6 +421,18 @@ export default function JobTrackerPage() {
     const fitMax = parseInt(colFilters.fitMax, 10);
     if (!Number.isNaN(fitMax)) {
       arr = arr.filter((j) => j.fit_score != null && j.fit_score <= fitMax);
+    }
+
+    if (colFilters.jev) {
+      arr = arr.filter((j) =>
+        colFilters.jev === "none"
+          ? !j.jev_recommendation
+          : j.jev_recommendation === colFilters.jev,
+      );
+    }
+    if (colFilters.sameCo) {
+      const want = colFilters.sameCo === "yes";
+      arr = arr.filter((j) => (j.same_company_active?.length ?? 0) > 0 === want);
     }
 
     if (sortKey !== "none") {
@@ -915,6 +974,28 @@ export default function JobTrackerPage() {
                 onChange={(e) => setColFilter("fitMax", e.target.value)}
               />
             </div>
+            <select
+              className="jsp-input text-xs"
+              value={colFilters.jev}
+              onChange={(e) => setColFilter("jev", e.target.value)}
+              aria-label="Jev verdict"
+            >
+              <option value="">Jev: all</option>
+              <option value="go">Jev: GO</option>
+              <option value="maybe">Jev: MAYBE</option>
+              <option value="no-go">Jev: NO-GO</option>
+              <option value="none">Jev: not scored</option>
+            </select>
+            <select
+              className="jsp-input text-xs"
+              value={colFilters.sameCo}
+              onChange={(e) => setColFilter("sameCo", e.target.value)}
+              aria-label="Applied at same company"
+            >
+              <option value="">Applied at co.: all</option>
+              <option value="yes">Applied at co.: yes</option>
+              <option value="no">Applied at co.: no</option>
+            </select>
             <input
               type="number"
               step={1000}
@@ -949,6 +1030,7 @@ export default function JobTrackerPage() {
                 aria-label="Sort by"
               >
                 <option value="none">Sort: default</option>
+                <option value="jev">Sort: Jev verdict</option>
                 <option value="fit">Sort: fit</option>
                 <option value="salary">Sort: salary</option>
                 <option value="skill_match_pct">Sort: skills %</option>
@@ -983,6 +1065,8 @@ export default function JobTrackerPage() {
                   salaryMin: "",
                   fitMin: "",
                   fitMax: "",
+                  jev: "",
+                  sameCo: "",
                 })
               }
             >
@@ -1047,6 +1131,8 @@ export default function JobTrackerPage() {
                         .join(" · ")}
                     </div>
                     <div className="flex flex-wrap gap-1 items-center mt-1.5">
+                      {j.jev_recommendation ? <JevVerdict job={j} /> : null}
+                      <SameCompanyActive job={j} compact />
                       <FitPill
                         score={j.fit_score ?? null}
                         redFlagCount={j.red_flag_count ?? 0}
@@ -1110,7 +1196,21 @@ export default function JobTrackerPage() {
                 </th>
                 <SortableTh label="Title" colKey="title" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <SortableTh label="Organization" colKey="org" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <th
+                  className="py-2 px-4 whitespace-nowrap"
+                  title="Do you have an active application (applied → offer) at the same company?"
+                >
+                  Applied at co.
+                </th>
                 <th className="py-2 px-4">Status</th>
+                <SortableTh
+                  label="Jev"
+                  colKey="jev"
+                  sortKey={sortKey}
+                  sortDir={sortDir}
+                  onSort={toggleSort}
+                  title="Jev's overall verdict (GO / MAYBE / NO-GO). Sorts by apply probability. Click again to flip, again to clear."
+                />
                 <SortableTh
                   label="Fit"
                   colKey="fit"
@@ -1163,6 +1263,8 @@ export default function JobTrackerPage() {
                           salaryMin: "",
                           fitMin: "",
                           fitMax: "",
+                          jev: "",
+                          sameCo: "",
                         })
                       }
                     >
@@ -1188,7 +1290,33 @@ export default function JobTrackerPage() {
                     onChange={(e) => setColFilter("org", e.target.value)}
                   />
                 </td>
+                <td className="py-1 px-4">
+                  <select
+                    className="jsp-input text-xs py-0.5 px-1.5 w-full"
+                    value={colFilters.sameCo}
+                    onChange={(e) => setColFilter("sameCo", e.target.value)}
+                    title="Filter by whether you have an active application at the same company"
+                  >
+                    <option value="">All</option>
+                    <option value="yes">Yes</option>
+                    <option value="no">No</option>
+                  </select>
+                </td>
                 <td className="py-1 px-4" />
+                <td className="py-1 px-4">
+                  <select
+                    className="jsp-input text-xs py-0.5 px-1.5 w-full"
+                    value={colFilters.jev}
+                    onChange={(e) => setColFilter("jev", e.target.value)}
+                    title="Filter by Jev's overall apply verdict"
+                  >
+                    <option value="">All</option>
+                    <option value="go">GO</option>
+                    <option value="maybe">MAYBE</option>
+                    <option value="no-go">NO-GO</option>
+                    <option value="none">Not Jev-scored</option>
+                  </select>
+                </td>
                 <td className="py-1 px-4">
                   <div className="flex gap-1">
                     <input
@@ -1247,7 +1375,7 @@ export default function JobTrackerPage() {
               {pagedItems.length === 0 ? (
                 <tr className="border-t border-corp-border">
                   <td
-                    colSpan={11}
+                    colSpan={13}
                     className="py-6 px-4 text-center text-sm text-corp-muted"
                   >
                     No jobs match the column filters. Clear them with the ×
@@ -1289,6 +1417,9 @@ export default function JobTrackerPage() {
                     {j.organization_name ?? "—"}
                   </td>
                   <td className="py-2 px-4">
+                    <SameCompanyActive job={j} />
+                  </td>
+                  <td className="py-2 px-4">
                     <InlineStatusPicker
                       jobId={j.id}
                       status={j.status}
@@ -1300,6 +1431,9 @@ export default function JobTrackerPage() {
                         )
                       }
                     />
+                  </td>
+                  <td className="py-2 px-4">
+                    <JevVerdict job={j} />
                   </td>
                   <td className="py-2 px-4">
                     <div className="flex flex-wrap gap-1 items-center">

@@ -241,6 +241,26 @@ async def job_status_counts(
     return {"counts": counts, "total": sum(counts.values())}
 
 
+# Submitted applications that are still open — "I have an active
+# application there". Excludes pre-apply states and closed outcomes.
+ACTIVE_APPLICATION_STATUSES = (
+    "applied", "responded", "screening", "interviewing", "assessment", "offer",
+)
+_COMPANY_SUFFIXES = {
+    "inc", "incorporated", "llc", "ltd", "limited", "corp", "corporation",
+    "co", "company", "plc", "gmbh", "lp", "llp", "the",
+}
+
+
+def _company_key(name: Optional[str]) -> str:
+    """Normalized company name: case/punctuation-insensitive, legal
+    suffixes dropped ("Acme, Inc." == "acme")."""
+    if not name:
+        return ""
+    words = re.sub(r"[^a-z0-9]+", " ", name.lower()).split()
+    return " ".join(w for w in words if w not in _COMPANY_SUFFIXES)
+
+
 async def _compute_job_summaries(
     db: AsyncSession,
     user: User,
@@ -425,6 +445,43 @@ async def _compute_job_summaries(
         has_resume_by_job = {}
         has_cover_letter_by_job = {}
 
+    # Active applications by company — across ALL the user's jobs, not
+    # just the filtered page, so the column is right under any filter.
+    active_by_org: dict[int, list[dict]] = {}
+    active_by_name: dict[str, list[dict]] = {}
+    if jobs:
+        active_rows = (
+            await db.execute(
+                select(
+                    TrackedJob.id, TrackedJob.title, TrackedJob.status,
+                    TrackedJob.organization_id, Organization.name,
+                )
+                .outerjoin(Organization, Organization.id == TrackedJob.organization_id)
+                .where(
+                    TrackedJob.user_id == user.id,
+                    TrackedJob.deleted_at.is_(None),
+                    TrackedJob.status.in_(ACTIVE_APPLICATION_STATUSES),
+                )
+            )
+        ).all()
+        for jid, jtitle, jstatus, oid, oname in active_rows:
+            item = {"id": jid, "title": jtitle, "status": jstatus}
+            if oid:
+                active_by_org.setdefault(oid, []).append(item)
+            key = _company_key(oname)
+            if key:
+                active_by_name.setdefault(key, []).append(item)
+
+    def _same_company_active(j: TrackedJob) -> list[dict]:
+        found: dict[int, dict] = {}
+        for it in active_by_org.get(j.organization_id, []) if j.organization_id else []:
+            found[it["id"]] = it
+        name = org_meta.get(j.organization_id, (None, None))[0] if j.organization_id else None
+        for it in active_by_name.get(_company_key(name), []) if name else []:
+            found[it["id"]] = it
+        found.pop(j.id, None)
+        return list(found.values())[:10]
+
     # Memoize the per-skill match result across all jobs. The same skill
     # strings ("python", "aws", …) recur on hundreds of postings, so without
     # this we re-ran the O(user_skill_terms) substring scan for each
@@ -453,11 +510,17 @@ async def _compute_job_summaries(
             if isinstance(raw, (int, float)):
                 fit_score = int(raw)
         red_flag_count = 0
+        jev_rec: Optional[str] = None
+        jev_p: Optional[float] = None
         jda = j.jd_analysis
         if isinstance(jda, dict):
             rfs = jda.get("red_flags")
             if isinstance(rfs, list):
                 red_flag_count = len(rfs)
+            if jda.get("engine") == "jev" and jda.get("recommendation") in ("go", "maybe", "no-go"):
+                jev_rec = jda["recommendation"]
+                ap = jda.get("apply_probability")
+                jev_p = float(ap) if isinstance(ap, (int, float)) else None
 
         # Skill-match heatmap. Prefer the value denormalized onto
         # fit_summary at score time; only compute live for legacy jobs
@@ -517,6 +580,9 @@ async def _compute_job_summaries(
                 skill_match_total=skill_match_total,
                 has_resume=has_resume_by_job.get(j.id, False),
                 has_cover_letter=has_cover_letter_by_job.get(j.id, False),
+                jev_recommendation=jev_rec,
+                jev_apply_probability=jev_p,
+                same_company_active=_same_company_active(j),
             )
         )
     return out

@@ -244,6 +244,12 @@ export type TrackedJobSummary = {
   skill_match_total?: number | null;
   has_resume?: boolean;
   has_cover_letter?: boolean;
+  // Jev's overall apply verdict; null unless the analysis came from Jev.
+  jev_recommendation?: "go" | "maybe" | "no-go" | null;
+  jev_apply_probability?: number | null;
+  // OTHER jobs at the same company with an active (submitted, open)
+  // application.
+  same_company_active?: { id: number; title: string; status: string }[];
 };
 
 export type TrackedJob = {

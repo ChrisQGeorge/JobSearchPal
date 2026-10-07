@@ -145,6 +145,15 @@ class TrackedJobSummary(BaseModel):
     # filter pills.
     has_resume: bool = False
     has_cover_letter: bool = False
+    # Jev's overall apply verdict ("go" / "maybe" / "no-go") and the
+    # probability behind it. Null unless the current analysis came from
+    # Jev (an LLM analysis's recommendation isn't Jev's call).
+    jev_recommendation: Optional[str] = None
+    jev_apply_probability: Optional[float] = None
+    # OTHER jobs at the same company with an active (submitted, still
+    # open) application: [{id, title, status}]. Same company = same
+    # organization row or the same normalized company name.
+    same_company_active: list[dict] = []
 
 
 # --------- InterviewRound ----------------------------------------------------
