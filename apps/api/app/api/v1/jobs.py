@@ -9,7 +9,7 @@ import json
 import logging
 import re
 from datetime import date, datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import (
     APIRouter,
@@ -1055,6 +1055,170 @@ async def _update_job_once(
     )
     job.organization_name = org_names.get(job.organization_id)  # type: ignore[attr-defined]
     return job
+
+
+# --- Bulk status change with undo --------------------------------------------
+#
+# The tracker's multi-select "Status" action goes through here so each run
+# records what it changed: per job, the status and the two dates a status
+# change can stamp (date_applied, date_closed). Undo restores exactly those,
+# and only on jobs still at the bulk target (a job edited since is left
+# alone). Kept in memory, last _UNDO_KEEP runs per user — a restart clears
+# it. Side effects of the original change that aren't fields (queued
+# follow-up research on `interested`, cancelled queued tasks on
+# `not_interested`) are not reversed.
+
+_UNDO_KEEP = 10
+_BULK_UNDO: dict[int, list[dict[str, Any]]] = {}
+
+
+class BulkStatusIn(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=5000)
+    status: str
+
+
+def _undo_summary(op: dict[str, Any]) -> dict[str, Any]:
+    prior: dict[str, int] = {}
+    for b in op["before"]:
+        prior[b["status"]] = prior.get(b["status"], 0) + 1
+    return {
+        "op_id": op["op_id"],
+        "at": op["at"],
+        "status": op["status"],
+        "count": len(op["before"]),
+        "prior_status_counts": prior,
+    }
+
+
+@router.post("/bulk-status")
+@long_running
+async def bulk_change_status(
+    payload: BulkStatusIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Set `status` on every listed job (same side effects as a single
+    PUT) and remember the previous values so the run can be undone."""
+    import uuid as _uuid
+
+    _validate_status(payload.status)
+    rows = (
+        await db.execute(
+            select(TrackedJob.id, TrackedJob.status, TrackedJob.date_applied, TrackedJob.date_closed)
+            .where(
+                TrackedJob.id.in_(set(payload.ids)),
+                TrackedJob.user_id == user.id,
+                TrackedJob.deleted_at.is_(None),
+            )
+        )
+    ).all()
+    await db.commit()
+    before: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    unchanged = 0
+    for jid, st, d_applied, d_closed in rows:
+        if st == payload.status:
+            unchanged += 1
+            continue
+        try:
+            for attempt in range(3):
+                try:
+                    await _update_job_once(db, jid, TrackedJobUpdate(status=payload.status), user)
+                    break
+                except Exception as exc:
+                    if _is_deadlock(exc) and attempt < 2:
+                        await db.rollback()
+                        await asyncio.sleep(0.05 * (attempt + 1))
+                        continue
+                    raise
+        except Exception as exc:  # noqa: BLE001 — one bad row mustn't stop the rest
+            await db.rollback()
+            failed.append({"id": jid, "error": f"{type(exc).__name__}: {exc}"[:300]})
+            continue
+        before.append({
+            "id": jid,
+            "status": st,
+            "date_applied": d_applied.isoformat() if d_applied else None,
+            "date_closed": d_closed.isoformat() if d_closed else None,
+        })
+    op = None
+    if before:
+        op = {
+            "op_id": _uuid.uuid4().hex[:10],
+            "at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
+            "status": payload.status,
+            "before": before,
+        }
+        stack = _BULK_UNDO.setdefault(user.id, [])
+        stack.append(op)
+        del stack[:-_UNDO_KEEP]
+    return {
+        "op_id": op["op_id"] if op else None,
+        "updated": len(before),
+        "unchanged": unchanged,
+        "not_found": len(set(payload.ids)) - len(rows),
+        "failed": failed,
+    }
+
+
+@router.get("/bulk-undo")
+async def list_bulk_undo(user: User = Depends(get_current_user)) -> dict:
+    """Undoable bulk status runs, newest first."""
+    return {"ops": [_undo_summary(op) for op in reversed(_BULK_UNDO.get(user.id, []))]}
+
+
+@router.post("/bulk-undo/{op_id}")
+@long_running
+async def undo_bulk_change(
+    op_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Restore each job of a bulk run to its previous status and dates —
+    only jobs still at the run's target status."""
+    stack = _BULK_UNDO.get(user.id, [])
+    op = next((o for o in stack if o["op_id"] == op_id), None)
+    if op is None:
+        raise HTTPException(
+            status_code=404,
+            detail="That bulk change can't be undone any more (too old, already undone, or the server restarted).",
+        )
+    by_id = {b["id"]: b for b in op["before"]}
+    jobs = (
+        await db.execute(
+            select(TrackedJob).where(
+                TrackedJob.id.in_(by_id.keys()),
+                TrackedJob.user_id == user.id,
+                TrackedJob.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    restored = changed_since = 0
+    now = datetime.now(tz=timezone.utc)
+    for job in jobs:
+        b = by_id[job.id]
+        if job.status != op["status"]:
+            changed_since += 1
+            continue
+        job.status = b["status"]
+        job.date_applied = date.fromisoformat(b["date_applied"]) if b["date_applied"] else None
+        job.date_closed = date.fromisoformat(b["date_closed"]) if b["date_closed"] else None
+        db.add(
+            ApplicationEvent(
+                tracked_job_id=job.id,
+                event_type="note",
+                event_date=now,
+                details_md=f"Undid bulk status change: `{op['status']}` → back to `{b['status']}`.",
+            )
+        )
+        restored += 1
+    await db.commit()
+    stack.remove(op)
+    return {
+        "restored": restored,
+        "changed_since": changed_since,
+        "missing": len(by_id) - len(jobs),
+    }
 
 
 def _status_to_event_type(status: str) -> str:

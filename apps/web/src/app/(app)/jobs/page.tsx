@@ -140,6 +140,22 @@ function SameCompanyActive({ job, compact }: { job: TrackedJobSummary; compact?:
   );
 }
 
+type BulkUndoOp = {
+  op_id: string;
+  at: string;
+  status: string;
+  count: number;
+  prior_status_counts: Record<string, number>;
+};
+
+function agoLabel(iso: string): string {
+  const mins = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60000));
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} min ago`;
+  const h = Math.round(mins / 60);
+  return h < 24 ? `${h}h ago` : `${Math.round(h / 24)}d ago`;
+}
+
 /** Compact posted-range label for the Salary column: "80k–120k", "150k",
  * with a currency suffix when it isn't USD. Em-dash when unposted. */
 function formatSalary(j: TrackedJobSummary): string {
@@ -226,6 +242,14 @@ export default function JobTrackerPage() {
   const [bulkRunning, setBulkRunning] = useState(false);
   const [bulkMsg, setBulkMsg] = useState<string | null>(null);
   const [bulkStatusTarget, setBulkStatusTarget] = useState<JobStatus | "">("");
+  // Undoable bulk status runs (server keeps the last 10; newest first).
+  const [undoOps, setUndoOps] = useState<BulkUndoOp[]>([]);
+  const [undoing, setUndoing] = useState(false);
+  // Mixed-status confirmation for a bulk status change.
+  const [confirmMixed, setConfirmMixed] = useState<{
+    target: JobStatus;
+    mix: [string, number][];
+  } | null>(null);
   // User's job preferences — hydrated by the consolidated tracker-view
   // call below. Only a small subset is read here for the salary + location
   // badges; the rest of the preferences page owns the full shape.
@@ -545,26 +569,89 @@ export default function JobTrackerPage() {
     setBulkMsg(null);
   }
 
+  async function loadUndoOps() {
+    try {
+      const r = await api.get<{ ops: BulkUndoOp[] }>("/api/v1/jobs/bulk-undo");
+      setUndoOps(r.ops);
+    } catch {
+      /* undo list is a convenience */
+    }
+  }
+  useEffect(() => {
+    void loadUndoOps();
+  }, []);
+
+  /** Entry point from the Status picker: warn first when the selection
+   *  spans more than one status (e.g. to_review + interested). */
+  function requestBulkChangeStatus(target: JobStatus) {
+    const ids = [...selectedIds];
+    if (ids.length === 0 || !target) return;
+    const byId = new Map(items.map((j) => [j.id, j.status]));
+    const mix = new Map<string, number>();
+    for (const id of ids) {
+      const st = byId.get(id) ?? "unknown";
+      mix.set(st, (mix.get(st) ?? 0) + 1);
+    }
+    if (mix.size > 1) {
+      setConfirmMixed({ target, mix: [...mix.entries()].sort((a, b) => b[1] - a[1]) });
+      return;
+    }
+    void bulkChangeStatus(target);
+  }
+
   async function bulkChangeStatus(target: JobStatus) {
     const ids = [...selectedIds];
     if (ids.length === 0 || !target) return;
     setBulkRunning(true);
     setBulkMsg(null);
-    const results = await mapWithConcurrency(ids, BULK_CONCURRENCY, (id) =>
-      api.put(`/api/v1/jobs/${id}`, { status: target }),
-    );
-    const ok = results.filter((r) => r.status === "fulfilled").length;
-    const fail = results.length - ok;
-    setBulkRunning(false);
-    setBulkStatusTarget("");
-    setSelectedIds(new Set());
-    setBulkMsg(
-      fail === 0
-        ? `Updated ${ok} job${ok === 1 ? "" : "s"} to "${target}".`
-        : `Updated ${ok} of ${results.length}; ${fail} failed.`,
-    );
-    setTimeout(() => setBulkMsg(null), 12000);
-    await refresh();
+    try {
+      const r = await api.post<{
+        op_id: string | null;
+        updated: number;
+        unchanged: number;
+        not_found: number;
+        failed: { id: number; error: string }[];
+      }>("/api/v1/jobs/bulk-status", { ids, status: target });
+      const parts = [`Updated ${r.updated} job${r.updated === 1 ? "" : "s"} to "${target.replace(/_/g, " ")}".`];
+      if (r.unchanged) parts.push(`${r.unchanged} already had that status.`);
+      if (r.failed.length) parts.push(`${r.failed.length} failed (${r.failed[0].error}).`);
+      if (r.not_found) parts.push(`${r.not_found} no longer exist.`);
+      setBulkMsg(parts.join(" "));
+      setSelectedIds(new Set());
+    } catch (e) {
+      setBulkMsg(
+        e instanceof ApiError
+          ? `Status change failed (HTTP ${e.status}): ${typeof e.detail === "string" ? e.detail : e.info?.message ?? ""}`
+          : "Status change failed.",
+      );
+    } finally {
+      setBulkRunning(false);
+      setBulkStatusTarget("");
+    }
+    await Promise.all([refresh(), loadUndoOps()]);
+  }
+
+  async function undoBulk(op: BulkUndoOp) {
+    setUndoing(true);
+    try {
+      const r = await api.post<{ restored: number; changed_since: number; missing: number }>(
+        `/api/v1/jobs/bulk-undo/${op.op_id}`,
+        {},
+      );
+      const parts = [`Undid: ${r.restored} job${r.restored === 1 ? "" : "s"} restored to their previous status.`];
+      if (r.changed_since) parts.push(`${r.changed_since} were changed since and left alone.`);
+      if (r.missing) parts.push(`${r.missing} no longer exist.`);
+      setBulkMsg(parts.join(" "));
+    } catch (e) {
+      setBulkMsg(
+        e instanceof ApiError
+          ? `Undo failed (HTTP ${e.status}): ${typeof e.detail === "string" ? e.detail : e.info?.message ?? ""}`
+          : "Undo failed.",
+      );
+    } finally {
+      setUndoing(false);
+    }
+    await Promise.all([refresh(), loadUndoOps()]);
   }
 
   /**
@@ -812,9 +899,96 @@ export default function JobTrackerPage() {
         </div>
       ) : null}
 
-      {bulkMsg ? (
-        <div className="jsp-card p-3 mt-3 text-xs text-corp-muted border-l-4 border-l-corp-accent">
-          {bulkMsg}
+      {bulkMsg || undoOps.length > 0 ? (
+        <div className="jsp-card p-3 mt-3 text-xs text-corp-muted border-l-4 border-l-corp-accent flex flex-wrap items-center gap-2">
+          {bulkMsg ? <span className="flex-1 min-w-0">{bulkMsg}</span> : <span className="flex-1" />}
+          {undoOps[0] ? (
+            <button
+              type="button"
+              className="jsp-btn-ghost text-xs"
+              disabled={undoing || bulkRunning}
+              onClick={() => void undoBulk(undoOps[0])}
+              title={`Put these ${undoOps[0].count} jobs back to their previous status (${Object.entries(
+                undoOps[0].prior_status_counts,
+              )
+                .map(([st, n]) => `${n} ${st.replace(/_/g, " ")}`)
+                .join(", ")}). Jobs changed since are left alone.`}
+            >
+              {undoing
+                ? "Undoing…"
+                : `↶ Undo: ${undoOps[0].count} → ${undoOps[0].status.replace(/_/g, " ")} (${agoLabel(undoOps[0].at)})`}
+            </button>
+          ) : null}
+          {bulkMsg ? (
+            <button
+              type="button"
+              className="text-corp-muted hover:text-corp-text"
+              onClick={() => setBulkMsg(null)}
+              aria-label="Dismiss"
+            >
+              ×
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+
+      {confirmMixed ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          role="dialog"
+          aria-modal="true"
+          onKeyDown={(e) => {
+            if (e.key === "Escape") setConfirmMixed(null);
+          }}
+        >
+          <div className="jsp-card p-4 max-w-md w-full space-y-3">
+            <h3 className="text-sm font-semibold">Selection has mixed statuses</h3>
+            <p className="text-xs text-corp-muted">
+              You&apos;re about to set{" "}
+              <strong>{confirmMixed.mix.reduce((n, [, c]) => n + c, 0)}</strong> jobs to{" "}
+              <strong>{confirmMixed.target.replace(/_/g, " ")}</strong>, but they don&apos;t all
+              have the same status right now:
+            </p>
+            <ul className="text-xs space-y-1">
+              {confirmMixed.mix.map(([st, n]) => (
+                <li key={st} className="flex items-center gap-2">
+                  {st === "unknown" ? (
+                    <span className="text-corp-muted">not in the loaded list</span>
+                  ) : (
+                    <StatusBadge status={st as JobStatus} />
+                  )}
+                  <span className="tabular-nums">{n}</span>
+                </li>
+              ))}
+            </ul>
+            <p className="text-[11px] text-corp-muted">
+              You can undo this afterwards from the bar above the table.
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                className="jsp-btn-ghost text-xs"
+                autoFocus
+                onClick={() => {
+                  setConfirmMixed(null);
+                  setBulkStatusTarget("");
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="jsp-btn-primary text-xs"
+                onClick={() => {
+                  const t = confirmMixed.target;
+                  setConfirmMixed(null);
+                  void bulkChangeStatus(t);
+                }}
+              >
+                Continue
+              </button>
+            </div>
+          </div>
         </div>
       ) : null}
 
@@ -836,7 +1010,7 @@ export default function JobTrackerPage() {
               onChange={(e) => {
                 const v = e.target.value as JobStatus | "";
                 setBulkStatusTarget(v);
-                if (v) bulkChangeStatus(v);
+                if (v) requestBulkChangeStatus(v);
               }}
               disabled={bulkRunning}
               title="Apply this status to every selected job"
