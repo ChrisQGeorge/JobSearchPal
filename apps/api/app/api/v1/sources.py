@@ -705,6 +705,85 @@ async def import_file_progress(
     return fi.progress(source_id) or {"status": None}
 
 
+@router.post("/{source_id:int}/stop-run")
+@long_running
+async def stop_run(
+    source_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Stop a Bright Data keyword run: cancel its snapshots at Bright Data
+    (plus any snapshot of the same dataset started since the run began —
+    covers duplicates whose ids were never recorded) and clear the run so
+    the poller stops. Cancelling is free; nothing new is triggered."""
+    from datetime import timedelta as _td
+
+    from app.sources import brightdata as bd
+    from app.sources.poller import STOPPED_RUNS, _build_ctx, _now, _run_of, _set_filters
+
+    src = await _owned_source(db, source_id, user.id)
+    run = _run_of(src)
+    if run is None and not (src.filters or {}).get("pending_snapshot_id"):
+        raise HTTPException(status_code=409, detail="No import is running for this source.")
+    if run is not None:
+        # Takes effect immediately for the poller, before any Bright Data call.
+        STOPPED_RUNS.add((src.id, str(run.get("started_at"))))
+    ctx = await _build_ctx(db, src)
+    api_key = ctx.get("api_key")
+    await db.commit()  # release the connection during Bright Data calls
+
+    ids: set[str] = set()
+    for s in (run or {}).get("snapshots") or []:
+        if s.get("id") and s.get("status") not in ("imported", "failed"):
+            ids.add(str(s["id"]))
+    if (src.filters or {}).get("pending_snapshot_id"):
+        ids.add(str(src.filters["pending_snapshot_id"]))
+    lookup_err = None
+    if api_key and run:
+        try:
+            started = datetime.fromisoformat(str(run.get("started_at")))
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            for snap in await bd.find_snapshots_since(
+                api_key, ctx.get("dataset_id"), started - _td(minutes=2)
+            ):
+                if snap["status"].lower() not in ("ready", "failed", "canceled", "cancelled", "done"):
+                    ids.add(snap["id"])
+        except Exception as exc:  # noqa: BLE001 — still cancel what we know
+            lookup_err = f"{type(exc).__name__}: {str(exc).strip() or 'no detail'}"
+    results = {}
+    if api_key:
+        for sid in sorted(ids):
+            results[sid] = await bd.cancel_snapshot(api_key, sid)
+
+    src = await _owned_source(db, source_id, user.id)
+    cancelled = [k for k, (ok, _d) in results.items() if ok]
+    failed = {k: d for k, (ok, d) in results.items() if not ok}
+    _set_filters(
+        src,
+        run=None,
+        pending_snapshot_id=None,
+        pending_since=None,
+        last_run={
+            "finished_at": _now().isoformat(timespec="seconds"),
+            "started_at": (run or {}).get("started_at") or _now().isoformat(timespec="seconds"),
+            "searches": len((run or {}).get("snapshots") or []),
+            "failed": 0,
+            "leads": int((run or {}).get("inserted") or 0),
+            "stopped": True,
+        },
+    )
+    src.last_polled_at = _now()
+    src.last_error = (
+        f"Stopped by you. Cancelled {len(cancelled)} Bright Data snapshot(s)"
+        + (f"; could not cancel {len(failed)}: " + "; ".join(f"{k} ({v})" for k, v in failed.items()) if failed else "")
+        + (f". Snapshot lookup failed ({lookup_err}) — check Bright Data's dashboard for others" if lookup_err else "")
+        + "."
+    )[:3000]
+    await db.commit()
+    return {"cancelled": cancelled, "failed": failed, "lookup_error": lookup_err}
+
+
 @router.post("/{source_id:int}/poll", response_model=SourceOut)
 @long_running
 async def poll_now(

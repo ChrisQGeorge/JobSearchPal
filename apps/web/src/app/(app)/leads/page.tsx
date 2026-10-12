@@ -125,7 +125,54 @@ const isCollecting = (s: Source) =>
 const minsSince = (iso: string) =>
   Math.max(1, Math.round((Date.now() - new Date(iso).getTime()) / 60000));
 
-function RunProgress({ source }: { source: Source }) {
+/** Stop a running Bright Data import: cancels its snapshots at Bright
+ *  Data (free) and clears the run so nothing polls or triggers again. */
+function StopRunButton({ sourceId, onStopped }: { sourceId: number; onStopped: () => void }) {
+  const [busy, setBusy] = useState(false);
+  async function stop() {
+    if (
+      !window.confirm(
+        "Stop this import?\n\nThis cancels its snapshots at Bright Data — and any other snapshot of the same dataset started since this run began — and stops all polling for it. Leads already imported are kept.",
+      )
+    )
+      return;
+    setBusy(true);
+    try {
+      const r = await api.post<{ cancelled: string[]; failed: Record<string, string>; lookup_error: string | null }>(
+        `/api/v1/job-sources/${sourceId}/stop-run`,
+        {},
+      );
+      const nFail = Object.keys(r.failed).length;
+      window.alert(
+        `Stopped. Cancelled ${r.cancelled.length} Bright Data snapshot(s).` +
+          (nFail ? `\nCould not cancel ${nFail}: ${Object.entries(r.failed).map(([k, v]) => `${k} (${v})`).join("; ")}` : "") +
+          (r.lookup_error ? `\nSnapshot lookup failed (${r.lookup_error}) — check Bright Data's dashboard for others.` : ""),
+      );
+    } catch (e) {
+      window.alert(
+        e instanceof ApiError
+          ? `Stop failed (HTTP ${e.status}): ${typeof e.detail === "string" ? e.detail : e.info?.message ?? ""}`
+          : "Stop failed.",
+      );
+    } finally {
+      setBusy(false);
+      onStopped();
+    }
+  }
+  return (
+    <button
+      type="button"
+      className="jsp-btn-ghost text-[11px] py-0.5 text-corp-danger border-corp-danger/40"
+      onClick={() => void stop()}
+      disabled={busy}
+      title="Cancel this run at Bright Data and stop polling it"
+    >
+      {busy ? "Stopping…" : "Stop"}
+    </button>
+  );
+}
+
+function RunProgress({ source, onStopped }: { source: Source; onStopped: () => void }) {
   const [open, setOpen] = useState(false);
   const run = runOf(source);
   if (!run) {
@@ -136,6 +183,7 @@ function RunProgress({ source }: { source: Source }) {
         <Spinner />
         Collecting from Bright Data
         {typeof since === "string" ? ` · ${minsSince(since)} min` : ""}
+        <StopRunButton sourceId={source.id} onStopped={onStopped} />
       </span>
     );
   }
@@ -150,9 +198,12 @@ function RunProgress({ source }: { source: Source }) {
   const pct = total ? Math.round((done / total) * 100) : 0;
   return (
     <div className="basis-full order-last">
+      <div className="flex justify-end -mb-5 relative z-10">
+        <StopRunButton sourceId={source.id} onStopped={onStopped} />
+      </div>
       <button
         type="button"
-        className="w-full text-left"
+        className="w-full text-left pr-14"
         onClick={() => setOpen((o) => !o)}
         title={
           batched
@@ -871,7 +922,7 @@ export default function LeadsPage() {
                   </span>
                 ) : null}
                 {isCollecting(s) ? (
-                  <RunProgress source={s} />
+                  <RunProgress source={s} onStopped={() => void loadAll()} />
                 ) : s.last_error ? (
                   <SourceError text={s.last_error} />
                 ) : null}

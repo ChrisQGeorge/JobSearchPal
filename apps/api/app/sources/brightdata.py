@@ -892,6 +892,24 @@ def iter_export_records(fileobj, chunk_size: int = 1 << 20):
             buf, pos = buf[pos:], 0
 
 
+async def cancel_snapshot(api_key: str, snapshot_id: str) -> tuple[bool, str]:
+    """Ask Bright Data to stop a running snapshot (free; nothing is
+    triggered). Returns (ok, detail) — never raises."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=20,
+            headers={"Authorization": f"Bearer {api_key}", "User-Agent": USER_AGENT},
+        ) as client:
+            resp = await client.post(
+                f"{BRIGHTDATA_API_BASE}/datasets/v3/snapshot/{snapshot_id}/cancel"
+            )
+    except httpx.HTTPError as exc:
+        return False, _exc_text(exc)
+    if resp.status_code >= 400:
+        return False, f"HTTP {resp.status_code}: {(resp.text or '').strip()[:200]}"
+    return True, "cancelled"
+
+
 async def snapshot_status(api_key: str, snapshot_id: str) -> str:
     """starting / running / ready / failed / canceled (Bright Data's
     Monitor Progress API)."""

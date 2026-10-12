@@ -23,6 +23,7 @@ from typing import Any, Optional
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.database import BgSessionLocal as SessionLocal  # background pool
 from app.models.sources import JobLead, JobSource
@@ -155,6 +156,7 @@ async def poll_source(
             f.pop("pending_snapshot_id", None)
             f.pop("pending_since", None)
             source.filters = f
+            flag_modified(source, "filters")
             source.last_polled_at = _now()
             msg = (
                 f"Bright Data snapshot {sp.snapshot_id} still wasn't ready after "
@@ -164,6 +166,7 @@ async def poll_source(
             source.last_error = msg
             return 0, msg
         source.filters = f
+        flag_modified(source, "filters")
         # Not an error — the UI shows a "collecting" spinner off
         # pending_snapshot_id instead.
         source.last_error = None
@@ -183,6 +186,7 @@ async def poll_source(
             f.pop("pending_snapshot_id", None)
             f.pop("pending_since", None)
             source.filters = f
+            flag_modified(source, "filters")
         # Format a more actionable message for the most common failure
         # modes — httpx 4xx, transport errors, bot-gate interstitials.
         msg = str(exc)
@@ -266,6 +270,7 @@ async def poll_source(
         f.pop("pending_snapshot_id", None)
         f.pop("pending_since", None)
         source.filters = f
+        flag_modified(source, "filters")
 
     cap = max(1, int(source.max_leads_per_poll or 100))
     inserted, err, auto_dismissed = await _insert_leads(db, source, raw_leads, cap)
@@ -395,6 +400,16 @@ TRIGGERS_PER_TICK = 3
 # and an entry interrupted mid-send (crash, restart) is marked failed
 # rather than re-sent. Failures carry a verbose reason instead.
 ERROR_CHARS = 1500
+# Hard send-once guard: a run (source id + its started_at) may reach
+# Bright Data at most once, ever. Recorded in memory and in the source's
+# filters["sent_runs"] BEFORE the trigger call. If a run somehow comes
+# back to the trigger step, it is never re-sent — it goes to
+# "verifying" (adopt the snapshot that already exists) instead.
+_SENT_RUNS: set[tuple[int, str]] = set()
+# Runs the user stopped (source id, started_at). A poll that loaded the
+# run before the stop landed drops it instead of saving it back.
+STOPPED_RUNS: set[tuple[int, str]] = set()
+SENT_RUNS_KEEP = 50
 # When a trigger's outcome is unknown (connection error, timeout, 5xx, or
 # the app died mid-send), the run isn't failed: Bright Data's snapshot
 # list (free) is checked each tick for this long, and a snapshot that
@@ -412,13 +427,23 @@ def _run_of(source: JobSource) -> Optional[dict]:
 
 
 def _set_filters(source: JobSource, **changes) -> None:
-    f = dict(source.filters or {})
+    """Write filters keys and FORCE the save. The run dict is edited in
+    place (entry status, snapshot id), and those nested edits also land
+    in SQLAlchemy's committed copy — so a plain reassignment compares
+    equal and nothing is written. That silently dropped the "sending" /
+    snapshot-id writes and re-triggered (and re-billed) the same run
+    every tick. Deep copy + flag_modified makes every write stick."""
+    import copy
+
+    f = copy.deepcopy(dict(source.filters or {}))
     for k, v in changes.items():
         if v is None:
             f.pop(k, None)
         else:
-            f[k] = v
-    source.filters = f  # reassign so SQLAlchemy sees the JSON change
+            f[k] = copy.deepcopy(v)
+    source.filters = f
+    if hasattr(source, "_sa_instance_state"):  # plain objects in tests
+        flag_modified(source, "filters")
 
 
 async def _verify_unconfirmed(run: dict, s: dict, api_key: str, dataset_id) -> None:
@@ -498,6 +523,9 @@ async def _poll_keyword(
         return 0, msg
     cap = max(1, int(source.max_leads_per_poll or 100))
     run = _run_of(source)
+    if run is not None and (source.id, str(run.get("started_at"))) in STOPPED_RUNS:
+        _set_filters(source, run=None)
+        return 0, None
     f = source.filters if isinstance(source.filters, dict) else {}
 
     if run is None and f.get("pending_snapshot_id"):
@@ -561,12 +589,47 @@ async def _poll_keyword(
         if not batch:
             s["status"], s["error"] = "failed", "Search row no longer on this source — not sent."
             continue
+        if (source.id, str(run.get("started_at"))) in STOPPED_RUNS:
+            break
         budget -= 1
-        # Persist "sending" BEFORE the call: if the process dies mid-call
-        # the next tick sees it and fails the entry instead of re-sending.
+        run_key = f"{run.get('started_at')}#{run['snapshots'].index(s)}"
+        sent_runs = list((source.filters or {}).get("sent_runs") or [])
+        try:
+            run_start = datetime.fromisoformat(str(run.get("started_at")))
+            if run_start.tzinfo is None:
+                run_start = run_start.replace(tzinfo=timezone.utc)
+            run_age = _now() - run_start
+        except ValueError:
+            run_age = timedelta(0)
+        # A fresh run is sent within a tick or two of the button press. A
+        # still-"queued" entry on an older run is one whose send was never
+        # recorded (the pre-fix save bug) — it may already be running at
+        # Bright Data many times over, so it is not sent again either.
+        stale_queued = run_age > timedelta(minutes=5)
+        if (
+            (source.id, run_key) in _SENT_RUNS
+            or run_key in sent_runs
+            or s.get("attempts")
+            or stale_queued
+        ):
+            # Already sent once — NEVER again. Look for the snapshot instead.
+            log.error(
+                "source %s keyword run %s reached the trigger step again — NOT re-sending",
+                source.id, run_key,
+            )
+            s["status"] = "verifying"
+            s.setdefault("sent_at", _now().isoformat(timespec="seconds"))
+            s["error"] = "This search was already sent to Bright Data once; it is never re-sent."
+            _set_filters(source, run=run)
+            if db is not None:
+                await db.commit()
+            continue
+        # Persist "sending" + the send-once record BEFORE the call: if the
+        # process dies mid-call the next tick verifies instead of re-sending.
+        _SENT_RUNS.add((source.id, run_key))
         s["status"], s["attempts"] = "sending", 1
         s["sent_at"] = _now().isoformat(timespec="seconds")
-        _set_filters(source, run=run)
+        _set_filters(source, run=run, sent_runs=(sent_runs + [run_key])[-SENT_RUNS_KEEP:])
         if db is not None:
             await db.commit()
         try:
