@@ -451,15 +451,26 @@ async def _post(
 # At most this many Jev calls in flight at once (queue worker + email
 # triage + interactive scoring share it). A bulk rescore then queues
 # here instead of piling onto Jev until requests time out.
-JEV_MAX_CONCURRENT = 4
+JEV_MAX_CONCURRENT = 4  # default; the live cap is the worker's "jev" lane limit
 CONNECT_TIMEOUT = 15.0
-_jev_slots: Optional[asyncio.Semaphore] = None
+_jev_cond: Optional[asyncio.Condition] = None
 _jev_inflight = 0
 _jev_waiting = 0
 
 
 def jev_load() -> dict[str, int]:
-    return {"max": JEV_MAX_CONCURRENT, "in_flight": _jev_inflight, "waiting": _jev_waiting}
+    return {"max": _jev_limit(), "in_flight": _jev_inflight, "waiting": _jev_waiting}
+
+
+def _jev_limit() -> int:
+    """Concurrent Jev calls allowed — follows the Companion Activity
+    page's Jev lane setting (re-read each call)."""
+    try:
+        from app.skills.worker_settings import get_lane_limit
+
+        return get_lane_limit("jev")
+    except Exception:  # noqa: BLE001
+        return JEV_MAX_CONCURRENT
 
 
 def _transport_reason(exc: Exception, read_timeout: float) -> tuple[str, str]:
@@ -491,19 +502,21 @@ def _transport_reason(exc: Exception, read_timeout: float) -> tuple[str, str]:
 async def _post_raw(api_key: str, state: dict, questions: dict, timeout_seconds: int) -> dict:
     import httpx
 
-    global _jev_slots, _jev_inflight, _jev_waiting
-    if _jev_slots is None:
-        _jev_slots = asyncio.Semaphore(JEV_MAX_CONCURRENT)
+    global _jev_cond, _jev_inflight, _jev_waiting
+    if _jev_cond is None:
+        _jev_cond = asyncio.Condition()
     body = {"state": state, "model": _MODEL, "questions": questions}
     size_kb = len(json.dumps(body, default=str)) / 1024
     queued_at = time.monotonic()
     _jev_waiting += 1
     try:
-        await _jev_slots.acquire()
+        async with _jev_cond:
+            while _jev_inflight >= _jev_limit():
+                await _jev_cond.wait()
+            _jev_inflight += 1
     finally:
         _jev_waiting -= 1
     waited = time.monotonic() - queued_at
-    _jev_inflight += 1
     started = time.monotonic()
     timeout = httpx.Timeout(
         connect=CONNECT_TIMEOUT, read=float(timeout_seconds), write=30.0, pool=10.0
@@ -558,8 +571,9 @@ async def _post_raw(api_key: str, state: dict, questions: dict, timeout_seconds:
                 f"Jev API returned an unexpected shape: {(resp.text or '')[:800]} {ctx()}"
             ) from exc
     finally:
-        _jev_inflight -= 1
-        _jev_slots.release()
+        async with _jev_cond:
+            _jev_inflight -= 1
+            _jev_cond.notify_all()
 
 
 # ---- Email triage ----------------------------------------------------------

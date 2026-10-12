@@ -1218,47 +1218,89 @@ function StreamLine({ ev }: { ev: StreamEvent }) {
 
 // ---------- Worker parallelism control --------------------------------------
 
+type LaneKey = "max_parallel" | "max_parallel_build" | "max_parallel_jev";
+
 type WorkerSettings = {
-  max_parallel: number;
+  max_parallel: number; // LLM lane
+  max_parallel_build: number;
+  max_parallel_jev: number;
+  lanes?: Record<string, { running: number; limit: number }>;
   min: number;
   max: number;
 };
 
+// Independent lanes: tasks that never call an LLM run in their own slots
+// and don't wait behind (or crowd out) Claude work.
+const LANE_FIELDS: { key: LaneKey; lane: string; label: string; help: string }[] = [
+  {
+    key: "max_parallel",
+    lane: "llm",
+    label: "AI tasks",
+    help: "Anything that may call a model (fetch + parse, tailoring, AI scoring, research…). Each Claude slot is a ~0.5–1 GB subprocess.",
+  },
+  {
+    key: "max_parallel_build",
+    lane: "build",
+    label: "Bright Data builds",
+    help: "Lead → tracked job from the stored Bright Data record. No page fetch, no LLM — light.",
+  },
+  {
+    key: "max_parallel_jev",
+    lane: "jev",
+    label: "Jev scoring",
+    help: "Scoring when a Jev key is set: one HTTP call to Jev, no LLM. Also caps concurrent Jev calls overall.",
+  },
+];
+
 function WorkerParallelismControl() {
   const [settings, setSettings] = useState<WorkerSettings | null>(null);
   const [saving, setSaving] = useState(false);
-  const [draft, setDraft] = useState<number>(1);
+  const [draft, setDraft] = useState<Record<LaneKey, number>>({
+    max_parallel: 1,
+    max_parallel_build: 4,
+    max_parallel_jev: 4,
+  });
   const [err, setErr] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
 
+  async function load(resetDraft: boolean) {
+    try {
+      const s = await api.get<WorkerSettings>("/api/v1/jobs/worker-settings");
+      setSettings(s);
+      if (resetDraft)
+        setDraft({
+          max_parallel: s.max_parallel,
+          max_parallel_build: s.max_parallel_build,
+          max_parallel_jev: s.max_parallel_jev,
+        });
+    } catch {
+      // Non-fatal — just hides the control if it fails.
+    }
+  }
+
   useEffect(() => {
-    api
-      .get<WorkerSettings>("/api/v1/jobs/worker-settings")
-      .then((s) => {
-        setSettings(s);
-        setDraft(s.max_parallel);
-      })
-      .catch(() => {
-        // Non-fatal — just hides the control if it fails.
-        setSettings(null);
-      });
+    void load(true);
+    // Live "running" counts per lane.
+    const t = setInterval(() => void load(false), 5000);
+    return () => clearInterval(t);
   }, []);
 
   if (!settings) return null;
-  const dirty = draft !== settings.max_parallel;
+  const dirty = LANE_FIELDS.some(({ key }) => draft[key] !== settings[key]);
 
   async function save() {
     setSaving(true);
     setErr(null);
     try {
-      const s = await api.put<WorkerSettings>(
-        "/api/v1/jobs/worker-settings",
-        { max_parallel: draft },
-      );
-      setSettings(s);
-      setDraft(s.max_parallel);
+      const s = await api.put<WorkerSettings>("/api/v1/jobs/worker-settings", draft);
+      setSettings((prev) => ({ ...(prev ?? s), ...s }));
+      setDraft({
+        max_parallel: s.max_parallel,
+        max_parallel_build: s.max_parallel_build,
+        max_parallel_jev: s.max_parallel_jev,
+      });
       setSavedAt(Date.now());
-      setTimeout(() => setSavedAt((t) => (t === Date.now() ? null : t)), 2500);
+      setTimeout(() => setSavedAt(null), 2500);
     } catch (e) {
       setErr(e instanceof ApiError ? `HTTP ${e.status}` : "Save failed");
     } finally {
@@ -1267,40 +1309,50 @@ function WorkerParallelismControl() {
   }
 
   return (
-    <div className="jsp-card p-3 mb-4 flex items-center gap-3 flex-wrap">
-      <div>
-        <label className="jsp-label">Parallel tasks</label>
-        <input
-          type="number"
-          min={settings.min}
-          max={settings.max}
-          value={draft}
-          onChange={(e) => {
-            const n = Number(e.target.value);
-            if (Number.isFinite(n)) setDraft(n);
-          }}
-          disabled={saving}
-          className="jsp-input w-20"
-        />
+    <div className="jsp-card p-3 mb-4 space-y-2">
+      <div className="flex items-center gap-2">
+        <span className="text-sm font-medium">Parallel tasks</span>
+        <span className="text-[11px] text-corp-muted">
+          per lane — each runs independently. Takes effect on the next free slot. Range{" "}
+          {settings.min}–{settings.max}.
+        </span>
+        <div className="ml-auto flex items-center gap-2">
+          {savedAt ? <span className="text-[11px] text-corp-ok">Saved.</span> : null}
+          {err ? <span className="text-[11px] text-corp-danger">{err}</span> : null}
+          <button
+            type="button"
+            className="jsp-btn-primary text-xs"
+            onClick={save}
+            disabled={saving || !dirty}
+          >
+            {saving ? "Saving…" : "Save"}
+          </button>
+        </div>
       </div>
-      <p className="text-[11px] text-corp-muted max-w-md">
-        How many queue tasks the worker runs at once. Higher = more Claude
-        subprocesses going in parallel; lower = sequential. Takes effect on
-        the next claim slot. Range {settings.min}–{settings.max}.
-      </p>
-      <div className="ml-auto flex items-center gap-2">
-        {savedAt ? (
-          <span className="text-[11px] text-corp-ok">Saved.</span>
-        ) : null}
-        {err ? <span className="text-[11px] text-corp-danger">{err}</span> : null}
-        <button
-          type="button"
-          className="jsp-btn-primary text-xs"
-          onClick={save}
-          disabled={saving || !dirty}
-        >
-          {saving ? "Saving…" : "Save"}
-        </button>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        {LANE_FIELDS.map(({ key, lane, label, help }) => (
+          <div key={key} className="rounded border border-corp-border p-2 space-y-1">
+            <div className="flex items-center gap-2">
+              <label className="jsp-label mb-0">{label}</label>
+              <span className="text-[11px] text-corp-muted ml-auto">
+                {settings.lanes?.[lane]?.running ?? 0} running
+              </span>
+            </div>
+            <input
+              type="number"
+              min={settings.min}
+              max={settings.max}
+              value={draft[key]}
+              onChange={(e) => {
+                const n = Number(e.target.value);
+                if (Number.isFinite(n)) setDraft((d) => ({ ...d, [key]: n }));
+              }}
+              disabled={saving}
+              className="jsp-input w-20"
+            />
+            <p className="text-[11px] text-corp-muted">{help}</p>
+          </div>
+        ))}
       </div>
     </div>
   );

@@ -31,7 +31,7 @@ import re
 from typing import Optional
 from datetime import datetime, time as _dt_time, timedelta, timezone
 
-from sqlalchemy import and_, delete as sa_delete, func, or_, select, update
+from sqlalchemy import false as sa_false, and_, delete as sa_delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import BgSessionLocal as SessionLocal  # background pool
@@ -323,13 +323,86 @@ def _ensure_claude_cleanup_setting() -> None:
         log.warning("Could not ensure Claude cleanupPeriodDays setting", exc_info=True)
 
 
-async def _claim_next(db: AsyncSession) -> JobFetchQueue | None:
-    """Pick the oldest queued row and mark it processing atomically.
+# --- Lanes ------------------------------------------------------------------
+#
+# Tasks run in independent lanes with their own parallelism limits
+# (worker_settings): "build" (Bright Data lead → job from the stored record,
+# no LLM) and "jev" (scoring for users with a Jev key — one HTTP call, no
+# LLM) never wait behind, or crowd out, "llm" tasks (Claude subprocesses).
+
+_JEV_USERS_TTL = 60.0
+_jev_users_cache: tuple[float, frozenset[int]] = (0.0, frozenset())
+# lane -> running asyncio tasks (read by lane_status for the UI).
+_RUNNING: dict[str, set] = {"llm": set(), "build": set(), "jev": set()}
+
+
+async def _jev_users(db: AsyncSession) -> frozenset[int]:
+    """Users with a TypeSafe Jev key — their score tasks are Jev-only."""
+    import time as _t
+
+    global _jev_users_cache
+    at, users = _jev_users_cache
+    if _t.monotonic() - at < _JEV_USERS_TTL:
+        return users
+    from app.models.user import ApiCredential
+    from app.skills.jev import JEV_PROVIDER
+
+    rows = (
+        await db.execute(
+            select(ApiCredential.user_id).where(
+                ApiCredential.provider == JEV_PROVIDER,
+                ApiCredential.deleted_at.is_(None),
+            ).distinct()
+        )
+    ).scalars().all()
+    users = frozenset(int(u) for u in rows)
+    _jev_users_cache = (_t.monotonic(), users)
+    return users
+
+
+def _lane_conditions(jev_users: frozenset[int]) -> dict:
+    is_fetch = or_(JobFetchQueue.kind.is_(None), JobFetchQueue.kind == "fetch")
+    prefetched = func.json_extract(JobFetchQueue.payload, "$.prefetched").isnot(None)
+    build = and_(is_fetch, prefetched)
+    jev = (
+        and_(JobFetchQueue.kind == "score", JobFetchQueue.user_id.in_(jev_users))
+        if jev_users else sa_false()
+    )
+    return {"build": build, "jev": jev, "llm": and_(~build, ~jev)}
+
+
+def lane_of(item: JobFetchQueue, jev_users: frozenset[int]) -> str:
+    kind = item.kind or "fetch"
+    if kind == "fetch" and isinstance(item.payload, dict) and item.payload.get("prefetched"):
+        return "build"
+    if kind == "score" and item.user_id in jev_users:
+        return "jev"
+    return "llm"
+
+
+def lane_status() -> dict[str, dict[str, int]]:
+    from app.skills import worker_settings as _ws
+
+    return {
+        lane: {"running": len(_RUNNING.get(lane, ())), "limit": _ws.get_lane_limit(lane)}
+        for lane in _ws.LANES
+    }
+
+
+async def _claim_next(
+    db: AsyncSession, lanes: Optional[set[str]] = None
+) -> JobFetchQueue | None:
+    """Pick the oldest queued row (in one of `lanes`, default all) and mark
+    it processing atomically.
 
     Rows with a future `resume_after` are skipped — that's our rate-limit
     cooldown. They get picked up automatically once the timestamp passes.
     """
     now = datetime.now(tz=timezone.utc)
+    lane_filter = []
+    if lanes is not None:
+        conds = _lane_conditions(await _jev_users(db))
+        lane_filter = [or_(*[conds[l] for l in lanes])] if lanes else [sa_false()]
     stmt = (
         select(JobFetchQueue)
         .where(
@@ -338,6 +411,7 @@ async def _claim_next(db: AsyncSession) -> JobFetchQueue | None:
                 JobFetchQueue.resume_after.is_(None),
                 JobFetchQueue.resume_after <= now,
             ),
+            *lane_filter,
         )
         .order_by(JobFetchQueue.id.asc())
         .limit(1)
@@ -2178,7 +2252,7 @@ async def run_forever() -> None:
         log.exception("Queue worker: prune failed on boot")
     last_prune = _time.monotonic()
 
-    running: set[asyncio.Task] = set()
+    running: set[asyncio.Task] = set()  # all lanes, for waiting
 
     async def _supervised_process(item: JobFetchQueue) -> None:
         try:
@@ -2211,7 +2285,13 @@ async def run_forever() -> None:
         # down so browsing never does.
         from app.core.responsiveness import background_capacity, yield_to_requests
 
-        if len(running) >= background_capacity(_ws.get_max_parallel()):
+        # Lanes with a free slot. Each lane's limit shrinks (down to 1)
+        # while the event loop is laggy or page requests are in flight.
+        free = {
+            lane for lane in _ws.LANES
+            if len(_RUNNING[lane]) < background_capacity(_ws.get_lane_limit(lane))
+        }
+        if not free:
             # Block on whichever task finishes first, re-checking capacity
             # every second (it rises again once browsing goes quiet).
             done, _pending = await asyncio.wait(
@@ -2224,7 +2304,8 @@ async def run_forever() -> None:
         await yield_to_requests()
         try:
             async with SessionLocal() as db:
-                item = await _claim_next(db)
+                item = await _claim_next(db, free)
+                lane = lane_of(item, await _jev_users(db)) if item is not None else "llm"
         except Exception:  # pragma: no cover
             log.exception("Queue worker: claim error")
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
@@ -2246,9 +2327,11 @@ async def run_forever() -> None:
             continue
 
         task = asyncio.create_task(
-            _supervised_process(item), name=f"qworker-{item.id}"
+            _supervised_process(item), name=f"qworker-{lane}-{item.id}"
         )
         running.add(task)
         task.add_done_callback(running.discard)
+        _RUNNING[lane].add(task)
+        task.add_done_callback(_RUNNING[lane].discard)
         # Tight loop: try to claim another immediately. Falls back to
         # the capacity wait above on the next iteration if we're full.

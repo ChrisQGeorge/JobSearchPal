@@ -4199,7 +4199,9 @@ async def cancel_activity_task(
 
 class _WorkerSettingsIn(BaseModel):
     # Upper bound mirrors worker_settings._MAX — keep in sync.
-    max_parallel: int = Field(ge=1, le=16)
+    max_parallel: Optional[int] = Field(default=None, ge=1, le=16)  # LLM lane
+    max_parallel_build: Optional[int] = Field(default=None, ge=1, le=16)
+    max_parallel_jev: Optional[int] = Field(default=None, ge=1, le=16)
 
 
 @router.get("/worker-settings")
@@ -4207,9 +4209,15 @@ async def get_worker_settings(_: User = Depends(get_current_user)) -> dict:
     """Read the queue worker's parallelism limit + clamp bounds."""
     from app.skills import worker_settings as _ws
 
+    from app.skills.queue_worker import lane_status
+
     lo, hi = _ws.get_bounds()
+    limits = _ws.get_lane_limits()
     return {
-        "max_parallel": _ws.get_max_parallel(),
+        "max_parallel": limits["llm"],
+        "max_parallel_build": limits["build"],
+        "max_parallel_jev": limits["jev"],
+        "lanes": lane_status(),
         "min": lo,
         "max": hi,
     }
@@ -4226,9 +4234,19 @@ async def put_worker_settings(
     JSON file in the Claude config volume so it survives restarts."""
     from app.skills import worker_settings as _ws
 
-    saved = _ws.set_max_parallel(payload.max_parallel)
+    saved = _ws.set_lane_limits({
+        "llm": payload.max_parallel,
+        "build": payload.max_parallel_build,
+        "jev": payload.max_parallel_jev,
+    })
     lo, hi = _ws.get_bounds()
-    return {"max_parallel": saved, "min": lo, "max": hi}
+    return {
+        "max_parallel": saved["llm"],
+        "max_parallel_build": saved["build"],
+        "max_parallel_jev": saved["jev"],
+        "min": lo,
+        "max": hi,
+    }
 
 
 class _ModelSettingsIn(BaseModel):
