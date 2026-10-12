@@ -1239,6 +1239,7 @@ def _status_to_event_type(status: str) -> str:
         "interested": "note",
         "not_interested": "note",
         "to_review": "note",
+        "awaiting_human": "note",
         "reviewed": "note",
     }.get(status, "note")
 

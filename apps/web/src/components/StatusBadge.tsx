@@ -8,6 +8,8 @@ const STATUS_STYLES: Record<JobStatus, string> = {
   watching: "bg-corp-surface2 text-corp-muted border-corp-border",
   interested: "bg-sky-500/20 text-sky-300 border-sky-500/40",
   contacted_by_recruiter: "bg-teal-500/25 text-teal-300 border-teal-500/50",
+  // An external agent needs a person's help (see awaiting_human_reason).
+  awaiting_human: "bg-green-500/30 text-green-300 border-green-500/60",
   in_progress: "bg-amber-500/25 text-amber-300 border-amber-500/50 animate-pulse",
   not_interested: "bg-zinc-500/20 text-zinc-400 border-zinc-500/40 line-through decoration-zinc-500/60",
   applied: "bg-corp-accent/25 text-corp-accent border-corp-accent/40",
@@ -29,6 +31,7 @@ const STATUS_LABELS: Partial<Record<JobStatus, string>> = {
   to_review: "to review",
   in_progress: "in progress",
   contacted_by_recruiter: "recruiter inbound",
+  awaiting_human: "awaiting human",
 };
 
 export function StatusBadge({ status }: { status: JobStatus }) {

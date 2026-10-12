@@ -94,6 +94,7 @@ _JOB_FIELDS = {
     "priority": {"type": "string", "enum": ["low", "medium", "high"]},
     "status": _STR,
     "notes": _STR,
+    "awaiting_human_reason": {**_STR, "description": "What you need a person to do (shown while status=awaiting_human)"},
     "date_posted": {"type": "string", "format": "date"},
     "date_applied": {"type": "string", "format": "date"},
     "date_closed": {"type": "string", "format": "date"},
@@ -381,7 +382,20 @@ TOOLS: list[Tool] = [
         write=True,
     ),
     Tool(
-        "set_job_status", "Set the status of one or more jobs (bulk).",
+        "request_human_help",
+        "Flag a job for the human: sets status=awaiting_human and records what you need them "
+        "to do (e.g. 'Application asks for a portfolio link I don't have', 'CAPTCHA on apply "
+        "page'). Pure label — nothing in the app acts on it; the reason shows on the job page.",
+        _obj({"job_id": _INT, "reason": _STR}, ["job_id", "reason"]),
+        lambda call, a: call(
+            "PUT", f"/jobs/{int(a['job_id'])}",
+            json={"status": "awaiting_human", "awaiting_human_reason": a["reason"]},
+        ),
+        write=True,
+    ),
+    Tool(
+        "set_job_status", "Set the status of one or more jobs (bulk). "
+        "Use request_human_help instead of status=awaiting_human so the reason is recorded.",
         _obj({"job_ids": _IDS, "status": _STR}, ["job_ids", "status"]),
         _set_status, write=True,
     ),

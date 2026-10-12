@@ -122,6 +122,7 @@ export type JobStatus =
   | "watching"
   | "interested"
   | "contacted_by_recruiter"
+  | "awaiting_human"
   | "in_progress"
   | "not_interested"
   | "applied"
@@ -142,6 +143,7 @@ export const JOB_STATUSES: JobStatus[] = [
   "watching",
   "interested",
   "contacted_by_recruiter",
+  "awaiting_human",
   "in_progress",
   "not_interested",
   "applied",
@@ -269,6 +271,9 @@ export type TrackedJob = {
   priority?: Priority | null;
   status: JobStatus;
   notes?: string | null;
+  // What an external agent needs a person to do — shown only while
+  // status === "awaiting_human".
+  awaiting_human_reason?: string | null;
   jd_analysis?: unknown;
   fit_summary?: unknown;
   date_posted?: string | null;

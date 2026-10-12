@@ -9,6 +9,7 @@ import { SkillsAnalysis } from "@/components/SkillsAnalysis";
 import { StatusBadge } from "@/components/StatusBadge";
 import { api, apiUrl, ApiError } from "@/lib/api";
 import { scoredOnlyParam } from "@/lib/queuePrefs";
+import { AwaitingHumanBox } from "./_AwaitingHuman";
 import { PostingPreview } from "./_PostingPreview";
 import {
   ARTIFACT_KINDS,
@@ -188,6 +189,16 @@ export default function JobDetailPage({
       <Link href="/jobs" className="text-sm text-corp-muted hover:text-corp-accent">
         ← All jobs
       </Link>
+
+      {job.status === "awaiting_human" ? (
+        <div className="mt-3">
+          <AwaitingHumanBox
+            reason={job.awaiting_human_reason}
+            saving={saving}
+            onSave={(r) => patch({ awaiting_human_reason: r })}
+          />
+        </div>
+      ) : null}
 
       <div className="mt-3">
         <PostingPreview

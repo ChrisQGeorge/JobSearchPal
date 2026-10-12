@@ -22,6 +22,10 @@ JOB_STATUSES = {
     # not yet applied) but tracked separately so response-rate and
     # source-attribution metrics stay honest.
     "contacted_by_recruiter",
+    # Set by external agents (MCP) when they need a person's help. Pure
+    # label: no automation, metrics or cleanup touch it. The problem is in
+    # TrackedJob.awaiting_human_reason.
+    "awaiting_human",
     # Active applying state — the user clicked "Apply" on the detail page,
     # which opens the posting in a new tab and parks the row here until
     # they confirm Applied or change their mind (Not interested). Distinct
@@ -61,6 +65,8 @@ class _TrackedJobCommon(BaseModel):
     priority: Optional[str] = None
     status: Optional[str] = None
     notes: Optional[str] = None
+    # What the human needs to do — shown only while status=awaiting_human.
+    awaiting_human_reason: Optional[str] = None
     date_posted: Optional[date] = None
     date_discovered: Optional[date] = None
     date_applied: Optional[date] = None

@@ -81,6 +81,9 @@ class TrackedJob(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     # status directly. Pre-existing rows are `watching` and still valid.
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="to_review", index=True)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Why the job is at status=awaiting_human (usually written by an
+    # external agent asking for help). Shown only in that status.
+    awaiting_human_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     jd_analysis: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     fit_summary: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 

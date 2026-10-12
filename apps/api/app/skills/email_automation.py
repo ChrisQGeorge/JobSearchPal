@@ -70,7 +70,7 @@ INTENT_LABELS = {
 }
 # Never auto-move a job out of these — a stray rejection-looking
 # email shouldn't undo an accepted offer.
-PROTECTED_STATUSES = {"won", "withdrawn"}
+PROTECTED_STATUSES = {"won", "withdrawn", "awaiting_human"}
 
 DEFAULT_RULES: dict[str, dict[str, bool]] = {
     "rejection": {"set_status": True, "notify": False},
