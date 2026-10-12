@@ -194,8 +194,9 @@ export default function JobDetailPage({
         <div className="mt-3">
           <AwaitingHumanBox
             reason={job.awaiting_human_reason}
+            resolution={job.awaiting_human_resolution}
             saving={saving}
-            onSave={(r) => patch({ awaiting_human_reason: r })}
+            onSave={(v) => patch(v)}
           />
         </div>
       ) : null}

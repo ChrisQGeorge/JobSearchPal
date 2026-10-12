@@ -274,6 +274,8 @@ export type TrackedJob = {
   // What an external agent needs a person to do — shown only while
   // status === "awaiting_human".
   awaiting_human_reason?: string | null;
+  // The person's answer, read by the agent before retrying.
+  awaiting_human_resolution?: string | null;
   jd_analysis?: unknown;
   fit_summary?: unknown;
   date_posted?: string | null;

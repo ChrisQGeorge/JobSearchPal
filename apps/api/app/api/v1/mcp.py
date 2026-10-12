@@ -95,6 +95,7 @@ _JOB_FIELDS = {
     "status": _STR,
     "notes": _STR,
     "awaiting_human_reason": {**_STR, "description": "What you need a person to do (shown while status=awaiting_human)"},
+    "awaiting_human_resolution": {**_STR, "description": "The person's answer to your request — read it (get_job) before retrying"},
     "date_posted": {"type": "string", "format": "date"},
     "date_applied": {"type": "string", "format": "date"},
     "date_closed": {"type": "string", "format": "date"},
@@ -385,11 +386,17 @@ TOOLS: list[Tool] = [
         "request_human_help",
         "Flag a job for the human: sets status=awaiting_human and records what you need them "
         "to do (e.g. 'Application asks for a portfolio link I don't have', 'CAPTCHA on apply "
-        "page'). Pure label — nothing in the app acts on it; the reason shows on the job page.",
+        "page'). Pure label — nothing in the app acts on it; the reason shows on the job page. "
+        "The person answers in awaiting_human_resolution: read it with get_job before trying "
+        "again. A new request clears the previous resolution.",
         _obj({"job_id": _INT, "reason": _STR}, ["job_id", "reason"]),
         lambda call, a: call(
             "PUT", f"/jobs/{int(a['job_id'])}",
-            json={"status": "awaiting_human", "awaiting_human_reason": a["reason"]},
+            json={
+                "status": "awaiting_human",
+                "awaiting_human_reason": a["reason"],
+                "awaiting_human_resolution": None,
+            },
         ),
         write=True,
     ),

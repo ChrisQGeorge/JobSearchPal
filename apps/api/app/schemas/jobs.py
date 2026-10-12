@@ -67,6 +67,9 @@ class _TrackedJobCommon(BaseModel):
     notes: Optional[str] = None
     # What the human needs to do — shown only while status=awaiting_human.
     awaiting_human_reason: Optional[str] = None
+    # The human's answer to that request — what an agent reads before
+    # trying again.
+    awaiting_human_resolution: Optional[str] = None
     date_posted: Optional[date] = None
     date_discovered: Optional[date] = None
     date_applied: Optional[date] = None

@@ -84,6 +84,8 @@ class TrackedJob(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     # Why the job is at status=awaiting_human (usually written by an
     # external agent asking for help). Shown only in that status.
     awaiting_human_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # The human's resolution of that request, for the agent's next try.
+    awaiting_human_resolution: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     jd_analysis: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     fit_summary: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
