@@ -23,7 +23,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from sqlalchemy import delete as sa_delete, func, or_, select, update
+from sqlalchemy import and_, delete as sa_delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
@@ -3998,6 +3998,12 @@ class ActivityFeedOut(BaseModel):
     """
 
     rows: list[ActivityRowOut]
+    # Rows matching the current filter (queue + live tasks), for paging.
+    filtered_total: int = 0
+    page: int = 0
+    page_size: int = 50
+    # Status counts over ALL live (bus) tasks, for the KPI tiles.
+    live_counts: dict[str, int] = {}
     # Whole-table per-state counts: queued / processing / done / error,
     # plus `waiting` (queued rows parked on a future resume_after).
     counts: dict[str, int]
@@ -4005,31 +4011,104 @@ class ActivityFeedOut(BaseModel):
     next_resume_at: Optional[datetime] = None
 
 
+_ACTIVITY_STATES = ("active", "waiting", "done", "error", "all")
+# Live (bus) task statuses per filter. "waiting" is queue-only.
+_BUS_STATUS_FOR = {
+    "active": {"running"},
+    "waiting": set(),
+    "done": {"done"},
+    "error": {"error", "stale", "cancelled"},
+}
+
+
 @router.get("/activity", response_model=ActivityFeedOut)
 async def list_activity(
-    limit: int = Query(200, ge=1, le=1000),
+    state: str = Query("all", description="active | waiting | done | error | all"),
+    source: Optional[str] = Query(None, description="Row source, e.g. fetch, bd_build, score, jev, tailor_resume"),
+    q: Optional[str] = Query(None, max_length=200, description="Search label / URL / error"),
+    page: int = Query(0, ge=0),
+    page_size: int = Query(50, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> ActivityFeedOut:
-    """Unified Companion Activity feed: fetch-queue items + every in-flight
-    / recent task from the Claude bus (tailor, humanize, score, research,
-    chat, etc.). Sorted by updated_at descending so the most recently
-    active rows float to the top. Queue rows are capped at `limit`;
-    per-state counts over the full table ride along in `counts`.
-    """
+    """Unified Companion Activity feed — fetch-queue rows (SQL-filtered)
+    plus in-memory Claude/Jev bus tasks — filtered by `state` / `source` /
+    `q` and paged over the merged list, newest activity first.
+    `filtered_total` is the match count for the filter; `counts` are
+    whole-table per-state counts for the KPI tiles."""
     from app.skills import queue_bus as _bus
 
+    if state not in _ACTIVITY_STATES:
+        raise HTTPException(status_code=422, detail=f"state must be one of {_ACTIVITY_STATES}")
     now = datetime.now(tz=timezone.utc)
+    needle = (q or "").strip().lower()
 
-    fetch_stmt = (
-        select(JobFetchQueue)
-        .where(JobFetchQueue.user_id == user.id)
-        .order_by(JobFetchQueue.id.desc())
-        .limit(limit)
-    )
+    conds = [JobFetchQueue.user_id == user.id]
+    not_parked = or_(JobFetchQueue.resume_after.is_(None), JobFetchQueue.resume_after <= now)
+    if state == "active":
+        conds.append(and_(JobFetchQueue.state.in_(("queued", "processing")), not_parked))
+    elif state == "waiting":
+        conds.append(and_(JobFetchQueue.state == "queued", JobFetchQueue.resume_after > now))
+    elif state == "done":
+        conds.append(JobFetchQueue.state == "done")
+    elif state == "error":
+        conds.append(JobFetchQueue.state.in_(("error", "stale", "cancelled")))
+    if source:
+        prefetched = func.json_extract(JobFetchQueue.payload, "$.prefetched").isnot(None)
+        is_fetch = or_(JobFetchQueue.kind.is_(None), JobFetchQueue.kind == "fetch")
+        if source == "bd_build":
+            conds.append(and_(is_fetch, prefetched))
+        elif source == "fetch":
+            conds.append(and_(is_fetch, ~prefetched))
+        else:
+            conds.append(JobFetchQueue.kind == source)
+    if needle:
+        like = f"%{needle}%"
+        conds.append(or_(
+            func.lower(JobFetchQueue.label).like(like),
+            func.lower(JobFetchQueue.url).like(like),
+            func.lower(JobFetchQueue.error_message).like(like),
+        ))
+
+    db_total = (
+        await db.execute(select(func.count(JobFetchQueue.id)).where(*conds))
+    ).scalar_one()
+
+    # Live tasks matching the filter (bus registry, capped at 200).
+    task_rows: list[ActivityRowOut] = []
+    live_counts: dict[str, int] = {}
+    allowed = _BUS_STATUS_FOR.get(state)
+    for t in _bus.list_tasks(limit=200):
+        if str(t.get("item_id") or "").startswith("queue:"):
+            continue  # the DB row is the canonical representation
+        row = _companion_task_to_row(t)
+        live_counts[row.status] = live_counts.get(row.status, 0) + 1
+        if state != "waiting":
+            if allowed is not None and row.status not in allowed:
+                continue
+            if source and row.source != source:
+                continue
+            if needle and needle not in " ".join(
+                filter(None, [row.label, row.error, row.last_text])
+            ).lower():
+                continue
+            task_rows.append(row)
+
+    # Merge-page: the newest (offset + page_size) of each side is enough
+    # to know the merged page exactly.
+    offset = page * page_size
+    want = min(offset + page_size, 20_000)
+    activity_at = func.coalesce(JobFetchQueue.last_attempt_at, JobFetchQueue.created_at)
     fetch_rows = [
         _fetch_queue_to_row(i)
-        for i in (await db.execute(fetch_stmt)).scalars().all()
+        for i in (
+            await db.execute(
+                select(JobFetchQueue)
+                .where(*conds)
+                .order_by(activity_at.desc(), JobFetchQueue.id.desc())
+                .limit(want)
+            )
+        ).scalars().all()
     ]
 
     count_rows = (
@@ -4039,7 +4118,7 @@ async def list_activity(
             .group_by(JobFetchQueue.state)
         )
     ).all()
-    counts: dict[str, int] = {state: n for state, n in count_rows}
+    counts: dict[str, int] = {st: n for st, n in count_rows}
     counts["waiting"] = (
         await db.execute(
             select(func.count(JobFetchQueue.id)).where(
@@ -4059,17 +4138,6 @@ async def list_activity(
         )
     ).scalar_one_or_none()
 
-    # Non-fetch DB rows are also in the bus task registry (the worker
-    # publishes while running). Skip any bus entry whose item_id points at
-    # a DB row — the DB row is the canonical representation and already
-    # carries progress data (merged in `_fetch_queue_to_row`).
-    task_rows: list[ActivityRowOut] = []
-    for t in _bus.list_tasks(limit=200):
-        item_id = str(t.get("item_id") or "")
-        if item_id.startswith("queue:"):
-            continue
-        task_rows.append(_companion_task_to_row(t))
-
     merged = fetch_rows + task_rows
     # JobFetchQueue datetimes come back naive from MySQL; companion-task rows
     # are tz-aware ISO strings. Normalize both so we can mix them in a sort.
@@ -4083,7 +4151,11 @@ async def list_activity(
 
     merged.sort(key=_sort_key, reverse=True)
     return ActivityFeedOut(
-        rows=merged,
+        rows=merged[offset: offset + page_size],
+        filtered_total=db_total + len(task_rows),
+        page=page,
+        page_size=page_size,
+        live_counts=live_counts,
         counts=counts,
         total=sum(n for k, n in counts.items() if k != "waiting"),
         next_resume_at=next_resume_at,

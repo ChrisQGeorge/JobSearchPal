@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { PageShell } from "@/components/PageShell";
+import { Paginator, type PageSize } from "@/components/Paginator";
 import { api, apiUrl, ApiError } from "@/lib/api";
 import {
   JOB_STATUSES,
@@ -44,6 +45,10 @@ type ActivityRow = {
 // stay accurate past the cap. Companion bus rows are all in `rows`.
 type ActivityFeed = {
   rows: ActivityRow[];
+  filtered_total?: number;
+  page?: number;
+  page_size?: number;
+  live_counts?: Record<string, number>;
   counts: Record<string, number>;
   total: number;
   next_resume_at: string | null;
@@ -93,13 +98,41 @@ export default function QueuePage() {
   const [adding, setAdding] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const taskStreamRef = useRef<EventSource | null>(null);
+  // Server-side filtering + paging (the list used to be the newest 200
+  // rows filtered in the browser, so older done/errored rows never showed).
+  const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState<PageSize>(30);
+  const [sourceFilter, setSourceFilter] = useState("");
+  const [qInput, setQInput] = useState("");
+  const [q, setQ] = useState("");
+  const [filteredTotal, setFilteredTotal] = useState(0);
+  const [liveCounts, setLiveCounts] = useState<Record<string, number>>({});
+  // Latest query for the poll timer / SSE handler (avoid stale closures).
+  const queryRef = useRef({ filter, page, pageSize, sourceFilter, q });
+  queryRef.current = { filter, page, pageSize, sourceFilter, q };
+
+  useEffect(() => {
+    const t = setTimeout(() => setQ(qInput.trim()), 300);
+    return () => clearTimeout(t);
+  }, [qInput]);
 
   async function refresh() {
+    const cur = queryRef.current;
+    const size = cur.pageSize === "all" ? 500 : cur.pageSize;
+    const params = new URLSearchParams({
+      state: cur.filter,
+      page: String(cur.pageSize === "all" ? 0 : cur.page),
+      page_size: String(size),
+    });
+    if (cur.sourceFilter) params.set("source", cur.sourceFilter);
+    if (cur.q) params.set("q", cur.q);
     try {
-      const data = await api.get<ActivityFeed>("/api/v1/jobs/activity");
+      const data = await api.get<ActivityFeed>(`/api/v1/jobs/activity?${params}`);
       // Backend already sorts most-recent-first.
       setItems(data.rows);
       setDbCounts(data.counts);
+      setLiveCounts(data.live_counts ?? {});
+      setFilteredTotal(data.filtered_total ?? data.rows.length);
       setServerNextResume(data.next_resume_at);
       setErr(null);
     } catch (e) {
@@ -109,9 +142,15 @@ export default function QueuePage() {
     }
   }
 
+  // New filter → back to page 1.
   useEffect(() => {
-    refresh();
-  }, []);
+    setPage(0);
+  }, [filter, sourceFilter, q, pageSize]);
+
+  useEffect(() => {
+    void refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filter, page, pageSize, sourceFilter, q]);
 
   // Live task-row updates from the server. Merges in-place by id so we
   // don't need a full refresh between polls.
@@ -144,6 +183,16 @@ export default function QueuePage() {
           num_turns: raw.num_turns ?? null,
         };
         setItems((prev) => {
+          const cur = queryRef.current;
+          const present = prev.some((p) => p.id === row.id);
+          // A row not on this page is only added on page 1 of a view it
+          // belongs to; everything else waits for the next poll.
+          const fits =
+            cur.page === 0 &&
+            !cur.sourceFilter &&
+            !cur.q &&
+            (cur.filter === "all" || (cur.filter === "active" && row.status === "running"));
+          if (!present && !fits) return prev;
           const without = prev.filter((p) => p.id !== row.id);
           const next = [row, ...without];
           next.sort((a, b) => {
@@ -151,7 +200,8 @@ export default function QueuePage() {
             const tb = b.updated_at ? new Date(b.updated_at).getTime() : 0;
             return tb - ta;
           });
-          return next;
+          const size = cur.pageSize === "all" ? 500 : cur.pageSize;
+          return next.slice(0, size);
         });
       } catch {
         /* non-fatal */
@@ -324,56 +374,18 @@ export default function QueuePage() {
     let active = Math.max(0, (dbCounts["queued"] ?? 0) - waiting) + processing;
     let total =
       (dbCounts["queued"] ?? 0) + processing + done + errored;
-    for (const it of items) {
-      if (!it.id.startsWith("task:")) continue;
-      total++;
-      if (isWaiting(it)) waiting++;
-      else if (it.status === "processing" || it.status === "running") {
-        processing++;
-        active++;
-      } else if (it.status === "queued") active++;
-      else if (it.status === "done") done++;
-      else if (it.status === "error" || it.status === "stale") errored++;
-    }
+    // Live (in-memory) tasks — counted server-side over ALL of them.
+    const lc = (k: string) => liveCounts[k] ?? 0;
+    processing += lc("running");
+    active += lc("running");
+    done += lc("done");
+    errored += lc("error") + lc("stale") + lc("cancelled");
+    total += Object.values(liveCounts).reduce((a, b) => a + b, 0);
     return { active, waiting, done, errored, processing, total };
-  }, [items, dbCounts]);
+  }, [dbCounts, liveCounts]);
 
-  const visible = useMemo<ActivityRow[]>(() => {
-    // Pick the rows for the active filter, then trim done-fetch rows
-    // to the most recent 20 so a long history of completed fetches
-    // doesn't bury active / errored work. items[] is already sorted
-    // newest-first by updated_at upstream.
-    function trimDone(arr: ActivityRow[]): ActivityRow[] {
-      let kept = 0;
-      const out: ActivityRow[] = [];
-      for (const it of arr) {
-        if (it.status === "done") {
-          if (kept >= 20) continue;
-          kept++;
-        }
-        out.push(it);
-      }
-      return out;
-    }
-    switch (filter) {
-      case "all":
-        return trimDone(items);
-      case "active":
-        return items.filter(isActive);
-      case "waiting":
-        return items.filter(isWaiting);
-      case "done":
-        return trimDone(items.filter((i) => i.status === "done"));
-      case "error":
-        return items.filter(
-          (i) => i.status === "error" || i.status === "stale",
-        );
-      default:
-        return items;
-    }
-  }, [items, filter]);
-
-  const hiddenDoneCount = Math.max(0, counts.done - 20);
+  // The server already filtered and paged.
+  const visible = items;
 
   // Soonest upcoming resume, for the "next resume in N min" hint. The
   // server computes it over the whole table (visible rows are capped);
@@ -575,12 +587,33 @@ export default function QueuePage() {
           </button>
         </div>
       </div>
-      {hiddenDoneCount > 0 && (filter === "all" || filter === "done") ? (
-        <div className="text-[11px] text-corp-muted -mt-2 mb-3">
-          Showing latest 20 completed rows; {hiddenDoneCount} older
-          hidden. Use <b>Dismiss completed</b> to clear them.
-        </div>
-      ) : null}
+      <div className="flex items-center gap-2 mb-3 flex-wrap">
+        <select
+          className="jsp-input text-xs w-48"
+          value={sourceFilter}
+          onChange={(e) => setSourceFilter(e.target.value)}
+          aria-label="Filter by task type"
+        >
+          <option value="">All task types</option>
+          {Object.entries(SOURCE_LABEL)
+            .filter(([k]) => k !== "score")
+            .sort((a, b) => a[1].localeCompare(b[1]))
+            .map(([k, label]) => (
+              <option key={k} value={k}>
+                {label} ({k.replace(/_/g, " ")})
+              </option>
+            ))}
+        </select>
+        <input
+          className="jsp-input text-xs flex-1 min-w-[12rem]"
+          placeholder="Search label, URL or error…"
+          value={qInput}
+          onChange={(e) => setQInput(e.target.value)}
+        />
+        <span className="text-[11px] text-corp-muted">
+          {filteredTotal} matching
+        </span>
+      </div>
 
       {err ? (
         <div className="jsp-card p-3 mb-3 text-sm text-corp-danger">{err}</div>
@@ -612,6 +645,15 @@ export default function QueuePage() {
           ))}
         </ul>
       )}
+      <Paginator
+        page={page}
+        pageSize={pageSize}
+        setPage={setPage}
+        setPageSize={setPageSize}
+        total={filteredTotal}
+        totalPages={pageSize === "all" ? 1 : Math.max(1, Math.ceil(filteredTotal / pageSize))}
+        className="px-1 py-2"
+      />
     </PageShell>
   );
 }
