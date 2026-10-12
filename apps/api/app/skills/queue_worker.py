@@ -690,40 +690,75 @@ async def _handle_fetch(item: JobFetchQueue) -> None:
         existing_job_id: Optional[int] = None
         prefetched_fields: Optional[dict] = None
         prefetched_extras: list[str] = []
+        is_bd_build = False
         if isinstance(row.payload, dict):
             tj_id = row.payload.get("tracked_job_id")
             if isinstance(tj_id, int):
                 existing_job_id = tj_id
             lid = row.payload.get("lead_id")
-            if row.payload.get("prefetched") == "brightdata_linkedin" and isinstance(lid, int):
+            from_bd_source = False
+            if isinstance(lid, int) and not row.payload.get("prefetched"):
+                # Queued before Bright Data leads were flagged by source:
+                # check the lead's source so these never page-fetch either.
+                from app.models.sources import JobLead as _JL, JobSource as _JS
+
+                kind = (
+                    await db.execute(
+                        select(_JS.kind)
+                        .join(_JL, _JL.source_id == _JS.id)
+                        .where(_JL.id == lid, _JL.user_id == row.user_id)
+                    )
+                ).scalar_one_or_none()
+                from_bd_source = bool(kind and kind.startswith("brightdata"))
+            if (row.payload.get("prefetched") == "brightdata_linkedin" or from_bd_source) and isinstance(lid, int):
                 from app.models.sources import JobLead
                 from app.sources.brightdata import (
                     linkedin_record_extras,
                     linkedin_record_to_job_fields,
                 )
 
-                raw = (
+                lead_row = (
                     await db.execute(
-                        select(JobLead.raw_payload).where(
-                            JobLead.id == lid, JobLead.user_id == row.user_id
-                        )
+                        select(
+                            JobLead.raw_payload, JobLead.title, JobLead.organization_name,
+                            JobLead.location, JobLead.remote_policy, JobLead.description_md,
+                            JobLead.source_url,
+                        ).where(JobLead.id == lid, JobLead.user_id == row.user_id)
                     )
-                ).scalar_one_or_none()
+                ).first()
+                raw = lead_row.raw_payload if lead_row is not None else None
                 if isinstance(raw, dict):
                     prefetched_fields = linkedin_record_to_job_fields(raw)
                     prefetched_extras = linkedin_record_extras(raw)
+                if prefetched_fields is None and lead_row is not None and lead_row.title:
+                    # Record didn't map (different export field names) —
+                    # build from what the import already stored on the
+                    # lead. A Bright Data lead is NEVER page-fetched.
+                    prefetched_fields = {
+                        "title": lead_row.title[:255],
+                        "organization_name": lead_row.organization_name,
+                        "location": lead_row.location,
+                        "remote_policy": lead_row.remote_policy
+                        if lead_row.remote_policy in {"onsite", "hybrid", "remote"} else None,
+                        "job_description": lead_row.description_md,
+                        "source_platform": "linkedin",
+                        "source_url": lead_row.source_url,
+                    }
+                is_bd_build = True
         row_url = row.url
+
+    bus_source = "bd_build" if is_bd_build else "fetch"
 
     def _on_event(ev: dict) -> None:
         p = dict(ev)
         p.setdefault("item_id", f"queue:{item_id}")
-        p.setdefault("source", "fetch")
+        p.setdefault("source", bus_source)
         p.setdefault("label", label)
         p.setdefault("url", item_url)
         queue_bus.publish(p)
 
     queue_bus.publish({
-        "item_id": f"queue:{item_id}", "source": "fetch",
+        "item_id": f"queue:{item_id}", "source": bus_source,
         "label": label, "url": item_url, "kind": "start",
     })
 
@@ -736,6 +771,11 @@ async def _handle_fetch(item: JobFetchQueue) -> None:
                 prefetched_fields.get("source_url") or row_url,
                 on_event=_on_event,
                 prefetched=(prefetched_fields, "Bright Data"),
+            )
+        elif is_bd_build:
+            raise ClaudeCodeError(
+                "Bright Data lead has no stored title to build the job from — not "
+                "fetching the page (Bright Data leads are built from their data only)."
             )
         else:
             fetched = await perform_fetch(None, row_url, on_event=_on_event)

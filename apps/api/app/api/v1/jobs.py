@@ -3952,7 +3952,10 @@ def _fetch_queue_to_row(item: JobFetchQueue) -> ActivityRowOut:
         "fetch": "fetch",
         "score": "jd_analyze",
     }
-    bus_source = _SOURCE_FOR_KIND.get(kind, kind)
+    is_bd_build = kind == "fetch" and isinstance(item.payload, dict) and bool(
+        item.payload.get("prefetched")
+    )
+    bus_source = "bd_build" if is_bd_build else _SOURCE_FOR_KIND.get(kind, kind)
     task = _bus.get_task(bus_source, f"queue:{item.id}")
     last_text = task.get("last_text") if task else None
     last_tool = task.get("last_tool") if task else None
@@ -3963,7 +3966,7 @@ def _fetch_queue_to_row(item: JobFetchQueue) -> ActivityRowOut:
     return ActivityRowOut(
         id=f"fetch:{item.id}",  # stable id across kinds — table is shared
         kind="fetch" if kind == "fetch" else "companion",
-        source=kind,
+        source="bd_build" if is_bd_build else kind,
         label=label,
         status=item.state or "queued",
         started_at=item.last_attempt_at,

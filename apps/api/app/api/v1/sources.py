@@ -1070,17 +1070,23 @@ async def _promote_lead(
     # lists, JD analysis). lead_id in the payload tells the fetch
     # handler to back-link the new TrackedJob onto this lead row.
     payload: dict = {"lead_id": lead.id}
-    raw = lead.raw_payload if isinstance(lead.raw_payload, dict) else {}
-    if raw.get("job_posting_id") and (raw.get("job_title") or raw.get("title")):
-        # Bright Data LinkedIn record: the stored payload is richer than
-        # what a fresh (often login-walled) page fetch + LLM parse would
-        # get, so the worker builds the job straight from it.
+    src_kind = (
+        await db.execute(select(JobSource.kind).where(JobSource.id == lead.source_id))
+    ).scalar_one_or_none() or ""
+    is_bd = src_kind.startswith("brightdata")
+    if is_bd:
+        # Bright Data lead: the stored record is richer than what a fresh
+        # (often login-walled) page fetch + LLM parse would get, so the
+        # worker builds the job straight from it — never fetches the page.
         payload["prefetched"] = "brightdata_linkedin"
     db.add(
         JobFetchQueue(
             user_id=user.id,
             kind="fetch",
-            label=f"Lead → {lead.title[:80]}"[:512],
+            label=(
+                f"Build from Bright Data data → {lead.title[:80]}" if is_bd
+                else f"Lead → {lead.title[:80]}"
+            )[:512],
             url=lead.source_url,
             desired_status=target_status,
             payload=payload,
@@ -1128,18 +1134,20 @@ async def lead_bulk_action(
         await db.commit()
         return LeadActionOut(dismissed=result.rowcount or 0)
 
-    # Lean select: ids + url + a DB-side "is this a Bright Data LinkedIn
-    # record" flag — never the description or the multi-KB raw payload.
+    # Lean select: ids + url + whether the lead came from a Bright Data
+    # source — never the description or the multi-KB raw payload. Bright
+    # Data leads are built from their stored record (no page fetch, no
+    # LLM parse); deciding by the source's kind, not by one key in the
+    # record, so exports whose id field is named differently still count.
     rows = (
         await db.execute(
             select(
                 JobLead.id,
                 JobLead.title,
                 JobLead.source_url,
-                func.json_extract(JobLead.raw_payload, "$.job_posting_id")
-                .isnot(None)
-                .label("is_bd_linkedin"),
+                JobSource.kind.like("brightdata%").label("is_bd"),
             )
+            .join(JobSource, JobSource.id == JobLead.source_id)
             .where(*conds, JobLead.state != "promoted")
             .order_by(JobLead.first_seen_at.desc(), JobLead.id.desc())
             .limit(MAX_PROMOTE_PER_REQUEST + 1)
@@ -1155,12 +1163,15 @@ async def lead_bulk_action(
         JobFetchQueue(
             user_id=user.id,
             kind="fetch",
-            label=f"Lead → {r.title[:80]}"[:512],
+            label=(
+                f"Build from Bright Data data → {r.title[:80]}" if r.is_bd
+                else f"Lead → {r.title[:80]}"
+            )[:512],
             url=r.source_url,
             desired_status=PROMOTED_STATUS,
             payload=(
                 {"lead_id": r.id, "prefetched": "brightdata_linkedin"}
-                if r.is_bd_linkedin else {"lead_id": r.id}
+                if r.is_bd else {"lead_id": r.id}
             ),
             state="queued",
         )

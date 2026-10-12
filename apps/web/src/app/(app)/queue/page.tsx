@@ -722,7 +722,8 @@ function QueueRow({
     SOURCE_COLOR[item.source] ??
     "bg-corp-surface2 text-corp-muted border-corp-border";
 
-  const isCompanion = item.kind === "companion";
+  // Build-from-Bright-Data rows show their label ("Build from Bright Data data → title"), not the URL.
+  const isCompanion = item.kind === "companion" || item.source === "bd_build";
   const isJev = item.source === "jev";
 
   // Cost formatted as $0.0023 if present.
@@ -928,6 +929,7 @@ const SOURCE_LABEL: Record<string, string> = {
   autofill: "AUTOFILL",
   resume_ingest: "INGEST",
   jev: "JEV",
+  bd_build: "BUILD",
 };
 const SOURCE_COLOR: Record<string, string> = {
   fetch: "bg-sky-500/25 text-sky-300 border-sky-500/40",
@@ -953,6 +955,8 @@ const SOURCE_COLOR: Record<string, string> = {
   autofill: "bg-fuchsia-500/25 text-fuchsia-300 border-fuchsia-500/40",
   resume_ingest: "bg-lime-500/25 text-lime-300 border-lime-500/40",
   jev: "bg-orange-500/25 text-orange-300 border-orange-500/40",
+  // Tracked job built from Bright Data's stored record — no page fetch.
+  bd_build: "bg-emerald-500/25 text-emerald-300 border-emerald-500/40",
 };
 
 function LiveStreamPanel() {
