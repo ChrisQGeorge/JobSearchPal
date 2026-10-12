@@ -42,8 +42,8 @@ def _now() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 
-def _matches_filters(lead: dict[str, Any], filters: Optional[dict]) -> bool:
-    """Apply user-defined per-source filters. None = pass.
+def _filter_reason(lead: dict[str, Any], filters: Optional[dict]) -> Optional[str]:
+    """Which per-source filter drops this lead, or None when it passes.
 
     Filter shape (all optional):
       {
@@ -55,30 +55,37 @@ def _matches_filters(lead: dict[str, Any], filters: Optional[dict]) -> bool:
       }
     """
     if not filters:
-        return True
+        return None
     title = (lead.get("title") or "").lower()
     location = (lead.get("location") or "").lower()
     remote = (lead.get("remote_policy") or "").lower()
     try:
         inc_t = filters.get("title_include")
         if inc_t and not re.search(inc_t, title, re.IGNORECASE):
-            return False
+            return "title_include"
         exc_t = filters.get("title_exclude")
         if exc_t and re.search(exc_t, title, re.IGNORECASE):
-            return False
+            return "title_exclude"
         inc_l = filters.get("location_include")
         if inc_l and not re.search(inc_l, location, re.IGNORECASE):
-            return False
+            return "location_include"
         exc_l = filters.get("location_exclude")
         if exc_l and re.search(exc_l, location, re.IGNORECASE):
-            return False
-        if filters.get("remote_only") and remote != "remote":
-            return False
+            return "location_exclude"
+        # Only a KNOWN non-remote job is dropped. Many sources (Bright Data
+        # LinkedIn records especially) don't say, and treating "unknown"
+        # as "not remote" dropped nearly every lead.
+        if filters.get("remote_only") and remote and remote != "remote":
+            return "remote_only"
     except re.error:
         # A malformed user regex shouldn't break the whole poll — log and
         # treat the filter as a no-op for that field.
         log.warning("source filter regex invalid: %r", filters)
-    return True
+    return None
+
+
+def _matches_filters(lead: dict[str, Any], filters: Optional[dict]) -> bool:
+    return _filter_reason(lead, filters) is None
 
 
 async def _adapter_fetch(
@@ -289,6 +296,7 @@ async def _insert_leads(
     raw_leads: list[dict[str, Any]],
     cap: int,
     existing: Optional[set] = None,
+    stats: Optional[dict] = None,
 ) -> tuple[int, Optional[str], int]:
     """Dedupe + filter + insert up to `cap` new JobLead rows. Returns
     (inserted, error, auto_dismissed) — error only on a concurrent-insert
@@ -333,16 +341,29 @@ async def _insert_leads(
             # Hit the per-poll cap. Remaining raws stay on upstream;
             # next poll will pick up whatever's still un-dedup'd.
             break
-        if not _matches_filters(raw, source.filters):
+        # `stats` (optional) collects why leads were skipped; "_seen" holds
+        # ids added during this import so repeats within it are told apart
+        # from leads that were already on the source.
+        why = _filter_reason(raw, source.filters)
+        if why:
+            if stats is not None:
+                stats[f"filtered_{why}"] = stats.get(f"filtered_{why}", 0) + 1
             continue
         ext_id = (raw.get("external_id") or "").strip()
         title = (raw.get("title") or "").strip()
         if not ext_id or not title:
+            if stats is not None:
+                stats["missing_id_or_title"] = stats.get("missing_id_or_title", 0) + 1
             continue
         ext_id = ext_id[:255]
         if ext_id in existing_ext:
+            if stats is not None:
+                key = "repeat_in_import" if ext_id in stats.setdefault("_seen", set()) else "already_on_source"
+                stats[key] = stats.get(key, 0) + 1
             continue
         existing_ext.add(ext_id)
+        if stats is not None:
+            stats.setdefault("_seen", set()).add(ext_id)
         dismiss = bool(auto_filters) and any(
             m({**raw, "title": title}) for m in auto_filters
         )

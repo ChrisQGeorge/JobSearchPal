@@ -21,7 +21,21 @@ type Progress = {
   leads?: number;
   auto_dismissed?: number;
   duplicates_or_filtered?: number;
+  // Why rows were skipped (see SKIP_LABEL).
+  skipped?: Record<string, number>;
+  existing_on_source?: number;
   error?: string | null;
+};
+
+const SKIP_LABEL: Record<string, string> = {
+  already_on_source: "already on this source (duplicates)",
+  repeat_in_import: "repeated within the file",
+  missing_id_or_title: "missing a job id or title",
+  filtered_remote_only: "dropped by the source's Remote-only filter (known on-site / hybrid)",
+  filtered_title_include: "dropped by the source's title-include filter",
+  filtered_title_exclude: "dropped by the source's title-exclude filter",
+  filtered_location_include: "dropped by the source's location-include filter",
+  filtered_location_exclude: "dropped by the source's location-exclude filter",
 };
 
 const mb = (n: number) => `${(n / (1024 * 1024)).toFixed(n > 100 * 1024 * 1024 ? 0 : 1)} MB`;
@@ -85,7 +99,8 @@ export function FileImport({
   useEffect(() => {
     api
       .get<Progress>(endpoint)
-      .then((p) => (p.status === "importing" ? setProg(p) : null))
+      // Also show the last finished import's result (kept until restart).
+      .then((p) => (p.status ? setProg(p) : null))
       .catch(() => {});
   }, [endpoint]);
 
@@ -153,7 +168,17 @@ export function FileImport({
           {prog.bytes ? ` (${mb(prog.bytes)})` : ""}: {prog.records ?? 0} records read ·{" "}
           {prog.leads ?? 0} new leads
           {prog.auto_dismissed ? ` · ${prog.auto_dismissed} auto-dismissed` : ""}
-          {prog.duplicates_or_filtered ? ` · ${prog.duplicates_or_filtered} duplicates / filtered out` : ""}
+          {prog.skipped && Object.keys(prog.skipped).length
+            ? Object.entries(prog.skipped)
+                .sort((a, b) => b[1] - a[1])
+                .map(([k, n]) => ` · ${n} ${SKIP_LABEL[k] ?? k.replace(/_/g, " ")}`)
+                .join("")
+            : prog.duplicates_or_filtered
+              ? ` · ${prog.duplicates_or_filtered} duplicates / filtered out`
+              : ""}
+          {prog.existing_on_source != null && prog.status !== "importing"
+            ? ` (this source already had ${prog.existing_on_source} leads before the import)`
+            : ""}
           {prog.not_jobs ? ` · ${prog.not_jobs} non-job / error rows skipped` : ""}
           {prog.error ? `\n${prog.error}` : ""}
           {prog.status !== "importing" ? (

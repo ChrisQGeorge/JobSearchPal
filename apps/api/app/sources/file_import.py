@@ -45,6 +45,10 @@ def _new_progress(filename: str, size: int) -> dict[str, Any]:
         "leads": 0,         # new leads added to the inbox
         "auto_dismissed": 0,
         "duplicates_or_filtered": 0,
+        # Why rows were skipped: already_on_source, repeat_in_import,
+        # missing_id_or_title, filtered_<source filter> (e.g.
+        # filtered_remote_only, filtered_title_exclude).
+        "skipped": {},
         "error": None,
     }
 
@@ -91,6 +95,8 @@ async def run_import(source_id: int, path: str) -> None:
             )
             await db.commit()  # release the connection while parsing
 
+            skip_stats: dict = {}
+            prog["existing_on_source"] = len(existing)
             fh = open(path, "rb")
             records = bd.iter_export_records(fh)
 
@@ -117,7 +123,7 @@ async def run_import(source_id: int, path: str) -> None:
                 if leads:
                     await yield_to_requests()
                     n, err, auto = await _insert_leads(
-                        db, source, leads, cap=10**9, existing=existing
+                        db, source, leads, cap=10**9, existing=existing, stats=skip_stats
                     )
                     if err is not None:
                         raise RuntimeError(f"Database conflict while inserting: {err}")
@@ -125,6 +131,7 @@ async def run_import(source_id: int, path: str) -> None:
                     prog["leads"] += n
                     prog["auto_dismissed"] += auto
                     prog["duplicates_or_filtered"] += len(leads) - n - auto
+                    prog["skipped"] = {k: v for k, v in skip_stats.items() if not k.startswith("_")}
                 await asyncio.sleep(0)
         prog["status"] = "done"
         if prog["records"] == 0:
