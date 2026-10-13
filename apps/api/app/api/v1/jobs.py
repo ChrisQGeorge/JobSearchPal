@@ -909,6 +909,49 @@ async def posting_preview(
     return {**out, "job_remote_policy": job.remote_policy}
 
 
+@router.get("/human-help")
+async def list_human_help(
+    resolved_only: bool = False,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Jobs with an awaiting-human request: status=awaiting_human, or a
+    resolution written (kept whatever the status). For agents (MCP
+    list_human_help) to find answers before retrying."""
+    has_res = and_(
+        TrackedJob.awaiting_human_resolution.isnot(None),
+        TrackedJob.awaiting_human_resolution != "",
+    )
+    cond = has_res if resolved_only else or_(TrackedJob.status == "awaiting_human", has_res)
+    rows = (
+        await db.execute(
+            select(
+                TrackedJob.id, TrackedJob.title, TrackedJob.status, TrackedJob.organization_id,
+                TrackedJob.awaiting_human_reason, TrackedJob.awaiting_human_resolution,
+                TrackedJob.updated_at,
+            )
+            .where(TrackedJob.user_id == user.id, TrackedJob.deleted_at.is_(None), cond)
+            .order_by(TrackedJob.updated_at.desc())
+            .limit(500)
+        )
+    ).all()
+    org_names = await _org_names_for(db, {r.organization_id for r in rows if r.organization_id})
+    return {
+        "jobs": [
+            {
+                "job_id": r.id,
+                "title": r.title,
+                "organization_name": org_names.get(r.organization_id),
+                "status": r.status,
+                "reason": r.awaiting_human_reason,
+                "resolution": r.awaiting_human_resolution,
+                "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+            }
+            for r in rows
+        ]
+    }
+
+
 @router.get("/{job_id:int}/posting-snapshot")
 @long_running
 async def posting_snapshot(

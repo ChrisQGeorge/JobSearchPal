@@ -190,9 +190,10 @@ export default function JobDetailPage({
         ← All jobs
       </Link>
 
-      {job.status === "awaiting_human" ? (
+      {job.status === "awaiting_human" || (job.awaiting_human_resolution ?? "").trim() ? (
         <div className="mt-3">
           <AwaitingHumanBox
+            awaiting={job.status === "awaiting_human"}
             reason={job.awaiting_human_reason}
             resolution={job.awaiting_human_resolution}
             saving={saving}

@@ -137,6 +137,17 @@ async def _get_job(call: Call, a: dict) -> Any:
     return job
 
 
+async def _get_human_help(call: Call, a: dict) -> Any:
+    job = await call("GET", f"/jobs/{int(a['job_id'])}")
+    return {
+        "job_id": job.get("id"),
+        "title": job.get("title"),
+        "status": job.get("status"),
+        "reason": job.get("awaiting_human_reason"),
+        "resolution": job.get("awaiting_human_resolution"),
+    }
+
+
 async def _set_status(call: Call, a: dict) -> Any:
     ok, failed = [], []
     for jid in a["job_ids"]:
@@ -230,7 +241,8 @@ TOOLS: list[Tool] = [
     Tool(
         "get_job",
         "Full detail for one tracked job: description, skills, Jev analysis "
-        "(jd_analysis.scores per dimension), fit_summary, dates, notes.",
+        "(jd_analysis.scores per dimension), fit_summary, dates, notes, and the "
+        "human-help fields awaiting_human_reason / awaiting_human_resolution.",
         _obj({"job_id": _INT, "include_description": {**_BOOL, "default": True}}, ["job_id"]),
         _get_job,
     ),
@@ -380,6 +392,34 @@ TOOLS: list[Tool] = [
         _obj({"job_id": _INT, "fields": _obj({k: v for k, v in _JOB_FIELDS.items()})},
              ["job_id", "fields"]),
         lambda call, a: call("PUT", f"/jobs/{int(a['job_id'])}", json=a["fields"]),
+        write=True,
+    ),
+    Tool(
+        "list_human_help",
+        "Jobs with a human-help request: status=awaiting_human, or a resolution the person "
+        "wrote (kept whatever the status). Each row: job_id, title, organization_name, status, "
+        "reason (what was asked), resolution (the person's answer — act on it before retrying). "
+        "resolved_only=true → only jobs that have an answer.",
+        _obj({"resolved_only": {**_BOOL, "default": False}}),
+        lambda call, a: call("GET", "/jobs/human-help",
+                             params={"resolved_only": "true" if a.get("resolved_only") else "false"}),
+    ),
+    Tool(
+        "get_human_help",
+        "One job's human-help state: status, reason (the request) and resolution (the "
+        "person's answer). Read this before retrying a job you asked for help on.",
+        _obj({"job_id": _INT}, ["job_id"]),
+        _get_human_help,
+    ),
+    Tool(
+        "set_human_resolution",
+        "Write or clear (resolution=null) a job's human-help resolution — e.g. clear it once "
+        "you've acted on it, or record the answer on the person's behalf.",
+        _obj({"job_id": _INT, "resolution": {"type": ["string", "null"]}}, ["job_id"]),
+        lambda call, a: call(
+            "PUT", f"/jobs/{int(a['job_id'])}",
+            json={"awaiting_human_resolution": a.get("resolution")},
+        ),
         write=True,
     ),
     Tool(

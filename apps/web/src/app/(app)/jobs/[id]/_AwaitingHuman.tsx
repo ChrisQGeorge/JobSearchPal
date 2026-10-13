@@ -1,18 +1,22 @@
 "use client";
 
-// Shown only while a job is at status=awaiting_human — the problem an
-// external agent (MCP request_human_help) needs a person for, and, once
-// there is a problem written, the person's resolution, which the agent
-// reads (get_job) before trying again. Nothing in the app acts on either.
+// Shown while a job is at status=awaiting_human — the problem an external
+// agent (MCP request_human_help) needs a person for, and, once there is a
+// problem written, the person's resolution, which the agent reads
+// (get_human_help / get_job) before trying again. A written resolution
+// keeps the box visible whatever the status. Nothing in the app acts on
+// either.
 
 import { useEffect, useState } from "react";
 
 export function AwaitingHumanBox({
+  awaiting,
   reason,
   resolution,
   saving,
   onSave,
 }: {
+  awaiting: boolean;
   reason: string | null | undefined;
   resolution: string | null | undefined;
   saving: boolean;
@@ -24,11 +28,14 @@ export function AwaitingHumanBox({
   useEffect(() => setRes(resolution ?? ""), [resolution]);
   const dirty =
     text.trim() !== (reason ?? "").trim() || res.trim() !== (resolution ?? "").trim();
-  const hasProblem = text.trim().length > 0;
+  // Resolution shows once there is a request — or a resolution already saved.
+  const hasProblem = text.trim().length > 0 || (resolution ?? "").trim().length > 0;
 
   return (
     <section className="jsp-card p-3 mb-4 border-l-4 border-l-green-500 bg-green-500/5 space-y-2">
-      <div className="text-sm font-medium text-green-300">Awaiting human — what&apos;s needed</div>
+      <div className="text-sm font-medium text-green-300">
+        {awaiting ? "Awaiting human — what’s needed" : "Human help — request"}
+      </div>
       <textarea
         className="jsp-input text-sm min-h-[70px]"
         value={text}
@@ -50,8 +57,9 @@ export function AwaitingHumanBox({
       ) : null}
       <div className="flex items-center gap-2">
         <span className="text-[11px] text-corp-muted flex-1">
-          Write the resolution, then change the status so the agent can try again. Both notes are
-          kept but only show in this status.
+          {awaiting
+            ? "Write the resolution, then change the status so the agent can try again."
+            : "Kept visible because it has a resolution. Agents read it via get_human_help / get_job; clear the resolution to hide this box."}
         </span>
         {dirty ? (
           <button
