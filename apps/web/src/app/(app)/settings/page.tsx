@@ -22,6 +22,7 @@ import {
 import { JevScoringPanel } from "./_panels/JevScoringPanel";
 import { AgentAccessPanel } from "./_panels/AgentAccessPanel";
 import { PromptsPanel } from "./_panels/PromptsPanel";
+import { OutboxPanel } from "./_panels/OutboxPanel";
 
 type Tab =
   | "resume"
@@ -35,6 +36,7 @@ type Tab =
   | "jev"
   | "prompts"
   | "agents"
+  | "outbox"
   | "personas"
   | "data-io";
 
@@ -52,6 +54,7 @@ const TABS: { key: Tab; label: string }[] = [
   { key: "jev", label: "Jev Scoring" },
   { key: "prompts", label: "Prompts" },
   { key: "agents", label: "Agent Access" },
+  { key: "outbox", label: "Sol Outbox" },
   { key: "personas", label: "Personas" },
   { key: "data-io", label: "Data Export / Import" },
 ];
@@ -110,6 +113,7 @@ export default function SettingsPage() {
       {tab === "jev" && <JevScoringPanel />}
       {tab === "prompts" && <PromptsPanel />}
       {tab === "agents" && <AgentAccessPanel />}
+      {tab === "outbox" && <OutboxPanel />}
       {tab === "personas" && <PersonaManager />}
       {tab === "data-io" && <DataIoPanel />}
     </PageShell>

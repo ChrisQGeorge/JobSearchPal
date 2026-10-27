@@ -10,6 +10,7 @@ import { StatusBadge } from "@/components/StatusBadge";
 import { api, apiUrl, ApiError } from "@/lib/api";
 import { scoredOnlyParam } from "@/lib/queuePrefs";
 import { AwaitingHumanBox } from "./_AwaitingHuman";
+import { SolOutboxCard } from "./_SolOutbox";
 import { PostingPreview } from "./_PostingPreview";
 import {
   ARTIFACT_KINDS,
@@ -201,6 +202,10 @@ export default function JobDetailPage({
           />
         </div>
       ) : null}
+
+      <div className="mt-3">
+        <SolOutboxCard jobId={job.id} onJobChanged={refresh} />
+      </div>
 
       <div className="mt-3">
         <PostingPreview

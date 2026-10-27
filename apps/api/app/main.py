@@ -20,6 +20,7 @@ from app.api.v1 import history as history_router
 from app.api.v1 import jev_settings as jev_settings_router
 from app.api.v1 import jobs as jobs_router
 from app.api.v1 import mcp as mcp_router
+from app.api.v1 import outbox as outbox_router
 from app.api.v1 import prompts as prompts_router
 from app.api.v1 import organizations as organizations_router
 from app.api.v1 import personas as personas_router
@@ -31,6 +32,7 @@ from app.api.v1 import resume_ingest as resume_ingest_router
 from app.api.v1 import sources as sources_router
 from app.core.config import settings
 from app.skills.email_automation import run_forever as run_gmail_poller
+from app.skills.outbox import run_forever as run_outbox_sync
 from app.skills.queue_worker import run_forever as run_queue_worker
 from app.sources.poller import run_forever as run_source_poller
 
@@ -47,8 +49,9 @@ async def lifespan(app: FastAPI):
     task = asyncio.create_task(run_queue_worker(), name="job-fetch-queue")
     poller_task = asyncio.create_task(run_source_poller(), name="source-poller")
     gmail_task = asyncio.create_task(run_gmail_poller(), name="gmail-poller")
-    log.info("Started job-fetch-queue, source-poller and gmail-poller workers")
-    tasks = (monitor_task, task, poller_task, gmail_task)
+    outbox_task = asyncio.create_task(run_outbox_sync(), name="outbox-sync")
+    log.info("Started job-fetch-queue, source-poller, gmail-poller and outbox-sync workers")
+    tasks = (monitor_task, task, poller_task, gmail_task, outbox_task)
     try:
         yield
     finally:
@@ -216,4 +219,5 @@ app.include_router(companion_router.router, prefix="/api/v1")
 app.include_router(cover_letter_library_router.router, prefix="/api/v1")
 app.include_router(email_ingest_router.router, prefix="/api/v1")
 app.include_router(game_router.router, prefix="/api/v1")
+app.include_router(outbox_router.router, prefix="/api/v1")
 sources_router.register(app)

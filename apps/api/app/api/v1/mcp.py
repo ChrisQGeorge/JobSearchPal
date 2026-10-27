@@ -423,6 +423,48 @@ TOOLS: list[Tool] = [
         write=True,
     ),
     Tool(
+        "list_outbox",
+        "Jobs sent to the Sol outbox repo (GitHub hand-off to the Sol application agent): "
+        "slug, published_at, withdrawn_at, sol_status (applied/skipped/closed from the repo's "
+        "status branch), confirmation, note, last_error.",
+        _obj({"limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200}}),
+        lambda call, a: call("GET", "/outbox/jobs", params={"limit": a.get("limit", 200)}),
+    ),
+    Tool(
+        "get_outbox_job",
+        "One job's Sol-outbox state: entry (or null if never sent) and blocked_reason — why it "
+        "can't be sent yet (no tailored resume with text, or no https apply URL).",
+        _obj({"job_id": _INT}, ["job_id"]),
+        lambda call, a: call("GET", f"/outbox/jobs/{int(a['job_id'])}"),
+    ),
+    Tool(
+        "send_to_sol",
+        "Approve a job for the Sol agent: commits jobs/<slug>/ (job.json, resume.pdf, cover "
+        "letter) to the outbox repo's main branch and pushes, in the background. Needs a "
+        "tailored resume for the job and an https apply URL. Optional notes go to Sol in job.json.",
+        _obj({"job_id": _INT, "notes": _STR}, ["job_id"]),
+        lambda call, a: call("POST", f"/outbox/jobs/{int(a['job_id'])}/approve",
+                             json={"notes": a.get("notes")}),
+        write=True,
+    ),
+    Tool(
+        "withdraw_from_sol",
+        "Pull a job back from Sol: adds withdrawn.json to its folder (nothing is deleted; Sol "
+        "skips it). Not possible once Sol has reported a status for it.",
+        _obj({"job_id": _INT, "reason": _STR}, ["job_id"]),
+        lambda call, a: call("POST", f"/outbox/jobs/{int(a['job_id'])}/withdraw",
+                             json={"reason": a.get("reason")}),
+        write=True,
+    ),
+    Tool(
+        "sync_outbox",
+        "Run a Sol-outbox sync now (push pending jobs, read Sol's status branch). Runs in the "
+        "background; list_outbox shows the result.",
+        _obj({}),
+        lambda call, a: call("POST", "/outbox/sync"),
+        write=True,
+    ),
+    Tool(
         "request_human_help",
         "Flag a job for the human: sets status=awaiting_human and records what you need them "
         "to do (e.g. 'Application asks for a portfolio link I don't have', 'CAPTCHA on apply "

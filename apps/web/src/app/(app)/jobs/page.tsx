@@ -725,6 +725,34 @@ export default function JobTrackerPage() {
     }
   }
 
+  /** Publish the selected jobs to the Sol outbox repo (Settings → Sol
+   * Outbox). Jobs without a tailored resume or an https URL are skipped
+   * with the reason; the push itself happens in the background. */
+  async function bulkSendToSol() {
+    const ids = [...selectedIds];
+    if (ids.length === 0) return;
+    setBulkRunning(true);
+    setBulkMsg(null);
+    try {
+      const r = await api.post<{
+        sent: number[];
+        skipped: { job_id: number; title?: string; reason: string }[];
+      }>("/api/v1/outbox/jobs/approve", { job_ids: ids });
+      let m = `Sent ${r.sent.length} of ${ids.length} to Sol — committing and pushing in the background`;
+      if (r.skipped.length) {
+        const reasons = [...new Set(r.skipped.map((s) => s.reason))].join(" / ");
+        m += ` · ${r.skipped.length} skipped: ${reasons}`;
+      }
+      setBulkMsg(m);
+      if (r.sent.length) setSelectedIds(new Set());
+    } catch (e) {
+      setBulkMsg(e instanceof ApiError ? `Send to Sol failed: ${e.info.message}` : "Send to Sol failed.");
+    } finally {
+      setBulkRunning(false);
+      setTimeout(() => setBulkMsg(null), 20000);
+    }
+  }
+
   async function onQueueImport(file: File | null) {
     if (!file) return;
     setQueueImporting(true);
@@ -1073,6 +1101,22 @@ export default function JobTrackerPage() {
               title="Queue a fresh scoring run (Jev when configured) for each selected job — replaces existing scores"
             >
               {bulkRunning ? "Queuing…" : "Rescore"}
+            </button>
+          </div>
+
+          {/* Hand-off group — publish to the Sol outbox repo. */}
+          <div className="flex items-center gap-1.5 px-2 py-1 rounded border border-corp-border">
+            <span className="text-[10px] uppercase tracking-wider text-corp-muted">
+              Sol
+            </span>
+            <button
+              type="button"
+              className="jsp-btn-ghost text-xs"
+              onClick={bulkSendToSol}
+              disabled={bulkRunning}
+              title="Commit each selected job (with its tailored resume + cover letter) to the Sol outbox repo so Sol can apply"
+            >
+              Send to Sol
             </button>
           </div>
 
