@@ -34,14 +34,16 @@ import shutil
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Any, Awaitable, Callable, Optional
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.models.documents import GeneratedDocument
 from app.models.jobs import ApplicationEvent, Organization, TrackedJob
 from app.models.outbox import OutboxConfig, OutboxJob
+from app.models.sources import JobLead
 
 log = logging.getLogger(__name__)
 
@@ -145,15 +147,22 @@ def _https(url: Optional[str]) -> Optional[str]:
     return u if u.lower().startswith("https://") and len(u) <= 2048 else None
 
 
-def build_job_json(ob: OutboxJob, job: TrackedJob, company: Optional[str], has_cover: bool) -> dict:
+def build_job_json(
+    ob: OutboxJob, job: TrackedJob, company: Optional[str], has_cover: bool,
+    apply_link: Optional[str] = None,
+) -> dict:
+    """`apply_link` (LinkedIn jobs): the off-LinkedIn application URL —
+    sent as apply_url, with the LinkedIn posting as posting_url."""
     out: dict[str, Any] = {
         "schema_version": 1,
         "id": ob.job_ref,
         "slug": ob.slug,
         "title": job.title,
         "company": company or "Unknown company",
-        "apply_url": _https(job.source_url),
+        "apply_url": apply_link or _https(job.source_url),
     }
+    if apply_link and _https(job.source_url) and job.source_url.strip() != apply_link:
+        out["posting_url"] = job.source_url.strip()
     optional = {
         "source": job.source_platform,
         "location": job.location,
@@ -483,11 +492,100 @@ async def latest_docs(db, user_id: int, job_ids: list[int]) -> dict[tuple[int, s
     return out
 
 
-def eligibility(job: TrackedJob, has_resume: bool) -> Optional[str]:
-    """Why a job can't be sent, or None."""
+# ---- LinkedIn: only jobs that apply OFF LinkedIn go to Sol --------------------
+
+def _host(url: Optional[str]) -> str:
+    try:
+        return (urlparse((url or "").strip()).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _is_linkedin_url(url: Optional[str]) -> bool:
+    h = _host(url)
+    return h == "linkedin.com" or h.endswith(".linkedin.com") or h == "lnkd.in"
+
+
+def is_linkedin(job: TrackedJob) -> bool:
+    return (job.source_platform or "").lower() == "linkedin" or _is_linkedin_url(job.source_url)
+
+
+def _external(url: Any) -> Optional[str]:
+    u = _https(url) if isinstance(url, str) else None
+    return u if u and not _is_linkedin_url(u) else None
+
+
+_TRUE = (True, 1, "true", "True", "TRUE", "yes", "1")
+_APPLY_LINE = re.compile(r"Apply link:\s*(\S+)")
+
+
+async def apply_info(db, user_id: int, job_ids: list[int]) -> dict[int, dict]:
+    """job id → {"easy_apply": bool, "apply_link": external https URL | None}.
+    From the Bright Data record on the job's lead; for jobs without one,
+    from the "Apply link:" / "LinkedIn Easy Apply" lines the build wrote
+    into the job's creation event."""
+    out: dict[int, dict] = {}
+    if not job_ids:
+        return out
+    leads = (
+        await db.execute(
+            select(JobLead.tracked_job_id, JobLead.raw_payload).where(
+                JobLead.user_id == user_id, JobLead.tracked_job_id.in_(job_ids)
+            )
+        )
+    ).all()
+    for jid, raw in leads:
+        if not isinstance(raw, dict):
+            continue
+        cur = out.setdefault(jid, {"easy_apply": False, "apply_link": None})
+        if raw.get("is_easy_apply") in _TRUE or raw.get("easy_apply") in _TRUE:
+            cur["easy_apply"] = True
+        link = _external(raw.get("apply_link") or raw.get("application_link") or raw.get("apply_url"))
+        cur["apply_link"] = cur["apply_link"] or link
+    missing = [j for j in job_ids if j not in out]
+    if missing:
+        evs = (
+            await db.execute(
+                select(ApplicationEvent.tracked_job_id, ApplicationEvent.details_md).where(
+                    ApplicationEvent.tracked_job_id.in_(missing),
+                    or_(
+                        ApplicationEvent.details_md.like("%Apply link:%"),
+                        ApplicationEvent.details_md.like("%LinkedIn Easy Apply%"),
+                    ),
+                )
+            )
+        ).all()
+        for jid, md in evs:
+            cur = out.setdefault(jid, {"easy_apply": False, "apply_link": None})
+            if "LinkedIn Easy Apply" in (md or ""):
+                cur["easy_apply"] = True
+            m = _APPLY_LINE.search(md or "")
+            if m and not cur["apply_link"]:
+                cur["apply_link"] = _external(m.group(1).rstrip(").,`"))
+    return out
+
+
+def linkedin_block(job: TrackedJob, info: Optional[dict]) -> Optional[str]:
+    """Why a LinkedIn job can't go to Sol (Easy Apply, or no apply link
+    off LinkedIn), or None. Non-LinkedIn jobs → None."""
+    if not is_linkedin(job):
+        return None
+    info = info or {}
+    if info.get("easy_apply"):
+        return "LinkedIn Easy Apply — only jobs that apply outside LinkedIn go to Sol."
+    if not info.get("apply_link"):
+        return "No apply link outside LinkedIn — only jobs that apply off LinkedIn go to Sol."
+    return None
+
+
+def eligibility(job: TrackedJob, has_resume: bool, info: Optional[dict] = None) -> Optional[str]:
+    """Why a job can't be sent, or None. `info`: this job's apply_info()."""
     if not has_resume:
         return "Needs a resume tailored to this job (with text) first."
-    if not _https(job.source_url):
+    block = linkedin_block(job, info)
+    if block:
+        return block
+    if not is_linkedin(job) and not _https(job.source_url):
         return "Needs an https:// posting / apply URL."
     return None
 
@@ -531,11 +629,29 @@ async def _housekeeping(db, user_id: int, cfg: dict) -> None:
             .where(OutboxJob.user_id == user_id, OutboxJob.withdrawn_at.is_(None), OutboxJob.sol_status.is_(None))
         )
     ).all()
+    live: dict[int, OutboxJob] = {}
     for ob, status in rows:
         if ob.tracked_job_id is None:
             ob.withdrawn_at, ob.withdraw_reason = now_utc(), "Job deleted in JobSearchPal."
         elif status in WITHDRAW_ON:
             ob.withdrawn_at, ob.withdraw_reason = now_utc(), f"Status changed to {status} in JobSearchPal."
+        else:
+            live[ob.tracked_job_id] = ob
+
+    # LinkedIn jobs that apply ON LinkedIn (Easy Apply / no outside link)
+    # never go to Sol: drop them if not pushed yet, withdraw them if they are.
+    if live:
+        jobs = (await db.execute(select(TrackedJob).where(TrackedJob.id.in_(list(live))))).scalars().all()
+        info = await apply_info(db, user_id, [j.id for j in jobs if is_linkedin(j)])
+        for j in jobs:
+            why = linkedin_block(j, info.get(j.id))
+            if not why:
+                continue
+            ob = live[j.id]
+            if ob.published_at is None:
+                await db.delete(ob)
+            else:
+                ob.withdrawn_at, ob.withdraw_reason = now_utc(), why
 
     if cfg.get("auto_approve"):
         have = set(
@@ -548,8 +664,9 @@ async def _housekeeping(db, user_id: int, cfg: dict) -> None:
         ).scalars().all()
         jobs = [j for j in jobs if j.id not in have]
         docs = await latest_docs(db, user_id, [j.id for j in jobs])
+        info = await apply_info(db, user_id, [j.id for j in jobs if is_linkedin(j)])
         for j in jobs:
-            if eligibility(j, (j.id, "resume") in docs) is None:
+            if eligibility(j, (j.id, "resume") in docs, info.get(j.id)) is None:
                 await approve(db, user_id, j)
 
 
@@ -569,6 +686,7 @@ async def _gather(db, user_id: int) -> list[Item]:
         (await db.execute(select(Organization.id, Organization.name).where(Organization.id.in_(org_ids)))).all()
     ) if org_ids else {}
     docs = await latest_docs(db, user_id, list(jobs))
+    info = await apply_info(db, user_id, [j.id for j in jobs.values() if is_linkedin(j)])
 
     items: list[Item] = []
     for ob in obs:
@@ -589,12 +707,13 @@ async def _gather(db, user_id: int) -> list[Item]:
             continue
         resume = docs.get((job.id, "resume"))
         cover = docs.get((job.id, "cover_letter"))
-        why = eligibility(job, resume is not None)
+        why = eligibility(job, resume is not None, info.get(job.id))
         if why:
             it.error = why
             items.append(it)
             continue
-        it.job_json = build_job_json(ob, job, orgs.get(job.organization_id), cover is not None)
+        apply_link = (info.get(job.id) or {}).get("apply_link") if is_linkedin(job) else None
+        it.job_json = build_job_json(ob, job, orgs.get(job.organization_id), cover is not None, apply_link)
         it.sources["job.json"] = {"hash": _sha(_dumps(it.job_json))}
         it.sources["resume.pdf"] = {
             "hash": _sha(str(resume.id), resume.title or "", resume.content_md),

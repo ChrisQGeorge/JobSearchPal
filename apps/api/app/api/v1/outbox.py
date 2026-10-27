@@ -280,10 +280,12 @@ async def _job_state(db: AsyncSession, user_id: int, job: TrackedJob) -> dict:
         await db.execute(select(OutboxJob).where(OutboxJob.user_id == user_id, OutboxJob.job_ref == ob.job_ref(job.id)))
     ).scalar_one_or_none()
     docs = await ob.latest_docs(db, user_id, [job.id])
+    info = (await ob.apply_info(db, user_id, [job.id])).get(job.id)
     return {
         "connected": (await _overview(db, user_id))["connected"],
         "entry": _job_out(o) if o else None,
-        "blocked_reason": ob.eligibility(job, (job.id, "resume") in docs),
+        "blocked_reason": ob.eligibility(job, (job.id, "resume") in docs, info),
+        "apply_url": (info or {}).get("apply_link") if ob.is_linkedin(job) else ob._https(job.source_url),
         "has_cover_letter": (job.id, "cover_letter") in docs,
         "running": ob.is_running(user_id),
     }
@@ -300,7 +302,8 @@ class ApproveIn(BaseModel):
 
 async def _approve_one(db: AsyncSession, user_id: int, job: TrackedJob, notes: Optional[str]) -> None:
     docs = await ob.latest_docs(db, user_id, [job.id])
-    why = ob.eligibility(job, (job.id, "resume") in docs)
+    info = (await ob.apply_info(db, user_id, [job.id])).get(job.id)
+    why = ob.eligibility(job, (job.id, "resume") in docs, info)
     if why:
         raise HTTPException(status_code=409, detail=why)
     existing = (

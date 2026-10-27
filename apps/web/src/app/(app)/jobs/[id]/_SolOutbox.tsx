@@ -29,6 +29,8 @@ type OutboxJobState = {
   blocked_reason: string | null;
   has_cover_letter: boolean;
   running: boolean;
+  // Where Sol applies: the off-LinkedIn link for LinkedIn jobs, else the posting.
+  apply_url: string | null;
 };
 
 const SOL_STYLE: Record<string, string> = {
@@ -124,6 +126,14 @@ export function SolOutboxCard({ jobId, onJobChanged }: { jobId: number; onJobCha
       </div>
 
       {e?.slug ? <div className="text-[11px] text-corp-muted font-mono break-all">jobs/{e.slug}/</div> : null}
+      {st.apply_url && !st.blocked_reason ? (
+        <div className="text-[11px] text-corp-muted break-all">
+          Sol applies at:{" "}
+          <a href={st.apply_url} target="_blank" rel="noopener noreferrer" className="hover:text-corp-accent">
+            {st.apply_url}
+          </a>
+        </div>
+      ) : null}
       {e?.sol_confirmation ? (
         <div className="text-xs">
           <span className="text-corp-muted">Confirmation: </span>
