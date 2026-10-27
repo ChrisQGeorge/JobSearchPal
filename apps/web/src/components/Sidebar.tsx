@@ -15,6 +15,7 @@ const NAV = [
   { href: "/queue", label: "Companion Activity" },
   { href: "/studio", label: "Document Studio" },
   { href: "/companion", label: "Companion" },
+  { href: "/tower", label: "The Tower" },
   { href: "/settings", label: "Settings" },
 ];
 

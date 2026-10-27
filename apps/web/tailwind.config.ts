@@ -7,17 +7,19 @@ const config: Config = {
     extend: {
       colors: {
         // Muted retro-corporate palette — dingy gold + alarm orange on dark neutrals.
+        // Values live in CSS variables (globals.css :root) so a page can
+        // re-skin the whole UI — The Tower swaps in a pixel palette.
         corp: {
-          bg: "#0f1117",
-          surface: "#161a22",
-          surface2: "#1f2430",
-          border: "#2a3040",
-          text: "#e6e6e6",
-          muted: "#8a94a6",
-          accent: "#e8c468",    // dingy corporate gold
-          accent2: "#ff7a45",   // warning-orange
-          ok: "#6fbf73",
-          danger: "#d35656",
+          bg: "rgb(var(--corp-bg) / <alpha-value>)",
+          surface: "rgb(var(--corp-surface) / <alpha-value>)",
+          surface2: "rgb(var(--corp-surface2) / <alpha-value>)",
+          border: "rgb(var(--corp-border) / <alpha-value>)",
+          text: "rgb(var(--corp-text) / <alpha-value>)",
+          muted: "rgb(var(--corp-muted) / <alpha-value>)",
+          accent: "rgb(var(--corp-accent) / <alpha-value>)",    // dingy corporate gold
+          accent2: "rgb(var(--corp-accent2) / <alpha-value>)",  // warning-orange
+          ok: "rgb(var(--corp-ok) / <alpha-value>)",
+          danger: "rgb(var(--corp-danger) / <alpha-value>)",
         },
       },
       fontFamily: {

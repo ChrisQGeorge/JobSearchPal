@@ -4,11 +4,23 @@
 
 :root {
   color-scheme: dark;
+  /* Corp palette as RGB triplets (Tailwind reads these; see
+     tailwind.config.ts). html[data-pixel] overrides them for The Tower. */
+  --corp-bg: 15 17 23;
+  --corp-surface: 22 26 34;
+  --corp-surface2: 31 36 48;
+  --corp-border: 42 48 64;
+  --corp-text: 230 230 230;
+  --corp-muted: 138 148 166;
+  --corp-accent: 232 196 104;
+  --corp-accent2: 255 122 69;
+  --corp-ok: 111 191 115;
+  --corp-danger: 211 86 86;
 }
 
 html, body {
-  background-color: #0f1117;
-  color: #e6e6e6;
+  background-color: rgb(var(--corp-bg));
+  color: rgb(var(--corp-text));
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
 }
@@ -239,4 +251,126 @@ kbd {
     height: 0 !important;
     margin: 0 !important;
   }
+}
+
+/* =====================================================================
+   THE TOWER — pixel-art takeover.
+   The Tower page sets <html data-pixel="1"> while it's open, which
+   swaps the corp palette for a night-shift office palette and turns the
+   WHOLE UI (sidebar included) into pixel art: pixel fonts, square
+   corners, stepped borders, dithering, scanlines. Removed on leaving.
+   Fonts load from Google Fonts on the Tower page only.
+   ===================================================================== */
+html[data-pixel="1"] {
+  --corp-bg: 18 14 34;          /* after-hours office indigo */
+  --corp-surface: 32 26 56;
+  --corp-surface2: 46 38 78;
+  --corp-border: 96 84 148;
+  --corp-text: 238 232 208;     /* timesheet parchment */
+  --corp-muted: 156 146 188;
+  --corp-accent: 255 204 64;    /* shareholder gold */
+  --corp-accent2: 255 112 64;
+  --corp-ok: 96 228 116;        /* CRT green */
+  --corp-danger: 240 72 100;
+  font-size: 19px;              /* VT323 runs small; rem units scale with it */
+}
+html[data-pixel="1"],
+html[data-pixel="1"] body {
+  font-family: "VT323", ui-monospace, monospace;
+  -webkit-font-smoothing: none;
+  -moz-osx-font-smoothing: unset;
+  font-smooth: never;
+  image-rendering: pixelated;
+  background-color: rgb(var(--corp-bg));
+  background-image: radial-gradient(rgb(var(--corp-border) / 0.28) 1px, transparent 1.2px);
+  background-size: 6px 6px;     /* ordered-dither speckle */
+}
+html[data-pixel="1"] *,
+html[data-pixel="1"] *::before,
+html[data-pixel="1"] *::after {
+  border-radius: 0 !important;
+  transition-timing-function: steps(4, end) !important;
+}
+html[data-pixel="1"] h1,
+html[data-pixel="1"] h2,
+html[data-pixel="1"] h3,
+html[data-pixel="1"] .jsp-btn,
+html[data-pixel="1"] .jsp-btn-primary,
+html[data-pixel="1"] .jsp-btn-ghost,
+html[data-pixel="1"] .jsp-label,
+html[data-pixel="1"] .px-head {
+  font-family: "Press Start 2P", ui-monospace, monospace;
+  letter-spacing: 0;
+  font-weight: 400;
+}
+html[data-pixel="1"] h1 { font-size: 15px; line-height: 1.7; }
+html[data-pixel="1"] h2,
+html[data-pixel="1"] h3 { font-size: 11px; line-height: 1.7; }
+html[data-pixel="1"] .jsp-label { font-size: 8px; line-height: 1.8; }
+html[data-pixel="1"] .jsp-btn,
+html[data-pixel="1"] .jsp-btn-primary,
+html[data-pixel="1"] .jsp-btn-ghost {
+  font-size: 9px;
+  line-height: 1.6;
+  border-width: 2px;
+  box-shadow:
+    inset -2px -2px 0 rgb(0 0 0 / 0.35),
+    inset 2px 2px 0 rgb(255 255 255 / 0.18);
+}
+html[data-pixel="1"] .jsp-btn:active,
+html[data-pixel="1"] .jsp-btn-primary:active,
+html[data-pixel="1"] .jsp-btn-ghost:active {
+  transform: translate(1px, 1px);
+  box-shadow: inset 2px 2px 0 rgb(0 0 0 / 0.35);
+}
+html[data-pixel="1"] .jsp-card {
+  border-width: 2px;
+  box-shadow: 4px 4px 0 0 rgb(0 0 0 / 0.5);
+}
+html[data-pixel="1"] .jsp-input { border-width: 2px; }
+html[data-pixel="1"] ::-webkit-scrollbar { width: 12px; height: 12px; }
+html[data-pixel="1"] ::-webkit-scrollbar-thumb {
+  background: rgb(var(--corp-border));
+  border: 2px solid rgb(var(--corp-bg));
+}
+/* CRT scanlines over everything (purely decorative, never blocks clicks). */
+html[data-pixel="1"] body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 60;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgb(0 0 0 / 0) 0px,
+    rgb(0 0 0 / 0) 2px,
+    rgb(0 0 0 / 0.14) 3px
+  );
+}
+/* Boot-up wipe when the Tower opens. */
+@keyframes px-boot {
+  0% { clip-path: inset(0 0 100% 0); opacity: 1; }
+  60% { clip-path: inset(0 0 0 0); opacity: 1; }
+  100% { clip-path: inset(0 0 0 0); opacity: 0; }
+}
+.px-boot {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  pointer-events: none;
+  background: rgb(var(--corp-bg));
+  animation: px-boot 0.9s steps(12, end) forwards;
+}
+/* Sprite walkers on tower floors. */
+@keyframes px-walk {
+  from { transform: translateX(0); }
+  to { transform: translateX(var(--px-walk, 160px)); }
+}
+@keyframes px-bob {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-2px); }
+}
+@keyframes px-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
 }
